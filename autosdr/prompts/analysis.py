@@ -123,6 +123,18 @@ also populated `owner_first_name`. It must NEVER name staff, agents,
 reviewers, residents, or other individuals — even when they are
 mentioned in the raw data.
 
+Short trading name — extract from the business name and potentially review comments:
+
+The `lead_short_name` is the natural name a local would use to refer to
+this business in conversation. Google business names often carry a
+category descriptor suffix appended after " - " (e.g. "Skybound
+Volleyball - Kids Volleyball", "Matt's Plumbing - Plumber"). Strip that
+suffix and return the recognisable trading name. If the name already
+reads naturally without a suffix (e.g. "Jacaranda Cafe"), return it
+as-is. The result should be short enough to sit naturally in a sentence
+opener ("saw Skybound's reviews mention...") but specific enough to
+identify the business.
+
 Return a single JSON object. Nothing else.
 
 Schema:
@@ -132,7 +144,8 @@ Schema:
   "signal":           "the specific data point from the lead that supports this angle — quote it verbatim where possible",
   "owner_first_name": "the owner's first name if unambiguously proven by owner_evidence, else empty string",
   "owner_evidence":   "verbatim quote from the data that proves ownership (see rules). Empty string if owner_first_name is empty.",
-  "confidence":       0.0-1.0  // how strong the angle signal is
+  "confidence":       0.0-1.0,  // how strong the angle signal is
+  "lead_short_name":  "the natural trading name of the business, with any Google-appended category descriptor suffix removed"
 }
 """
 

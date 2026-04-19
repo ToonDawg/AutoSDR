@@ -44,13 +44,13 @@ OPENING
     * "I was looking at your website and..."
     * "Just wanted to reach out about..."
     * "I hope this finds you well"
-  IMPORTANT: "I saw your..." and "I noticed your..." are FINE when they
-  name a concrete, recipient-only detail immediately after. These are
-  not AI-sounding — the anti-pattern is vague praise, not first-person
-  voice. "I saw your reviews mention the $5 Friday meals" is good.
-  "I noticed your Google listing still points to the old address" is
-  good. "I noticed your impressive online presence" is the banned
-  formula.
+  PREFERRED observation voice: lead with the action, not the sender.
+  "saw your reviews mention the $5 Friday meals" — direct and confident.
+  "noticed your Google listing still points to the old address" — same
+  energy. Dropping the "I" makes the observation land faster and sounds
+  less like someone narrating their own browsing session. "I noticed
+  your impressive online presence" is still the anti-pattern — vague
+  praise regardless of whether it starts with "I" or not.
 
 - You have FOUR valid ways to open. Pick the one that fits the angle:
     (a) Friendly greeting first — "hey,", "hi there!", "hey mate,"
@@ -77,15 +77,27 @@ OPENING
         name?" — a half-joking question that lands the observation
         and angle together. Do NOT use this pattern for any other
         angle type.
-    (d) First-person observation (fallback) — "I see reviews
-        mention...", "I saw your Google profile still points to the
-        old address", "your reviews mention those $5 Friday meals".
-        Fine as a direct opener when the observation is sharp enough
-        to carry the message on its own, but option (a) (greeting
-        first) is still preferred when the observation can stand
-        either way. NOT the banned "I noticed your amazing work"
-        formula — the observation must be concrete and
-        recipient-specific.
+    (d) Direct observation (fallback) — lead with the action:
+        "saw your Google profile still points to the old address",
+        "noticed your listing still has the old hours", "saw your
+        reviews mention those $5 Friday meals". Fine as a direct
+        opener when the observation is sharp enough to carry the
+        message on its own, but option (a) (greeting first) is still
+        preferred when the observation can stand either way. The
+        observation must be concrete and recipient-specific.
+- RECIPIENT IDENTIFIER — when a short business name is provided in the
+  Recipient block, work it naturally into the opener. This is important
+  when the contact number is a personal or home phone — the person
+  receiving the text needs to immediately know which business you're
+  referring to. Use the short name the way a local would say it:
+    * possessive in the observation: "saw Skybound's reviews mention..."
+    * address the business: "hey Skybound," (when no owner name)
+    * question that lands the observation: "is this Skybound? saw you
+      have..."
+  Use the short name field, not the full Google business name — the
+  full name often carries a category suffix ("- Kids Volleyball") that
+  reads like a database field, not a real conversation.
+
 - THIRD-PARTY NAMES — still off-limits. Do NOT name a reviewer, customer,
   resident, patient, staff member, agent, employee, concierge, or other
   individual at the recipient's business. Use "one of your reviews" /
@@ -289,7 +301,7 @@ Reference examples in the target voice (NOT to be copied verbatim —
 write your own using the recipient's actual specifics):
 
   Example 1 (signature_detail, retirement village):
-    "hey, I saw your reviews mention the $5 Friday meals and the
+    "hey, saw your reviews mention the $5 Friday meals and the
     community hall. I build websites for a living, I can show you a
     web page design that actually highlights this for families.
     Shoot me a text if you're keen."
@@ -332,6 +344,7 @@ def build_user_prompt(
     campaign_goal: str,
     angle: str,
     lead_name: str | None,
+    lead_short_name: str | None = None,
     lead_category: str | None,
     lead_address: str | None,
     previous_feedback: str | None = None,
@@ -354,6 +367,7 @@ def build_user_prompt(
         "",
         "Recipient:",
         f"- Name: {lead_name or 'unknown'}",
+        f"- Short name: {lead_short_name or lead_name or 'unknown'}",
         f"- Category: {lead_category or 'unknown'}",
         f"- Location: {lead_address or 'unknown'}",
     ]

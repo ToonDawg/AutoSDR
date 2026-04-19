@@ -79,13 +79,13 @@ scores are calibrated (don't default to 0.9+ for everything):
 
 5. naturalness (would a real Australian small-business owner type this on
    their phone?)
-   - 1.0: yes, reads like a real text from a human. First-person
-     observation ("I see reviews mention...", "I saw your profile
-     still...") is fine and often a PLUS. Looser punctuation
-     (lowercase opener, dropped final full stop, sentence fragments,
-     a single exclamation mark on a friendly greeting like "hi
-     there!") is fine and often a PLUS for tradie / hospitality /
-     retail recipients.
+   - 1.0: yes, reads like a real text from a human. Observation
+     openers that lead with the action ("saw your reviews mention...",
+     "noticed your Google listing...", "saw you have...") are natural
+     and a PLUS for this voice. Looser punctuation (lowercase opener,
+     dropped final full stop, sentence fragments, a single exclamation
+     mark on a friendly greeting like "hi there!") is fine and often a
+     PLUS for tradie / hospitality / retail recipients.
    - 0.7: mostly natural but one phrase is stiff, reads like
      marketing, OR contains more than one exclamation / any
      exclamation outside the greeting.
@@ -97,9 +97,9 @@ scores are calibrated (don't default to 0.9+ for everything):
        * PUNCTUATION-level: em dash joining clauses, semicolons,
          stylistic ellipses, perfectly balanced dash-separated
          parallel clauses, Oxford commas in three-item casual lists.
-     NOTE: first-person specific observations are NOT AI-speak.
-     "I see reviews mention the $5 Friday meals" is fine; "I noticed
-     your impressive online presence" is not.
+     NOTE: the target observation voice drops the "I" — "saw reviews
+     mention the $5 Friday meals" is the preferred form; "I noticed
+     your impressive online presence" is still the anti-pattern.
    - 0.0: reads like a cold sales email, uses hype words, or sounds
      like a vendor pitch.
 
@@ -225,8 +225,9 @@ FEEDBACK RULES (IMPORTANT):
 - The feedback is read by another AI that will rewrite the draft, so be
   specific: quote the offending phrase and suggest a replacement, rather
   than just saying "tone is off".
-- Good feedback: "'I noticed' is an AI-speak opener; replace with 'your
-  review replies still...' to open on the observation directly."
+- Good feedback: "'I noticed' / 'I saw' opener — the preferred form
+  drops the 'I': rewrite as 'noticed your review replies still...' or
+  'saw your Google listing...' for a more direct opener."
 - Good feedback: "The em dash in 'your profile is stale — worth a look?'
   reads AI. Swap for a plain comma or split into two sentences."
 - Good feedback (tradie category): "Title-case opener 'Your Google

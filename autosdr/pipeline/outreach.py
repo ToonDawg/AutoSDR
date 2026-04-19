@@ -118,6 +118,7 @@ async def _run_analysis(
     parsed.setdefault("owner_first_name", "")
     parsed.setdefault("owner_evidence", "")
     parsed.setdefault("confidence", 0.0)
+    parsed.setdefault("lead_short_name", "")
     validated_name, validated_evidence = analysis.validate_owner_first_name(
         owner_first_name=parsed.get("owner_first_name"),
         owner_evidence=parsed.get("owner_evidence"),
@@ -146,6 +147,7 @@ async def _generate_and_evaluate(
     lead: Lead,
     thread: Thread,
     angle: str,
+    lead_short_name: str | None = None,
     message_history: list[dict[str, str]] | None,
 ) -> dict[str, Any]:
     """Run the generate/evaluate loop up to ``eval_max_attempts`` times.
@@ -182,6 +184,7 @@ async def _generate_and_evaluate(
             campaign_goal=campaign.goal,
             angle=angle,
             lead_name=lead.name,
+            lead_short_name=lead_short_name,
             lead_category=lead.category,
             lead_address=lead.address,
             previous_feedback=feedback,
@@ -344,6 +347,7 @@ async def run_outreach_for_campaign_lead(
         owner_first_name = str(analysis_result.get("owner_first_name") or "").strip()
         if owner_first_name:
             angle = f"Recipient owner's first name: {owner_first_name}\n\n{angle}"
+        lead_short_name = str(analysis_result.get("lead_short_name") or "").strip() or None
         thread.angle = angle
         analysis_meta = {
             "model": analysis_result["_meta"]["model"],
@@ -352,21 +356,24 @@ async def run_outreach_for_campaign_lead(
             "prompt_version": analysis_result["_meta"]["prompt_version"],
             "signal": analysis_result.get("signal"),
             "owner_first_name": owner_first_name or None,
+            "lead_short_name": lead_short_name,
             "confidence": analysis_result.get("confidence"),
             "raw_data_truncated": truncated,
             "llm_call_id": analysis_result["_meta"].get("llm_call_id"),
         }
         logger.info(
-            "analysis thread=%s angle=%r owner=%r confidence=%s signal=%r truncated=%s",
+            "analysis thread=%s angle=%r owner=%r short_name=%r confidence=%s signal=%r truncated=%s",
             thread.id,
             angle[:120],
             owner_first_name or None,
+            lead_short_name,
             analysis_result.get("confidence"),
             (analysis_result.get("signal") or "")[:120],
             truncated,
         )
     else:
         angle = thread.angle
+        lead_short_name = None
 
     # 2+3. Generate and evaluate
     loop_result = await _generate_and_evaluate(
@@ -378,6 +385,7 @@ async def run_outreach_for_campaign_lead(
         lead=lead,
         thread=thread,
         angle=angle,
+        lead_short_name=lead_short_name,
         message_history=message_history if not created else None,
     )
 

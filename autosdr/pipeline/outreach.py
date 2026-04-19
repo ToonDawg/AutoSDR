@@ -41,14 +41,28 @@ class OutreachResult:
 def _ensure_thread(
     session: Session, campaign_lead: CampaignLead, workspace: Workspace, campaign: Campaign
 ) -> tuple[Thread, bool]:
-    """Return the thread for this campaign_lead; create if missing."""
+    """Return the thread for this campaign_lead; create if missing.
+
+    We always commit before returning. This serves two purposes:
+
+    1. If we just created a new thread, it's now durable and LLM contexts
+       can safely reference ``thread.id``.
+    2. It flushes any pending writes from a prior lead's pipeline in the
+       same scheduler tick (the outer session is reused across leads) so
+       the SQLite writer lock is released before we start issuing LLM
+       calls. Without this, the outer session holds the writer lock for
+       the full ~30-60s pipeline run and every ``_log_call`` insert
+       times out on ``busy_timeout`` and rolls back, hollowing out
+       ``autosdr logs llm`` and thread replay.
+    """
 
     thread = (
         session.query(Thread)
         .filter(Thread.campaign_lead_id == campaign_lead.id)
         .one_or_none()
     )
-    if thread is None:
+    created = thread is None
+    if created:
         thread = Thread(
             campaign_lead_id=campaign_lead.id,
             connector_type=campaign.connector_type,
@@ -57,8 +71,9 @@ def _ensure_thread(
         )
         session.add(thread)
         session.flush()
-        return thread, True
-    return thread, False
+
+    session.commit()
+    return thread, created
 
 
 async def _run_analysis(
@@ -100,7 +115,16 @@ async def _run_analysis(
     )
     parsed.setdefault("angle", "")
     parsed.setdefault("signal", "")
+    parsed.setdefault("owner_first_name", "")
+    parsed.setdefault("owner_evidence", "")
     parsed.setdefault("confidence", 0.0)
+    validated_name, validated_evidence = analysis.validate_owner_first_name(
+        owner_first_name=parsed.get("owner_first_name"),
+        owner_evidence=parsed.get("owner_evidence"),
+        lead_name=lead.name,
+    )
+    parsed["owner_first_name"] = validated_name
+    parsed["owner_evidence"] = validated_evidence
     parsed["_meta"] = {
         "model": result.model,
         "tokens_in": result.tokens_in,
@@ -184,6 +208,7 @@ async def _generate_and_evaluate(
             campaign_goal=campaign.goal,
             angle=angle,
             draft=draft,
+            lead_category=lead.category,
         )
         eval_raw, eval_result = await complete_json(
             system=system_eval,
@@ -313,6 +338,12 @@ async def run_outreach_for_campaign_lead(
         angle = str(analysis_result.get("angle") or "").strip()
         if not angle:
             angle = f"{lead.category or 'business'} in {lead.address or 'the area'}"
+        # If analysis confidently identified the owner's first name, prepend
+        # it as a labelled line so the generation / evaluation prompts can
+        # reliably see it (and it survives across reply turns via thread.angle).
+        owner_first_name = str(analysis_result.get("owner_first_name") or "").strip()
+        if owner_first_name:
+            angle = f"Recipient owner's first name: {owner_first_name}\n\n{angle}"
         thread.angle = angle
         analysis_meta = {
             "model": analysis_result["_meta"]["model"],
@@ -320,14 +351,16 @@ async def run_outreach_for_campaign_lead(
             "tokens_out": analysis_result["_meta"]["tokens_out"],
             "prompt_version": analysis_result["_meta"]["prompt_version"],
             "signal": analysis_result.get("signal"),
+            "owner_first_name": owner_first_name or None,
             "confidence": analysis_result.get("confidence"),
             "raw_data_truncated": truncated,
             "llm_call_id": analysis_result["_meta"].get("llm_call_id"),
         }
         logger.info(
-            "analysis thread=%s angle=%r confidence=%s signal=%r truncated=%s",
+            "analysis thread=%s angle=%r owner=%r confidence=%s signal=%r truncated=%s",
             thread.id,
             angle[:120],
+            owner_first_name or None,
             analysis_result.get("confidence"),
             (analysis_result.get("signal") or "")[:120],
             truncated,

@@ -20,6 +20,76 @@ The wrapper adds six behaviours the pipelines expect:
 
 from __future__ import annotations
 
+# NOTE: SSL patching MUST happen before ``import litellm`` (which imports
+# aiohttp, which in turn pre-builds an SSL context at import time and caches
+# it on ``aiohttp.connector._SSL_CONTEXT_VERIFIED``). If we patch after, the
+# cached context wins and the patch is a no-op.
+#
+# macOS Homebrew Python uses its own OpenSSL that may be missing root CAs,
+# and corporate networks (Zscaler, Netskope, etc.) often MITM outbound TLS
+# with a root whose Basic Constraints are not marked critical — which modern
+# OpenSSL rejects under VERIFY_X509_STRICT. We therefore patch
+# ``ssl.create_default_context`` to:
+#   1. load certifi's public CA bundle (needed on fresh Homebrew installs),
+#   2. load any extra corporate root listed in AUTOSDR_EXTRA_CA_CERTS (or,
+#      as a convenience, NODE_EXTRA_CA_CERTS / REQUESTS_CA_BUNDLE /
+#      SSL_CERT_FILE — whichever the shell already has set),
+#   3. clear VERIFY_X509_STRICT so a non-critical basic-constraints MITM
+#      root still validates.
+# We then refresh aiohttp's pre-built contexts if aiohttp is already loaded.
+import os as _os
+import ssl as _ssl
+import certifi as _certifi
+
+_orig_create_default_context = _ssl.create_default_context
+
+
+def _extra_ca_bundle_paths() -> list[str]:
+    seen: set[str] = set()
+    bundles: list[str] = []
+    for var in (
+        "AUTOSDR_EXTRA_CA_CERTS",
+        "NODE_EXTRA_CA_CERTS",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+    ):
+        value = _os.environ.get(var)
+        if not value:
+            continue
+        for candidate in value.split(_os.pathsep):
+            candidate = candidate.strip()
+            if candidate and candidate not in seen and _os.path.isfile(candidate):
+                seen.add(candidate)
+                bundles.append(candidate)
+    return bundles
+
+
+def _patched_create_default_context(purpose=_ssl.Purpose.SERVER_AUTH, **kwargs):
+    ctx = _orig_create_default_context(purpose, **kwargs)
+    ctx.load_verify_locations(_certifi.where())
+    for bundle in _extra_ca_bundle_paths():
+        try:
+            ctx.load_verify_locations(bundle)
+        except Exception:
+            pass
+    ctx.verify_flags &= ~_ssl.VERIFY_X509_STRICT
+    return ctx
+
+
+_ssl.create_default_context = _patched_create_default_context
+
+# aiohttp caches a pre-built SSL context at module import time. If aiohttp
+# was imported before the patch above (e.g. by another package), rebuild the
+# cache now so our trusted roots actually take effect.
+import sys as _sys
+
+if "aiohttp.connector" in _sys.modules:
+    _aiohttp_connector = _sys.modules["aiohttp.connector"]
+    try:
+        _aiohttp_connector._SSL_CONTEXT_VERIFIED = _ssl.create_default_context()
+    except Exception:  # pragma: no cover - best effort
+        pass
+
 import asyncio
 import json
 import logging
@@ -33,6 +103,15 @@ from threading import Lock
 from typing import Any
 
 import litellm
+
+# Rebuild aiohttp's cached verified context now that aiohttp has definitely
+# been imported (either just now via litellm or earlier in the process).
+try:
+    import aiohttp.connector as _aiohttp_connector_post
+
+    _aiohttp_connector_post._SSL_CONTEXT_VERIFIED = _ssl.create_default_context()
+except Exception:  # pragma: no cover - best effort
+    pass
 
 from autosdr import killswitch
 from autosdr.config import get_settings

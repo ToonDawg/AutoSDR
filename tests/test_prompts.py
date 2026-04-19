@@ -35,7 +35,7 @@ def test_raw_data_truncates_long_strings():
 
 
 def test_evaluate_result_recomputes_length_valid():
-    long_draft = "a" * 200
+    long_draft = "a" * (evaluation.MAX_SMS_LENGTH + 1)
     normalised = evaluation.evaluate_result(
         {
             "scores": {

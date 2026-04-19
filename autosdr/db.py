@@ -55,6 +55,14 @@ def get_engine() -> Engine:
                 # Write-ahead logging reduces reader/writer contention between
                 # the scheduler and the webhook background task.
                 cur.execute("PRAGMA journal_mode=WAL")
+                # The scheduler holds a session open for the full duration of
+                # a pipeline run (several LLM calls, often 30-60s end to end),
+                # while the LLM client opens short-lived sessions to persist
+                # each llm_call row. SQLite-WAL still serialises writers, so
+                # the inner session has to wait for the outer one to commit.
+                # A 2-minute busy_timeout covers realistic pipeline durations
+                # without failing the secondary writers.
+                cur.execute("PRAGMA busy_timeout=120000")
                 cur.close()
 
     return _engine

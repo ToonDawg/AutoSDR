@@ -27,9 +27,15 @@ from autosdr.pipeline import process_incoming_message
 
 @pytest.fixture
 def active_thread(fresh_db, workspace_factory, tmp_path):
-    """Workspace + active thread with one prior AI outbound."""
+    """Workspace + active thread with one prior AI outbound.
 
-    ws_id = workspace_factory()
+    The legacy reply tests in this file cover the auto-reply loop. The new
+    "first-message-only" default flips auto_reply_enabled off globally, so
+    the fixture pins it on here to keep those tests meaningful. The separate
+    ``test_reply_first_message_only.py`` covers the default-off behaviour.
+    """
+
+    ws_id = workspace_factory(settings_overrides={"auto_reply_enabled": True})
     outbox = tmp_path / "outbox.jsonl"
 
     with fresh_db() as session:
@@ -127,9 +133,10 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch, responses: dict[str, Any]) -> No
 
     # Classify uses pipeline.reply's complete_json binding.
     monkeypatch.setattr("autosdr.pipeline.reply.complete_json", _fake_complete_json)
-    # Auto-reply generate+eval goes through the outreach helpers.
-    monkeypatch.setattr("autosdr.pipeline.outreach.complete_text", _fake_complete_text)
-    monkeypatch.setattr("autosdr.pipeline.outreach.complete_json", _fake_complete_json)
+    # Generate + evaluate now live in pipeline._shared — both the legacy
+    # auto-reply loop and the new suggested-replies path pull from there.
+    monkeypatch.setattr("autosdr.pipeline._shared.complete_text", _fake_complete_text)
+    monkeypatch.setattr("autosdr.pipeline._shared.complete_json", _fake_complete_json)
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +268,8 @@ async def test_positive_triggers_auto_reply(active_thread, fresh_db, monkeypatch
                 "confidence": 0.92,
                 "reason": "Lead wants to know more.",
             },
-            "generation-v1": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
-            "evaluation-v1": {
+            "generation-v6": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
+            "evaluation-v4.2": {
                 "scores": {
                     "tone_match": 0.92,
                     "personalisation": 0.9,

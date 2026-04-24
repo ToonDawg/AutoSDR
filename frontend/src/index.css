@@ -1,0 +1,205 @@
+@import 'tailwindcss';
+
+/* ==========================================================================
+   Design tokens.
+   Paper tones for chrome, mono for telemetry. Two font families only.
+   ========================================================================== */
+
+@theme {
+  --font-sans: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+
+  --color-paper: #f4ebdc;
+  --color-paper-deep: #ebe1ce;
+  --color-paper-sunk: #e3d8c0;
+  --color-ink: #1a1713;
+  --color-ink-muted: #6e645a;
+  --color-ink-faint: #a89e8e;
+  --color-rule: rgba(26, 23, 19, 0.14);
+  --color-rule-strong: rgba(26, 23, 19, 0.35);
+
+  --color-rust: #b23a1f;
+  --color-rust-deep: #8a2e18;
+  --color-rust-soft: #e8b8a6;
+  --color-forest: #3f5d3a;
+  --color-forest-soft: #c8d4bf;
+  --color-mustard: #b8801f;
+  --color-mustard-soft: #ead9b1;
+  --color-oxblood: #7a1b1b;
+  --color-oxblood-soft: #e8c1bc;
+  --color-teal: #2e4f5e;
+  --color-teal-soft: #bfd1d8;
+
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+}
+
+/* Dark palette overrides. `index.html`'s head script sets
+   `html.dark` / `html.light` synchronously before first paint, so this
+   is the only rule that flips the tokens — no media-query fallback
+   needed, and `html.light` returns to the `@theme` defaults by virtue
+   of not matching below. */
+html.dark {
+  --color-paper: #17140f;
+  --color-paper-deep: #1f1b14;
+  --color-paper-sunk: #28241b;
+  --color-ink: #eee5d0;
+  --color-ink-muted: #9a9082;
+  --color-ink-faint: #5e5648;
+  --color-rule: rgba(238, 229, 208, 0.12);
+  --color-rule-strong: rgba(238, 229, 208, 0.28);
+  --color-rust: #e07050;
+  --color-rust-deep: #b5553c;
+  --color-rust-soft: #5a2a1d;
+  --color-forest: #8aa884;
+  --color-forest-soft: #2d3f2a;
+  --color-mustard: #d9a24a;
+  --color-mustard-soft: #463722;
+  --color-oxblood: #c9625c;
+  --color-oxblood-soft: #4a1f1e;
+  --color-teal: #7ca1b0;
+  --color-teal-soft: #243640;
+}
+
+html,
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: 'ss01', 'ss02', 'cv11';
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--color-rust);
+  color: var(--color-paper);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-rule-strong) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--color-rule-strong);
+  border: 3px solid var(--color-paper);
+  border-radius: 999px;
+}
+
+.font-mono { font-family: var(--font-mono); }
+
+.label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-ink-muted);
+}
+
+.paper-card {
+  background: var(--color-paper);
+  border: 1px solid var(--color-rule);
+}
+.paper-card-deep {
+  background: var(--color-paper-deep);
+  border: 1px solid var(--color-rule);
+}
+
+/* Every route's outer wrapper. Leave the gap off — each page picks its
+   own cadence via gap-4/5/6/8. */
+.page { @apply px-8 py-8 max-w-6xl mx-auto flex flex-col; }
+.page-narrow { @apply px-8 py-8 max-w-5xl mx-auto flex flex-col; }
+
+:where(button, a, input, textarea, select, [role='button']):focus-visible {
+  outline: 1.5px solid var(--color-rust);
+  outline-offset: 2px;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.dot-pulse { animation: pulse-dot 1.8s ease-in-out infinite; }
+
+/* Conversation bubbles — three distinct speakers on the same paper */
+.bubble {
+  position: relative;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  border: 1px solid var(--color-rule);
+  max-width: 520px;
+}
+.bubble-ai {
+  background: var(--color-paper-deep);
+  border-color: var(--color-rule);
+  border-radius: 14px 14px 14px 2px;
+}
+.bubble-lead {
+  background: var(--color-rust);
+  color: var(--color-paper);
+  border-color: var(--color-rust-deep);
+  border-radius: 14px 14px 2px 14px;
+  align-self: flex-end;
+}
+.bubble-human {
+  background: var(--color-paper);
+  border: 1px dashed var(--color-ink-muted);
+  border-radius: 14px 14px 14px 2px;
+}
+
+.t-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.t-table th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-ink-muted);
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-rule);
+  font-weight: 500;
+}
+.t-table td {
+  padding: 12px;
+  border-bottom: 1px solid var(--color-rule);
+  font-size: 14px;
+  vertical-align: top;
+}
+.t-table tr:hover td { background: var(--color-paper-deep); }
+.t-table tr:last-child td { border-bottom: 0; }
+
+.tab {
+  position: relative;
+  padding: 10px 2px;
+  font-size: 13px;
+  color: var(--color-ink-muted);
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.tab::after {
+  content: '';
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 2px;
+  background: transparent;
+  transition: background 160ms ease;
+}
+.tab:hover { color: var(--color-ink); }
+.tab.is-active { color: var(--color-ink); }
+.tab.is-active::after { background: var(--color-ink); }
+
+.stripes {
+  background: repeating-linear-gradient(
+    135deg,
+    transparent 0 6px,
+    var(--color-rule) 6px 7px
+  );
+}

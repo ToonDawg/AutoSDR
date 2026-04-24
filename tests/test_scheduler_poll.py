@@ -7,7 +7,6 @@ the poll responses without talking to a real gateway.
 
 from __future__ import annotations
 
-import pytest
 
 from autosdr.connectors.base import (
     BaseConnector,

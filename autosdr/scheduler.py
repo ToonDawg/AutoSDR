@@ -13,19 +13,19 @@ Two concurrent concerns run inside the scheduler:
 
 Both run as cooperating asyncio tasks managed by the FastAPI lifespan in
 ``webhook.create_app``. All three respect the shared kill-switch event.
+
+Every knob here is read from ``workspace.settings`` — the only config source
+of truth — so toggling a value in the UI takes effect on the next tick.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from autosdr import killswitch
-from autosdr.config import Settings, get_settings
 from autosdr.connectors.base import BaseConnector
 from autosdr.db import session_scope
 from autosdr.models import (
@@ -34,35 +34,13 @@ from autosdr.models import (
     CampaignLeadStatus,
     CampaignStatus,
     Lead,
-    Message,
-    MessageRole,
-    Thread,
     Workspace,
 )
 from autosdr.pipeline import process_incoming_message, run_outreach_for_campaign_lead
+from autosdr.quota import count_ai_messages_last_24h
+from autosdr.workspace_settings import load_workspace_settings_or_empty
 
 logger = logging.getLogger(__name__)
-
-
-def _effective_setting(settings_blob: dict, key: str, env_override: int | None, fallback: int) -> int:
-    if env_override is not None:
-        return env_override
-    return int(settings_blob.get(key, fallback))
-
-
-def _count_ai_messages_last_24h(session: Session, campaign_id: str) -> int:
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
-    stmt = (
-        select(func.count(Message.id))
-        .join(Thread, Thread.id == Message.thread_id)
-        .join(CampaignLead, CampaignLead.id == Thread.campaign_lead_id)
-        .where(
-            CampaignLead.campaign_id == campaign_id,
-            Message.role == MessageRole.AI,
-            Message.created_at >= cutoff,
-        )
-    )
-    return int(session.execute(stmt).scalar_one() or 0)
 
 
 def _next_queued_leads(
@@ -89,11 +67,7 @@ def _next_queued_leads(
     return list(session.execute(stmt).all())
 
 
-async def _run_campaign_tick(
-    *,
-    connector: BaseConnector,
-    settings: Settings,
-) -> dict[str, int]:
+async def _run_campaign_tick(connector: BaseConnector) -> dict[str, int]:
     """One pass across all active campaigns; returns a send summary."""
 
     summary = {"campaigns": 0, "sent": 0, "failed": 0, "idle": 0}
@@ -101,23 +75,13 @@ async def _run_campaign_tick(
     with session_scope() as session:
         workspace = session.query(Workspace).first()
         if workspace is None:
-            logger.warning("no workspace — run `autosdr init` first")
+            logger.debug("no workspace yet — waiting for setup wizard")
             summary["idle"] += 1
             return summary
 
         settings_blob = workspace.settings or {}
-        min_delay_s = _effective_setting(
-            settings_blob,
-            "min_inter_send_delay_s",
-            settings.min_inter_send_delay_s,
-            30,
-        )
-        max_batch = _effective_setting(
-            settings_blob,
-            "max_batch_per_tick",
-            settings.max_batch_per_tick,
-            2,
-        )
+        min_delay_s = int(settings_blob.get("min_inter_send_delay_s", 30))
+        max_batch = int(settings_blob.get("max_batch_per_tick", 2))
 
         campaigns = (
             session.query(Campaign)
@@ -132,7 +96,7 @@ async def _run_campaign_tick(
             if killswitch.is_paused():
                 break
 
-            sent_last_24h = _count_ai_messages_last_24h(session, campaign.id)
+            sent_last_24h = count_ai_messages_last_24h(session, campaign.id)
             remaining = max(0, campaign.outreach_per_day - sent_last_24h)
             batch_limit = min(remaining, max_batch)
 
@@ -239,20 +203,11 @@ async def _poll_inbound_once(connector: BaseConnector) -> int:
     return dispatched
 
 
-async def run_inbound_poller(
-    connector: BaseConnector,
-    settings: Settings | None = None,
-) -> None:
+async def run_inbound_poller(connector: BaseConnector) -> None:
     """Background task: poll the connector for inbound messages every N seconds."""
 
-    settings = settings or get_settings()
-    with session_scope() as session:
-        workspace = session.query(Workspace).first()
-        settings_blob = (workspace.settings if workspace else {}) or {}
-
-    poll_s = _effective_setting(
-        settings_blob, "inbound_poll_s", settings.inbound_poll_s, 20
-    )
+    settings_blob = load_workspace_settings_or_empty()
+    poll_s = int(settings_blob.get("inbound_poll_s", 20))
     logger.info(
         "inbound poller started; poll=%ds connector=%s", poll_s, connector.connector_type
     )
@@ -277,21 +232,11 @@ async def run_inbound_poller(
             return
 
 
-async def run_scheduler(
-    connector: BaseConnector,
-    settings: Settings | None = None,
-) -> None:
+async def run_scheduler(connector: BaseConnector) -> None:
     """Main scheduler loop. Exits when the kill-switch shutdown event fires."""
 
-    settings = settings or get_settings()
-
-    with session_scope() as session:
-        workspace = session.query(Workspace).first()
-        settings_blob = (workspace.settings if workspace else {}) or {}
-
-    tick_s = _effective_setting(
-        settings_blob, "scheduler_tick_s", settings.scheduler_tick_s, 60
-    )
+    settings_blob = load_workspace_settings_or_empty()
+    tick_s = int(settings_blob.get("scheduler_tick_s", 60))
     logger.info("scheduler started; tick=%ds connector=%s", tick_s, connector.connector_type)
 
     while True:
@@ -303,9 +248,7 @@ async def run_scheduler(
             logger.debug("pause flag set — skipping tick")
         else:
             try:
-                summary = await _run_campaign_tick(
-                    connector=connector, settings=settings
-                )
+                summary = await _run_campaign_tick(connector=connector)
                 if summary["sent"] or summary["failed"]:
                     logger.info("scheduler tick summary: %s", summary)
             except Exception:

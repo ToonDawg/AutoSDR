@@ -15,9 +15,9 @@ from autosdr.models import (
     MessageRole,
     Thread,
     ThreadStatus,
-    Workspace,
 )
-from autosdr.scheduler import _count_ai_messages_last_24h, _next_queued_leads
+from autosdr.quota import count_ai_messages_last_24h
+from autosdr.scheduler import _next_queued_leads
 
 
 def _build_fixture(session, ws_id: str, num_leads: int) -> str:
@@ -67,7 +67,7 @@ def test_count_ai_messages_last_24h_includes_only_ai_role(fresh_db, workspace_fa
         )
         session.flush()
 
-        count = _count_ai_messages_last_24h(session, cid)
+        count = count_ai_messages_last_24h(session, cid)
         assert count == 2
 
 
@@ -91,7 +91,7 @@ def test_count_ai_messages_last_24h_excludes_old_messages(fresh_db, workspace_fa
         old.created_at = now - timedelta(hours=25)
         session.flush()
 
-        count = _count_ai_messages_last_24h(session, cid)
+        count = count_ai_messages_last_24h(session, cid)
         assert count == 1
 
 

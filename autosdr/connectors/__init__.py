@@ -1,10 +1,19 @@
-"""Connector abstraction + registry."""
+"""Connector abstraction + registry.
+
+The active connector is assembled from ``workspace.settings`` — the DB-backed
+source of truth — at boot time and cached in a module-level singleton. PATCHes
+to ``/api/workspace/settings`` call :func:`rebuild_connector` so that toggling
+CONNECTOR, flipping dry-run, or pasting a new API key takes effect without a
+server restart.
+"""
 
 from __future__ import annotations
 
 import logging
+import threading
+from typing import Any
 
-from autosdr.config import Settings, get_settings
+from autosdr.config import get_settings
 from autosdr.connectors.base import (
     BaseConnector,
     ConnectorError,
@@ -15,6 +24,7 @@ from autosdr.connectors.file_connector import FileConnector
 from autosdr.connectors.override import OverrideConnector
 from autosdr.connectors.smsgate import SmsGateConnector
 from autosdr.connectors.textbee import TextBeeConnector
+from autosdr.workspace_settings import load_workspace_settings_optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,60 +37,123 @@ __all__ = [
     "OverrideConnector",
     "SmsGateConnector",
     "TextBeeConnector",
+    "build_connector",
     "get_connector",
+    "rebuild_connector",
+    "reset_connector",
 ]
 
 
-def get_connector(settings: Settings | None = None) -> BaseConnector:
-    """Return the configured connector instance.
+# ---------------------------------------------------------------------------
+# Cached active connector
+# ---------------------------------------------------------------------------
+
+_connector: BaseConnector | None = None
+_lock = threading.Lock()
+
+
+def build_connector(workspace_settings: dict[str, Any]) -> BaseConnector:
+    """Assemble a connector from the workspace settings blob.
 
     Composition, in order:
 
-    1. Base connector is selected by ``CONNECTOR`` (file | textbee | smsgate).
-    2. ``DRY_RUN=true`` short-circuits to :class:`FileConnector` regardless of
-       ``CONNECTOR`` — nothing hits the wire, but the LLM still runs.
-    3. ``SMS_OVERRIDE_TO`` wraps the result in :class:`OverrideConnector` so
-       every outbound is rerouted to that number. Composable with dry-run:
-       the outbox then records the override number instead of real leads.
-
-    The scheduler + webhook handler both call this once at process start and
-    share the result — important for the TextBee connector's in-memory
-    "seen ids" dedup set and the override wrapper's inbound remapping.
+    1. Base connector selected by ``connector.type`` (file | textbee | smsgate).
+    2. ``rehearsal.dry_run=true`` forces :class:`FileConnector` — nothing hits
+       the wire, every outbound is appended to ``settings.outbox_path``. The
+       LLM still runs normally so eval / logs remain useful.
+    3. ``rehearsal.override_to`` wraps the result in :class:`OverrideConnector`
+       so every outbound is redirected to that number. Composable with dry-run.
     """
 
-    settings = settings or get_settings()
+    infra = get_settings()
+    connector_cfg = (workspace_settings or {}).get("connector") or {}
+    rehearsal = (workspace_settings or {}).get("rehearsal") or {}
+    ctype = str(connector_cfg.get("type") or "file").lower()
 
-    if settings.dry_run:
+    if rehearsal.get("dry_run"):
         logger.warning(
-            "DRY RUN mode active: using FileConnector (CONNECTOR=%s ignored). "
-            "Outbound will be appended to %s — no real SMS will be sent.",
-            settings.connector,
-            settings.outbox_path,
+            "dry-run mode active: forcing FileConnector (configured=%s)",
+            ctype,
         )
-        inner: BaseConnector = FileConnector(outbox_path=settings.outbox_path)
-    elif settings.connector == "file":
-        inner = FileConnector(outbox_path=settings.outbox_path)
-    elif settings.connector == "textbee":
+        inner: BaseConnector = FileConnector(outbox_path=infra.outbox_path)
+    elif ctype == "file":
+        inner = FileConnector(outbox_path=infra.outbox_path)
+    elif ctype == "textbee":
+        tb = connector_cfg.get("textbee") or {}
         inner = TextBeeConnector(
-            api_url=settings.textbee_api_url,
-            api_key=settings.textbee_api_key or "",
-            device_id=settings.textbee_device_id or "",
-            poll_limit=settings.textbee_poll_limit,
+            api_url=str(tb.get("api_url") or "https://api.textbee.dev"),
+            api_key=str(tb.get("api_key") or ""),
+            device_id=str(tb.get("device_id") or ""),
+            poll_limit=int(tb.get("poll_limit") or 50),
         )
-    elif settings.connector == "smsgate":
+    elif ctype == "smsgate":
+        sg = connector_cfg.get("smsgate") or {}
         inner = SmsGateConnector(
-            api_url=settings.smsgate_api_url,
-            username=settings.smsgate_username or "",
-            password=settings.smsgate_password or "",
+            api_url=str(sg.get("api_url") or ""),
+            username=str(sg.get("username") or ""),
+            password=str(sg.get("password") or ""),
         )
     else:
-        raise ConnectorError(f"unknown connector {settings.connector!r}")
+        raise ConnectorError(f"unknown connector type {ctype!r}")
 
-    if settings.sms_override_to:
+    override_to = rehearsal.get("override_to")
+    if override_to:
+        override_to = str(override_to).strip()
+    if override_to:
         logger.warning(
-            "OVERRIDE mode active: every outbound SMS will be redirected to %s",
-            settings.sms_override_to,
+            "override mode active: redirecting every outbound to %s",
+            override_to,
         )
-        return OverrideConnector(inner, settings.sms_override_to)
+        return OverrideConnector(inner, override_to)
 
     return inner
+
+
+def _load_workspace_settings_or_error() -> dict[str, Any]:
+    """Read the single workspace's settings blob; raise if no workspace yet."""
+
+    settings = load_workspace_settings_optional()
+    if settings is None:
+        raise ConnectorError(
+            "workspace has not been set up yet — complete the setup wizard first"
+        )
+    return settings
+
+
+def get_connector() -> BaseConnector:
+    """Return the cached connector singleton (building it on first access)."""
+
+    global _connector
+    if _connector is not None:
+        return _connector
+    with _lock:
+        if _connector is None:
+            _connector = build_connector(_load_workspace_settings_or_error())
+    return _connector
+
+
+def rebuild_connector(workspace_settings: dict[str, Any] | None = None) -> BaseConnector:
+    """Replace the cached connector with a fresh one.
+
+    Called by PATCH /api/workspace/settings so connector changes (swapping
+    TextBee for SmsGate, flipping dry-run, rotating credentials) take effect
+    immediately without restarting the process.
+    """
+
+    global _connector
+    settings = (
+        workspace_settings
+        if workspace_settings is not None
+        else _load_workspace_settings_or_error()
+    )
+    with _lock:
+        _connector = build_connector(settings)
+    return _connector
+
+
+def reset_connector() -> None:
+    """Clear the cached connector (tests, teardown)."""
+
+    global _connector
+    with _lock:
+        _connector = None

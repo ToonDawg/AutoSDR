@@ -194,6 +194,125 @@ def test_import_csv(tmp_path, workspace_factory, fresh_db):
                 assert l.status == LeadStatus.SKIPPED
 
 
+def test_reimport_demotes_queued_lead_when_phone_becomes_landline(
+    tmp_path, workspace_factory, fresh_db
+):
+    """Regression: a NEW lead whose number is later re-classified as non-mobile
+    must be flipped to SKIPPED with a ``not_a_mobile_number`` reason. Without
+    this the lead would stay assignable and we'd text a landline in production.
+    """
+
+    ws_id = workspace_factory()
+    landline_phone = "+61754954233"  # (07) 5495 4233 parses as LANDLINE
+
+    with fresh_db() as session:
+        lead = Lead(
+            workspace_id=ws_id,
+            name="Caboolture Parklands",
+            contact_uri=landline_phone,
+            contact_type=ContactType.MOBILE,
+            raw_data={},
+            import_order=1,
+            source_file="initial.json",
+            status=LeadStatus.NEW,
+            skip_reason=None,
+        )
+        session.add(lead)
+        session.flush()
+        lead_id = lead.id
+
+    path = tmp_path / "refresh.json"
+    _write_ndjson(
+        path,
+        [{"name": "Caboolture Parklands", "phone": "(07) 5495 4233", "category": "Aged Care"}],
+    )
+    with fresh_db() as session:
+        import_file(session=session, workspace_id=ws_id, path=path, region_hint="AU")
+
+    with fresh_db() as session:
+        refreshed = session.get(Lead, lead_id)
+        assert refreshed.contact_type == ContactType.LANDLINE
+        assert refreshed.status == LeadStatus.SKIPPED
+        assert refreshed.skip_reason == "not_a_mobile_number:landline"
+
+
+def test_reimport_promotes_skipped_lead_when_phone_becomes_mobile(
+    tmp_path, workspace_factory, fresh_db
+):
+    """A lead skipped because its number was ambiguous/landline should be
+    promoted back to NEW when a re-import identifies it as mobile.
+    """
+
+    ws_id = workspace_factory()
+    mobile_phone = "+61413123456"
+
+    with fresh_db() as session:
+        lead = Lead(
+            workspace_id=ws_id,
+            name="Ambiguous Number Ltd",
+            contact_uri=mobile_phone,
+            contact_type=ContactType.UNKNOWN,
+            raw_data={},
+            import_order=1,
+            source_file="initial.json",
+            status=LeadStatus.SKIPPED,
+            skip_reason="not_a_mobile_number:unknown",
+        )
+        session.add(lead)
+        session.flush()
+        lead_id = lead.id
+
+    path = tmp_path / "refresh.json"
+    _write_ndjson(
+        path, [{"name": "Ambiguous Number Ltd", "phone": "0413 123 456"}]
+    )
+    with fresh_db() as session:
+        import_file(session=session, workspace_id=ws_id, path=path, region_hint="AU")
+
+    with fresh_db() as session:
+        refreshed = session.get(Lead, lead_id)
+        assert refreshed.contact_type == ContactType.MOBILE
+        assert refreshed.status == LeadStatus.NEW
+        assert refreshed.skip_reason is None
+
+
+def test_reimport_never_touches_contacted_lead(tmp_path, workspace_factory, fresh_db):
+    """If the lead has already been engaged (contacted/replied/won/lost) the
+    re-import must NEVER change its status, even if the number is now
+    classified differently. Contact_type can still be refined for reporting.
+    """
+
+    ws_id = workspace_factory()
+    landline_phone = "+61754954233"
+
+    with fresh_db() as session:
+        lead = Lead(
+            workspace_id=ws_id,
+            name="Already Contacted",
+            contact_uri=landline_phone,
+            contact_type=ContactType.MOBILE,
+            raw_data={},
+            import_order=1,
+            source_file="initial.json",
+            status=LeadStatus.CONTACTED,
+            skip_reason=None,
+        )
+        session.add(lead)
+        session.flush()
+        lead_id = lead.id
+
+    path = tmp_path / "refresh.json"
+    _write_ndjson(path, [{"name": "Already Contacted", "phone": "(07) 5495 4233"}])
+    with fresh_db() as session:
+        import_file(session=session, workspace_id=ws_id, path=path, region_hint="AU")
+
+    with fresh_db() as session:
+        refreshed = session.get(Lead, lead_id)
+        assert refreshed.contact_type == ContactType.LANDLINE
+        assert refreshed.status == LeadStatus.CONTACTED
+        assert refreshed.skip_reason is None
+
+
 def test_import_rejects_unknown_extension(tmp_path, workspace_factory, fresh_db):
     ws_id = workspace_factory()
     path = tmp_path / "leads.xlsx"

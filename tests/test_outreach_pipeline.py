@@ -162,7 +162,8 @@ def _install_mock_llm(monkeypatch: pytest.MonkeyPatch, *, responses: dict[str, A
             latency_ms=1,
         )
 
-    monkeypatch.setattr("autosdr.pipeline.outreach.complete_text", _fake_complete_text)
+    monkeypatch.setattr("autosdr.pipeline._shared.complete_text", _fake_complete_text)
+    monkeypatch.setattr("autosdr.pipeline._shared.complete_json", _fake_complete_json)
     monkeypatch.setattr("autosdr.pipeline.outreach.complete_json", _fake_complete_json)
     return calls
 
@@ -176,13 +177,13 @@ async def test_outreach_happy_path(prepared_campaign, fresh_db, monkeypatch):
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v1": {
+            "analysis-v3.3": {
                 "angle": "Rating of 3 from 10 reviews suggests room to improve service perception.",
                 "signal": "rating=3, reviews=10",
                 "confidence": 0.7,
             },
-            "generation-v1": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
-            "evaluation-v1": {
+            "generation-v6": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
+            "evaluation-v4.2": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -247,16 +248,16 @@ async def test_outreach_retries_then_passes(prepared_campaign, fresh_db, monkeyp
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v1": {
+            "analysis-v3.3": {
                 "angle": "Rating 3 — opportunity to stand out",
                 "signal": "rating",
                 "confidence": 0.6,
             },
-            "generation-v1": [
+            "generation-v6": [
                 "Hello valued customer! Let's discuss synergies.",  # bad
                 "Hey — noticed your ratings slipped recently. Quick chat about it?",  # good
             ],
-            "evaluation-v1": [
+            "evaluation-v4.2": [
                 {
                     "scores": {
                         "tone_match": 0.3,
@@ -310,9 +311,9 @@ async def test_outreach_escalates_after_max_attempts(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v1": {"angle": "x", "signal": "y", "confidence": 0.5},
-            "generation-v1": "Hi hi hi hi hi hi hi hi.",
-            "evaluation-v1": {
+            "analysis-v3.3": {"angle": "x", "signal": "y", "confidence": 0.5},
+            "generation-v6": "Hi hi hi hi hi hi hi hi.",
+            "evaluation-v4.2": {
                 "scores": {
                     "tone_match": 0.3,
                     "personalisation": 0.3,
@@ -344,25 +345,27 @@ async def test_outreach_escalates_after_max_attempts(
     with fresh_db() as session:
         thread = session.query(Thread).one()
         assert thread.status == ThreadStatus.PAUSED_FOR_HITL
-        assert thread.hitl_reason == "eval_failed_after_3_attempts"
+        assert thread.hitl_reason == "eval_failed_after_max_attempts"
         assert len(thread.hitl_context["last_drafts"]) == 3
         assert len(thread.hitl_context["last_scores"]) == 3
         # No message row written for rejected drafts.
         assert session.query(Message).count() == 0
 
 
-async def test_outreach_rejects_message_over_160_chars(
+async def test_outreach_rejects_message_over_max_length(
     prepared_campaign, fresh_db, monkeypatch
 ):
     """length_valid is recomputed from the draft itself, not trusted from the LLM."""
 
-    long_draft = "x" * 170
+    from autosdr.prompts.evaluation import MAX_SMS_LENGTH
+
+    long_draft = "x" * (MAX_SMS_LENGTH + 10)
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v1": {"angle": "y", "signal": "z", "confidence": 0.6},
-            "generation-v1": long_draft,
-            "evaluation-v1": {
+            "analysis-v3.3": {"angle": "y", "signal": "z", "confidence": 0.6},
+            "generation-v6": long_draft,
+            "evaluation-v4.2": {
                 "scores": {
                     "tone_match": 1.0,
                     "personalisation": 1.0,

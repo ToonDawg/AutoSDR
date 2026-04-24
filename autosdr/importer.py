@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -290,10 +291,34 @@ def _process_row(
         existing.raw_data = merged_raw
         changed = True
 
-    # Update contact_type if we now know it more precisely.
+    # Refine contact_type when we now know it more precisely, and reconcile
+    # status + skip_reason for leads that have never been engaged. Without
+    # this, a lead initially classified MOBILE (or UNKNOWN) that turns out
+    # to be a LANDLINE/TOLL_FREE could still sit at ``status=new`` and get
+    # assigned to a campaign — we'd then text a landline in production.
+    # Only touch pre-engagement states (``new`` and ``skipped``); never
+    # clobber ``contacted``/``replied``/``won``/``lost``.
     if existing.contact_type != contact_type and contact_type != ContactType.UNKNOWN:
         existing.contact_type = contact_type
         changed = True
+
+        if existing.status in (LeadStatus.NEW, LeadStatus.SKIPPED):
+            if is_mobile:
+                # Promote skipped-for-non-mobile back into the queue.
+                was_non_mobile_skip = (
+                    existing.status == LeadStatus.SKIPPED
+                    and (existing.skip_reason or "").startswith("not_a_mobile_number")
+                )
+                if was_non_mobile_skip:
+                    existing.status = LeadStatus.NEW
+                    existing.skip_reason = None
+            else:
+                # Demote queued leads whose number turned out to be non-mobile.
+                if existing.status == LeadStatus.NEW:
+                    existing.status = LeadStatus.SKIPPED
+                    existing.skip_reason = default_skip_reason
+                elif existing.skip_reason != default_skip_reason:
+                    existing.skip_reason = default_skip_reason
 
     if changed:
         session.flush()
@@ -361,3 +386,105 @@ def import_file(
     session.flush()
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Preview: parse the file and report what *would* happen, without touching the DB.
+# ---------------------------------------------------------------------------
+
+_PREVIEW_SAMPLE_LIMIT = 20
+
+
+@dataclass
+class PreviewRow:
+    """One row as it would be classified on commit."""
+
+    name: str | None
+    phone: str | None
+    normalised_phone: str | None
+    contact_type: str
+    skip_reason: str | None
+
+
+@dataclass
+class ImportPreview:
+    """The shape the ``POST /api/leads/import/preview`` endpoint returns.
+
+    ``would_skip`` is ordered by frequency descending so the endpoint can
+    render it directly. ``sample`` is capped at the first ``_PREVIEW_SAMPLE_LIMIT``
+    rows — enough to eyeball without blowing up big-file previews.
+    """
+
+    file_type: str
+    total_rows: int
+    would_import: int
+    would_skip: list[tuple[str, int]]
+    sample: list[PreviewRow]
+
+
+def preview_import_file(*, path: Path, region_hint: str = "AU") -> ImportPreview:
+    """Dry-run version of :func:`import_file`.
+
+    The web preview endpoint used to reach directly into ``_detect_file_type``,
+    ``_iter_csv``/``_iter_ndjson``, and ``_split_core_and_raw``. Exposing one
+    helper here means the parsing rules, alias resolution, and phone
+    normalisation stay in a single module; callers just get a summary.
+    """
+
+    path = Path(path)
+    file_type = _detect_file_type(path)
+    iterator = _iter_csv(path) if file_type == "csv" else _iter_ndjson(path)
+
+    total = 0
+    would_import = 0
+    skip_counter: Counter[str] = Counter()
+    sample: list[PreviewRow] = []
+
+    for row in iterator:
+        total += 1
+        core, _raw = _split_core_and_raw(row)
+        raw_phone = core.get("phone")
+
+        if not raw_phone:
+            skip_counter["no_contact_uri"] += 1
+            if len(sample) < _PREVIEW_SAMPLE_LIMIT:
+                sample.append(
+                    PreviewRow(
+                        name=core.get("name"),
+                        phone=None,
+                        normalised_phone=None,
+                        contact_type=ContactType.UNKNOWN,
+                        skip_reason="no_contact_uri",
+                    )
+                )
+            continue
+
+        e164, contact_type = normalise_phone(raw_phone, region_hint=region_hint)
+        if not e164:
+            skip_reason: str | None = "invalid_phone_format"
+            skip_counter[skip_reason] += 1
+        elif contact_type != ContactType.MOBILE:
+            skip_reason = f"not_a_mobile_number:{contact_type}"
+            skip_counter[skip_reason] += 1
+        else:
+            would_import += 1
+            skip_reason = None
+
+        if len(sample) < _PREVIEW_SAMPLE_LIMIT:
+            sample.append(
+                PreviewRow(
+                    name=core.get("name"),
+                    phone=str(raw_phone),
+                    normalised_phone=e164,
+                    contact_type=contact_type,
+                    skip_reason=skip_reason,
+                )
+            )
+
+    return ImportPreview(
+        file_type=file_type,
+        total_rows=total,
+        would_import=would_import,
+        would_skip=list(skip_counter.most_common()),
+        sample=sample,
+    )

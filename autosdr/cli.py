@@ -1,4 +1,19 @@
-"""Typer-based CLI. Installed as the ``autosdr`` console script."""
+"""Typer-based CLI. Installed as the ``autosdr`` console script.
+
+Scope (after the cleanup PR):
+
+* ``autosdr run`` — boots the FastAPI app (UI + API + scheduler + poller).
+* ``autosdr pause`` / ``resume`` / ``stop`` — kill-switch ergonomics.
+* ``autosdr status`` — quick process health.
+* ``autosdr import <file>`` — CSV / NDJSON lead import.
+* ``autosdr sim inbound`` — drive the reply pipeline with a fake inbound.
+* ``autosdr logs llm`` / ``logs thread`` — audit LLM call history.
+
+Everything else (create the workspace, create a campaign, assign leads)
+lives in the UI — the setup wizard handles first-run and the Campaigns /
+Leads pages handle ongoing CRUD. Keeping the CLI surface small means there
+is exactly one way to do each thing.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +22,6 @@ import atexit
 import logging
 import os
 import signal
-import sys
-from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -16,11 +29,10 @@ from typing import Optional
 import typer
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy import and_, func, select
+from sqlalchemy import select
 
 from autosdr import killswitch
-from autosdr import config as config_module
-from autosdr.config import default_workspace_settings, get_settings
+from autosdr.config import get_settings
 from autosdr.connectors import get_connector as _get_connector
 from autosdr.connectors.base import ConnectorError, OutgoingMessage
 from autosdr.db import create_all, session_scope
@@ -28,28 +40,21 @@ from autosdr.llm import get_usage_snapshot
 from autosdr.models import (
     Campaign,
     CampaignLead,
-    CampaignLeadStatus,
     CampaignStatus,
     Lead,
-    LeadStatus,
     LlmCall,
     Message,
-    MessageRole,
     Thread,
-    ThreadStatus,
     Workspace,
 )
+from autosdr.quota import count_ai_messages_last_24h
 
 app = typer.Typer(help="AutoSDR POC — autonomous SDR for small business owners.")
-campaign_app = typer.Typer(help="Manage outreach campaigns.")
 test_app = typer.Typer(help="Connectivity and health tests.")
-hitl_app = typer.Typer(help="Human-in-the-loop operations.")
 sim_app = typer.Typer(help="Simulate inbound messages (for testing).")
 logs_app = typer.Typer(help="Inspect LLM call and thread transcripts.")
 
-app.add_typer(campaign_app, name="campaign")
 app.add_typer(test_app, name="test")
-app.add_typer(hitl_app, name="hitl")
 app.add_typer(sim_app, name="sim")
 app.add_typer(logs_app, name="logs")
 
@@ -91,97 +96,23 @@ def _configure_logging() -> None:
         root.warning("failed to attach file log handler")
 
 
-def get_connector():
-    """Wrap :func:`autosdr.connectors.get_connector` with a friendly CLI error.
-
-    Connector constructors raise :class:`ConnectorError` when required config
-    is missing (e.g. ``TEXTBEE_API_KEY``). Instead of surfacing a traceback,
-    print the problem and exit with code 2 so scripts can detect it.
-    """
+def _get_connector_or_exit():
+    """Wrap :func:`autosdr.connectors.get_connector` with a friendly CLI error."""
 
     try:
         return _get_connector()
     except ConnectorError as exc:
-        console.print(f"[red]connector misconfigured[/red]: {exc}")
+        console.print(f"[red]{exc}[/red]")
         console.print(
-            "[dim]tip: check .env — set CONNECTOR + the provider-specific keys "
-            "(e.g. TEXTBEE_API_KEY, TEXTBEE_DEVICE_ID, or SMSGATE_USERNAME + "
-            "SMSGATE_PASSWORD). Pass --dry-run to skip real SMS entirely.[/dim]"
+            "[dim]tip: complete the setup wizard at /setup once the server "
+            "is running, or edit workspace settings via PATCH /api/workspace/settings[/dim]"
         )
         raise typer.Exit(code=2) from exc
 
 
-def _apply_test_mode_flags(dry_run: bool, override_to: str | None) -> None:
-    """Propagate ``--dry-run`` / ``--override-to`` into the settings layer.
-
-    Both are ordinary env-backed settings, so the cleanest way to make a CLI
-    flag win over a ``.env`` value is to mutate ``os.environ`` before Settings
-    is first built. We also clear the singleton in case anything upstream
-    already instantiated it.
-    """
-
-    if dry_run:
-        os.environ["DRY_RUN"] = "true"
-    if override_to:
-        os.environ["SMS_OVERRIDE_TO"] = override_to.strip()
-    if dry_run or override_to:
-        config_module.reset_settings_for_tests()
-
-
 # ---------------------------------------------------------------------------
-# init / import
+# import
 # ---------------------------------------------------------------------------
-
-
-@app.command()
-def init(
-    business_name: str = typer.Option(
-        "My Business", "--business-name", help="Short label for the workspace."
-    ),
-    business_dump: str = typer.Option(
-        ..., "--business-dump", help="Free-form description of your business (what you sell, who you sell to)."
-    ),
-    tone: str = typer.Option(
-        ..., "--tone", help="Desired tone for generated messages."
-    ),
-    default_region: str = typer.Option(
-        "AU",
-        "--region",
-        help="Region hint for phone number parsing (ISO 3166-1 alpha-2).",
-    ),
-) -> None:
-    """Create (or replace) the single workspace row."""
-
-    _configure_logging()
-    create_all()
-    env = get_settings()
-    ws_settings = default_workspace_settings(env)
-    ws_settings["default_region"] = default_region
-
-    with session_scope() as session:
-        existing = session.query(Workspace).first()
-        if existing:
-            existing.business_name = business_name
-            existing.business_dump = business_dump
-            existing.tone_prompt = tone
-            existing.settings = ws_settings
-            console.print(f"[green]workspace updated[/green] id={existing.id}")
-        else:
-            workspace = Workspace(
-                business_name=business_name,
-                business_dump=business_dump,
-                tone_prompt=tone,
-                settings=ws_settings,
-            )
-            session.add(workspace)
-            session.flush()
-            console.print(f"[green]workspace created[/green] id={workspace.id}")
-
-    console.print(
-        f"connector=[cyan]{env.connector}[/cyan]  "
-        f"next: [green]autosdr import <file>[/green] then "
-        f"[green]autosdr campaign create[/green]"
-    )
 
 
 @app.command("import")
@@ -197,7 +128,9 @@ def import_leads(
     with session_scope() as session:
         workspace = session.query(Workspace).first()
         if workspace is None:
-            console.print("[red]run `autosdr init` first[/red]")
+            console.print(
+                "[red]no workspace — complete the setup wizard at /setup first[/red]"
+            )
             raise typer.Exit(code=1)
 
         region_hint = (workspace.settings or {}).get("default_region", "AU")
@@ -223,238 +156,55 @@ def import_leads(
 
 
 # ---------------------------------------------------------------------------
-# campaign subcommands
-# ---------------------------------------------------------------------------
-
-
-@campaign_app.command("create")
-def campaign_create(
-    name: str = typer.Option(..., "--name"),
-    goal: str = typer.Option(..., "--goal"),
-    per_day: int = typer.Option(20, "--per-day", min=1),
-    connector_type: str = typer.Option("android_sms", "--connector-type"),
-) -> None:
-    with session_scope() as session:
-        workspace = session.query(Workspace).first()
-        if workspace is None:
-            console.print("[red]run `autosdr init` first[/red]")
-            raise typer.Exit(code=1)
-
-        campaign = Campaign(
-            workspace_id=workspace.id,
-            name=name,
-            goal=goal,
-            outreach_per_day=per_day,
-            connector_type=connector_type,
-            status=CampaignStatus.DRAFT,
-        )
-        session.add(campaign)
-        session.flush()
-        console.print(f"[green]campaign created[/green] id={campaign.id} name={name!r}")
-
-
-@campaign_app.command("list")
-def campaign_list() -> None:
-    with session_scope() as session:
-        campaigns = session.query(Campaign).all()
-        tbl = Table(title="Campaigns")
-        tbl.add_column("id", overflow="fold")
-        tbl.add_column("name")
-        tbl.add_column("status")
-        tbl.add_column("per_day")
-        tbl.add_column("queued")
-        tbl.add_column("contacted")
-        tbl.add_column("replied")
-        tbl.add_column("won")
-        tbl.add_column("lost")
-        for c in campaigns:
-            totals = _campaign_status_breakdown(session, c.id)
-            tbl.add_row(
-                c.id,
-                c.name,
-                c.status,
-                str(c.outreach_per_day),
-                str(totals["queued"]),
-                str(totals["contacted"]),
-                str(totals["replied"]),
-                str(totals["won"]),
-                str(totals["lost"]),
-            )
-        console.print(tbl)
-
-
-def _campaign_status_breakdown(session, campaign_id: str) -> dict[str, int]:
-    out = {s: 0 for s in ("queued", "contacted", "replied", "won", "lost", "skipped")}
-    stmt = (
-        select(CampaignLead.status, func.count(CampaignLead.id))
-        .where(CampaignLead.campaign_id == campaign_id)
-        .group_by(CampaignLead.status)
-    )
-    for status_name, count in session.execute(stmt).all():
-        out[status_name] = int(count)
-    return out
-
-
-@campaign_app.command("assign")
-def campaign_assign(
-    campaign_id: str,
-    all_unassigned: bool = typer.Option(
-        False, "--all-unassigned", help="Assign every lead not yet in this campaign."
-    ),
-    limit: Optional[int] = typer.Option(None, "--limit", help="Cap the number assigned."),
-) -> None:
-    """Assign leads to a campaign."""
-
-    with session_scope() as session:
-        campaign = session.get(Campaign, campaign_id)
-        if campaign is None:
-            console.print(f"[red]campaign {campaign_id} not found[/red]")
-            raise typer.Exit(code=1)
-
-        if not all_unassigned:
-            console.print(
-                "[yellow]only --all-unassigned is supported in the POC;"
-                " per-lead assignment is a v1 feature[/yellow]"
-            )
-            raise typer.Exit(code=1)
-
-        # Find leads that (a) are 'new' status and (b) not already in this campaign.
-        subquery = select(CampaignLead.lead_id).where(
-            CampaignLead.campaign_id == campaign.id
-        )
-        leads_query = (
-            select(Lead)
-            .where(
-                and_(
-                    Lead.workspace_id == campaign.workspace_id,
-                    Lead.status == LeadStatus.NEW,
-                    ~Lead.id.in_(subquery),
-                )
-            )
-            .order_by(Lead.import_order.asc())
-        )
-        if limit:
-            leads_query = leads_query.limit(limit)
-
-        leads = list(session.execute(leads_query).scalars())
-        existing_count = (
-            session.execute(
-                select(func.count(CampaignLead.id)).where(
-                    CampaignLead.campaign_id == campaign.id
-                )
-            ).scalar_one()
-            or 0
-        )
-
-        for idx, lead in enumerate(leads):
-            session.add(
-                CampaignLead(
-                    campaign_id=campaign.id,
-                    lead_id=lead.id,
-                    queue_position=int(existing_count) + idx + 1,
-                    status=CampaignLeadStatus.QUEUED,
-                )
-            )
-
-        console.print(f"[green]assigned[/green] {len(leads)} leads to {campaign.name!r}")
-
-
-@campaign_app.command("activate")
-def campaign_activate(campaign_id: str) -> None:
-    _set_campaign_status(campaign_id, CampaignStatus.ACTIVE)
-
-
-@campaign_app.command("pause")
-def campaign_pause(campaign_id: str) -> None:
-    _set_campaign_status(campaign_id, CampaignStatus.PAUSED)
-
-
-@campaign_app.command("stop")
-def campaign_stop(campaign_id: str) -> None:
-    _set_campaign_status(campaign_id, CampaignStatus.COMPLETED)
-
-
-def _set_campaign_status(campaign_id: str, status_value: str) -> None:
-    with session_scope() as session:
-        campaign = session.get(Campaign, campaign_id)
-        if campaign is None:
-            console.print(f"[red]campaign {campaign_id} not found[/red]")
-            raise typer.Exit(code=1)
-        campaign.status = status_value
-        console.print(f"[green]campaign {campaign.name!r} -> {status_value}[/green]")
-
-
-# ---------------------------------------------------------------------------
 # run / pause / resume / stop / status
 # ---------------------------------------------------------------------------
 
 
 @app.command()
 def run(
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help=(
-            "Mock SMS for a full workflow rehearsal. Forces FileConnector "
-            "regardless of CONNECTOR — nothing hits the wire, every outbound "
-            "is appended to data/outbox.jsonl. The LLM still runs normally so "
-            "you can review data/logs/llm-YYYYMMDD.jsonl afterwards."
-        ),
+    host: Optional[str] = typer.Option(
+        None, "--host", help="Bind host. Defaults to settings.host (127.0.0.1)."
     ),
-    override_to: Optional[str] = typer.Option(
-        None,
-        "--override-to",
-        help=(
-            "E.164 phone number that every outbound SMS is redirected to "
-            "(e.g. your own phone). Use with the real connector to rehearse "
-            "outbound end-to-end against one device before pointing at real "
-            "leads."
-        ),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="Bind port. Defaults to settings.port (8000)."
     ),
 ) -> None:
-    """Start the webhook server + scheduler. Ctrl+C to stop."""
+    """Start the FastAPI server (UI + API + scheduler). Ctrl+C to stop.
 
-    _apply_test_mode_flags(dry_run=dry_run, override_to=override_to)
+    All connector / LLM / rehearsal config comes from ``workspace.settings``
+    — if you haven't set up a workspace yet, open the browser at the bound
+    address and finish the setup wizard. The scheduler will no-op until
+    that's done.
+    """
+
     _configure_logging()
     create_all()
     env = get_settings()
 
     import uvicorn
 
-    from autosdr.webhook import create_app
-
     killswitch.write_pid_file()
-    # Belt-and-braces PID file cleanup: `finally` blocks don't always run
-    # if Python exits with a signal exit code, so we register atexit AND
-    # explicit signal handlers that clean the PID file before re-raising.
     atexit.register(killswitch.clear_pid_file)
 
     def _cleanup_on_signal(signum: int, _frame) -> None:
         killswitch.clear_pid_file()
-        # Re-raise via default handler so uvicorn sees the signal.
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
-    # Only install for SIGTERM — SIGINT should stay with uvicorn so Ctrl+C
-    # still surfaces a KeyboardInterrupt cleanly to uvicorn's own handler.
     signal.signal(signal.SIGTERM, _cleanup_on_signal)
 
-    mode_suffix = ""
-    if env.dry_run:
-        mode_suffix += " [bold yellow]DRY-RUN[/bold yellow]"
-    if env.sms_override_to:
-        mode_suffix += f" [bold yellow]OVERRIDE->{env.sms_override_to}[/bold yellow]"
+    bind_host = host or env.host
+    bind_port = int(port or env.port)
     console.print(
-        f"[green]autosdr starting[/green] pid={os.getpid()} "
-        f"connector={env.connector} host={env.host} port={env.port}"
-        + mode_suffix
+        f"[green]autosdr[/green] starting  pid={os.getpid()}  "
+        f"http://{bind_host}:{bind_port}/"
     )
 
     try:
         uvicorn.run(
-            create_app(run_scheduler_task=True),
-            host=env.host,
-            port=env.port,
+            "autosdr.webhook:app",
+            host=bind_host,
+            port=bind_port,
             log_level=os.environ.get("UVICORN_LOG_LEVEL", "info"),
         )
     finally:
@@ -499,14 +249,12 @@ def stop() -> None:
 def status() -> None:
     """Show pause state, LLM usage, and campaign quota progress."""
 
-    env = get_settings()
     create_all()
 
     paused = killswitch.is_flag_set()
     pid = killswitch.read_pid_file()
     console.print(
-        f"paused={'yes' if paused else 'no'}  pid={pid if pid else 'n/a'}  "
-        f"connector={env.connector}"
+        f"paused={'yes' if paused else 'no'}  pid={pid if pid else 'n/a'}"
     )
     usage = get_usage_snapshot()
     console.print(
@@ -531,8 +279,16 @@ def status() -> None:
     with session_scope() as session:
         workspace = session.query(Workspace).first()
         if workspace is None:
-            console.print("[yellow]no workspace — run `autosdr init`[/yellow]")
+            console.print(
+                "[yellow]no workspace — complete the setup wizard at /setup[/yellow]"
+            )
             return
+
+        connector_cfg = (workspace.settings or {}).get("connector") or {}
+        console.print(
+            f"connector=[cyan]{connector_cfg.get('type', 'file')}[/cyan]  "
+            f"auto_reply_enabled={(workspace.settings or {}).get('auto_reply_enabled', False)}"
+        )
 
         active = (
             session.query(Campaign)
@@ -548,91 +304,11 @@ def status() -> None:
         tbl.add_column("per_day")
         tbl.add_column("sent_24h")
         tbl.add_column("remaining")
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
         for c in active:
-            sent_24h = (
-                session.execute(
-                    select(func.count(Message.id))
-                    .join(Thread, Thread.id == Message.thread_id)
-                    .join(CampaignLead, CampaignLead.id == Thread.campaign_lead_id)
-                    .where(
-                        CampaignLead.campaign_id == c.id,
-                        Message.role == MessageRole.AI,
-                        Message.created_at >= cutoff,
-                    )
-                ).scalar_one()
-                or 0
-            )
-            remaining = max(0, c.outreach_per_day - int(sent_24h))
+            sent_24h = count_ai_messages_last_24h(session, c.id)
+            remaining = max(0, c.outreach_per_day - sent_24h)
             tbl.add_row(c.name, str(c.outreach_per_day), str(sent_24h), str(remaining))
         console.print(tbl)
-
-
-# ---------------------------------------------------------------------------
-# HITL
-# ---------------------------------------------------------------------------
-
-
-@hitl_app.command("list")
-def hitl_list() -> None:
-    """List threads waiting for owner attention."""
-
-    with session_scope() as session:
-        threads = (
-            session.query(Thread)
-            .filter(Thread.status == ThreadStatus.PAUSED_FOR_HITL)
-            .all()
-        )
-        if not threads:
-            console.print("[green]no threads waiting for HITL[/green]")
-            return
-        tbl = Table(title="HITL queue")
-        tbl.add_column("thread_id", overflow="fold")
-        tbl.add_column("reason")
-        tbl.add_column("updated_at")
-        for t in threads:
-            tbl.add_row(t.id, t.hitl_reason or "", str(t.updated_at))
-        console.print(tbl)
-
-
-@hitl_app.command("show")
-def hitl_show(thread_id: str) -> None:
-    with session_scope() as session:
-        t = session.get(Thread, thread_id)
-        if t is None:
-            console.print(f"[red]thread {thread_id} not found[/red]")
-            raise typer.Exit(code=1)
-        console.print(
-            f"[bold]thread {t.id}[/bold]  status={t.status}  "
-            f"hitl_reason={t.hitl_reason}"
-        )
-        if t.hitl_context:
-            console.print(t.hitl_context)
-        messages = (
-            session.query(Message)
-            .filter(Message.thread_id == t.id)
-            .order_by(Message.created_at.asc())
-            .all()
-        )
-        if not messages:
-            console.print("[dim](no messages yet)[/dim]")
-        for m in messages:
-            console.print(f"[{m.created_at.isoformat()}] [{m.role}] {m.content}")
-
-
-@hitl_app.command("resume")
-def hitl_resume(thread_id: str) -> None:
-    """Mark a HITL thread as active again so the AI takes over."""
-
-    with session_scope() as session:
-        t = session.get(Thread, thread_id)
-        if t is None:
-            console.print(f"[red]thread {thread_id} not found[/red]")
-            raise typer.Exit(code=1)
-        t.status = ThreadStatus.ACTIVE
-        t.hitl_reason = None
-        t.hitl_context = None
-        console.print(f"[green]thread {t.id} -> active[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -646,22 +322,17 @@ def test_sms(
     content: str = typer.Option(
         "AutoSDR test message — ignore.", "--content"
     ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Write to data/outbox.jsonl via FileConnector instead of real send.",
-    ),
-    override_to: Optional[str] = typer.Option(
-        None,
-        "--override-to",
-        help="Redirect the test send to this number (e.g. your own phone).",
-    ),
 ) -> None:
-    """Send a test SMS via the configured connector."""
+    """Send a test SMS via the configured connector.
 
-    _apply_test_mode_flags(dry_run=dry_run, override_to=override_to)
+    Uses whatever is in ``workspace.settings`` — if you want to test in
+    dry-run or override-to mode, flip the Rehearsal toggles in the UI
+    first.
+    """
+
     _configure_logging()
-    connector = get_connector()
+    create_all()
+    connector = _get_connector_or_exit()
 
     async def _run():
         ok, detail = await connector.validate_config()
@@ -690,7 +361,7 @@ def sim_inbound(
 
     _configure_logging()
     create_all()
-    connector = get_connector()
+    connector = _get_connector_or_exit()
 
     async def _run() -> None:
         incoming = connector.parse_webhook(
@@ -699,7 +370,9 @@ def sim_inbound(
         with session_scope() as session:
             workspace = session.query(Workspace).first()
             if workspace is None:
-                console.print("[red]run `autosdr init` first[/red]")
+                console.print(
+                    "[red]no workspace — complete the setup wizard first[/red]"
+                )
                 raise typer.Exit(code=1)
             workspace_id = workspace.id
 
@@ -909,7 +582,6 @@ def logs_thread(
                 colour = {"ai": "cyan", "human": "green", "lead": "magenta"}.get(role, "white")
                 console.print(f"[dim]{stamp}[/dim] [{colour}]{role:>5}[/{colour}]  {obj.content}")
                 continue
-            # llm
             style = _PURPOSE_STYLE.get(obj.purpose, "white")
             header = (
                 f"[dim]{stamp}[/dim] [{style}]{obj.purpose:>13}[/{style}]  "

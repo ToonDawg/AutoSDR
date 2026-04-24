@@ -121,6 +121,40 @@ from autosdr.models import LlmCall, LlmCallPurpose
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Provider API keys
+#
+# LiteLLM reads ``GEMINI_API_KEY`` / ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY``
+# from ``os.environ``. We keep the source of truth in ``workspace.settings``
+# and shove the values into the environment at boot and on every settings
+# PATCH so a key rotation takes effect without restarting the process.
+# ---------------------------------------------------------------------------
+
+
+_PROVIDER_ENV = {
+    "gemini": "GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
+
+
+def apply_llm_provider_keys(workspace_settings: dict[str, Any]) -> None:
+    """Copy provider keys from the workspace settings blob into ``os.environ``.
+
+    Called at process start (after the workspace is loaded) and again whenever
+    settings are updated via the REST API. A missing or empty key leaves the
+    corresponding env var untouched so existing env-based setups still work
+    during the transition.
+    """
+
+    llm = (workspace_settings or {}).get("llm") or {}
+    provider_keys = llm.get("provider_api_keys") or {}
+    for provider, env_var in _PROVIDER_ENV.items():
+        value = provider_keys.get(provider)
+        if value and isinstance(value, str) and value.strip():
+            _os.environ[env_var] = value.strip()
+
+
 class LLMError(RuntimeError):
     """Unrecoverable LLM error, or retries exhausted."""
 

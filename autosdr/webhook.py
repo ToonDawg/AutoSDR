@@ -1,23 +1,18 @@
-"""FastAPI app: webhook ingress + health.
+"""FastAPI app: REST API + static frontend + scheduler lifecycle.
 
-The POC runs three concurrent async tasks inside the FastAPI lifespan:
+Single-process boot: the one ``uvicorn autosdr.webhook:app`` serves both
+``/api/*`` JSON routes and the built React frontend at ``/``. No separate
+Vite dev server is needed in production — the plan's goal 5.
+
+Async tasks inside the app lifespan:
 
 1. ``run_scheduler`` — outreach tick loop (sends queued leads).
-2. ``run_inbound_poller`` — pulls new inbound messages from the connector
-   (TextBee polling) and drives the reply pipeline.
-3. ``watch_flag_file`` — notices the pause flag appearing/disappearing.
+2. ``run_inbound_poller`` — TextBee / file connector poll for inbound SMS.
+3. ``watch_flag_file`` — notices the pause flag appearing / disappearing.
 
-Two HTTP entry points for inbound messages:
-
-* ``POST /api/webhooks/sms`` — push-based: the active connector's
-  ``parse_webhook`` is invoked. Used by SmsGate (the Android app POSTs to us
-  on the LAN).
-* ``POST /api/webhooks/sim`` — dev-only simulator, accepts a simple
-  ``{"contact_uri": ..., "content": ...}`` payload regardless of which
-  connector is active.
-
-Poll-based connectors (TextBee) just ignore ``/api/webhooks/sms`` — the
-endpoint is still live, it's just inert because nothing POSTs to it.
+Startup order matters: we hot-apply the workspace's LLM provider keys into
+``os.environ`` *before* the scheduler fires so the first outreach tick has
+valid credentials without needing a restart.
 """
 
 from __future__ import annotations
@@ -25,53 +20,99 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from sqlalchemy.orm.attributes import flag_modified
 
 from autosdr import killswitch
-from autosdr.config import get_settings
+from autosdr.api import ALL_ROUTERS
+from autosdr.api.deps import SETUP_REQUIRED_STATUS
+from autosdr.api.errors import install_exception_handlers
+from autosdr.config import get_settings, merge_workspace_settings
 from autosdr.connectors import get_connector
-from autosdr.connectors.base import BaseConnector
-from autosdr.connectors.file_connector import FileConnector
 from autosdr.db import session_scope
-from autosdr.llm import get_usage_snapshot
+from autosdr.llm import apply_llm_provider_keys, get_usage_snapshot
 from autosdr.models import Workspace
-from autosdr.pipeline import process_incoming_message
 from autosdr.scheduler import run_inbound_poller, run_scheduler
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_workspace_id() -> str | None:
-    """POC: there is exactly one workspace. Return its ID."""
+def _load_and_backfill_workspace_settings() -> dict | None:
+    """Load the workspace settings blob, self-healing any legacy gaps.
+
+    This is distinct from the plain readers in :mod:`autosdr.workspace_settings`
+    because it also mutates: legacy workspaces created before the current
+    settings schema (or by the old CLI init path) can be missing top-level
+    keys like ``connector``, ``auto_reply_enabled``, ``rehearsal``, or
+    ``llm.provider_api_keys``. The UI Settings page relies on those keys
+    to render inputs, and the status endpoint/pipeline code otherwise has
+    to paper over them with ``.get(..., default)`` everywhere. Merging the
+    defaults back in once at boot keeps the DB, the UI, and the runtime
+    in sync. We keep the read + write in one session so the caller gets a
+    dict that already reflects what was just committed.
+    """
 
     with session_scope() as session:
         workspace = session.query(Workspace).first()
-        return workspace.id if workspace else None
+        if workspace is None:
+            return None
+
+        existing = dict(workspace.settings or {})
+        merged = merge_workspace_settings(existing, {})
+        if merged != existing:
+            workspace.settings = merged
+            flag_modified(workspace, "settings")
+            logger.info(
+                "workspace=%s settings backfilled with defaults for missing keys",
+                workspace.id,
+            )
+        return dict(merged)
 
 
 def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
     """Build the FastAPI app.
 
     ``run_scheduler_task=False`` is used by tests that drive the reply
-    pipeline directly without needing the scheduler or poller to run.
+    pipeline directly without the scheduler or poller running.
     """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # NB: we intentionally do NOT call killswitch.install_signal_handlers()
-        # here — uvicorn installs its own SIGINT/SIGTERM handlers, and
-        # overriding them would prevent the server from shutting down. Instead
-        # we rely on uvicorn driving the lifespan shutdown path below, which
-        # flips _hard_stop and wakes the scheduler.
-        app.state.connector = get_connector()
-
         scheduler_task: asyncio.Task | None = None
         poller_task: asyncio.Task | None = None
         flag_watcher: asyncio.Task | None = None
-        if run_scheduler_task:
+
+        # Apply LLM provider keys from settings into os.environ before any
+        # scheduler tick runs — LiteLLM reads them at call time.
+        settings_blob = _load_and_backfill_workspace_settings()
+        if settings_blob is not None:
+            try:
+                apply_llm_provider_keys(settings_blob)
+            except Exception:
+                logger.exception("failed to apply llm provider keys on boot")
+
+            # Build and cache the connector so the first tick doesn't stall
+            # behind a cold start. If the workspace hasn't been set up yet,
+            # we skip this — the scheduler + poller gracefully no-op until
+            # setup completes.
+            try:
+                app.state.connector = get_connector()
+            except Exception as exc:
+                logger.warning("connector unavailable at boot: %s", exc)
+                app.state.connector = None
+        else:
+            logger.info(
+                "no workspace yet — waiting for setup wizard before starting scheduler"
+            )
+            app.state.connector = None
+
+        if run_scheduler_task and app.state.connector is not None:
             scheduler_task = asyncio.create_task(
                 run_scheduler(app.state.connector), name="autosdr.scheduler"
             )
@@ -97,128 +138,107 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
                     pass
 
     app = FastAPI(title="AutoSDR", lifespan=lifespan)
+    install_exception_handlers(app)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
+        connector = getattr(app.state, "connector", None)
         return {
             "status": "ok",
             "paused": killswitch.is_flag_set(),
             "shutting_down": killswitch.is_shutting_down(),
-            "connector": getattr(app.state, "connector", None).__class__.__name__
-            if hasattr(app.state, "connector")
-            else None,
+            "connector": connector.__class__.__name__ if connector else None,
             "llm_usage": get_usage_snapshot(),
         }
 
-    @app.post("/api/webhooks/sms")
-    async def webhook_sms(
-        request: Request, background_tasks: BackgroundTasks
-    ) -> JSONResponse:
-        """Inbound SMS webhook — delegates parsing to the active connector.
+    # ------------------------------------------------------------------
+    # API routers
+    # ------------------------------------------------------------------
+    for router in ALL_ROUTERS:
+        app.include_router(router)
 
-        Used by push-based connectors such as SmsGate. TextBee polls instead,
-        so this endpoint is inert under ``CONNECTOR=textbee`` (nothing will
-        POST to it).
-        """
-
-        try:
-            payload = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="invalid JSON")
-
-        try:
-            incoming = app.state.connector.parse_webhook(payload)
-        except ValueError as exc:
-            # Non-inbound events (sms:delivered, sms:failed, ...) also arrive
-            # here — they raise ValueError and we 202 them so the sender stops
-            # retrying without polluting logs as hard errors.
-            logger.info("ignoring non-inbound webhook: %s", exc)
-            return JSONResponse(
-                content={"accepted": False, "reason": str(exc)},
-                status_code=status.HTTP_202_ACCEPTED,
-            )
-
-        workspace_id = _resolve_workspace_id()
-        if workspace_id is None:
-            return JSONResponse(
-                content={"accepted": False, "reason": "no_workspace"},
-                status_code=status.HTTP_202_ACCEPTED,
-            )
-
-        background_tasks.add_task(
-            _process_in_background,
-            connector=app.state.connector,
-            workspace_id=workspace_id,
-            incoming=incoming,
-        )
-        return JSONResponse(
-            content={"accepted": True},
-            status_code=status.HTTP_202_ACCEPTED,
-        )
-
-    @app.post("/api/webhooks/sim")
-    async def webhook_sim(
-        request: Request, background_tasks: BackgroundTasks
-    ) -> JSONResponse:
-        """Dev/testing webhook — accepts ``{"contact_uri": ..., "content": ...}``.
-
-        Always parses via :class:`FileConnector` (simple ``contact_uri``/
-        ``content`` shape) regardless of the active connector, so you can
-        inject synthetic inbound without matching the real provider's
-        payload schema.
-        """
-
-        try:
-            payload = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="invalid JSON")
-
-        parser = FileConnector(outbox_path=get_settings().outbox_path)
-        try:
-            incoming = parser.parse_webhook(payload)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        workspace_id = _resolve_workspace_id()
-        if workspace_id is None:
-            return JSONResponse(
-                content={"accepted": False, "reason": "no_workspace"},
-                status_code=status.HTTP_202_ACCEPTED,
-            )
-
-        background_tasks.add_task(
-            _process_in_background,
-            connector=app.state.connector,
-            workspace_id=workspace_id,
-            incoming=incoming,
-        )
-        return JSONResponse(
-            content={"accepted": True},
-            status_code=status.HTTP_202_ACCEPTED,
-        )
+    # ------------------------------------------------------------------
+    # Static frontend (built Vite bundle)
+    # ------------------------------------------------------------------
+    _attach_frontend(app)
 
     return app
 
 
-async def _process_in_background(
-    *, connector: BaseConnector, workspace_id: str, incoming: Any
-) -> None:
-    """Background task wrapper — swallows exceptions so the task runner stays alive."""
+def _attach_frontend(app: FastAPI) -> None:
+    """Mount the built React SPA at ``/`` with an index-html fallback.
 
-    if killswitch.is_paused():
-        logger.info("dropping inbound while paused: %s", incoming.contact_uri)
+    We don't want the existence of the frontend to be load-bearing — if
+    ``frontend/dist`` hasn't been built yet we just log a warning and
+    serve API-only. The SPA handles 404s client-side anyway.
+    """
+
+    dist_dir: Path = get_settings().frontend_dist_dir
+    if not dist_dir.exists():
+        logger.warning(
+            "frontend dist directory %s not found — skipping static mount "
+            "(run `cd frontend && npm run build`)",
+            dist_dir,
+        )
         return
-    try:
-        result = await process_incoming_message(
-            connector=connector,
-            workspace_id=workspace_id,
-            incoming=incoming,
+
+    assets_dir = dist_dir / "assets"
+    if assets_dir.exists():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=str(assets_dir)),
+            name="assets",
         )
-        logger.info(
-            "inbound processed: action=%s intent=%s thread=%s",
-            result.action,
-            result.intent,
-            result.thread_id,
-        )
-    except Exception:
-        logger.exception("inbound processing failed for %s", incoming.contact_uri)
+
+    index_html = dist_dir / "index.html"
+    if not index_html.exists():
+        logger.warning("frontend index.html missing at %s", index_html)
+        return
+
+    # Serve specific public-root files (favicon, robots, manifest) directly.
+    for static_file in ("favicon.svg", "favicon.ico", "icon.svg", "icons.svg", "robots.txt", "manifest.json"):
+        asset = dist_dir / static_file
+        if asset.exists():
+            _register_root_file(app, asset, "/" + static_file)
+
+    @app.get("/", include_in_schema=False)
+    async def serve_root() -> FileResponse:
+        return FileResponse(index_html)
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str, request: Request) -> FileResponse:
+        """Catch-all that returns index.html for SPA deep links.
+
+        Keeps API 404s as real 404s: we only rewrite GETs that (a) are not
+        under ``/api/`` and (b) accept HTML. Anything else (an asset the
+        build didn't produce, an API caller pinging a missing endpoint)
+        gets a genuine 404.
+        """
+
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail={"error": "not_found"})
+
+        accept = request.headers.get("accept", "")
+        if "text/html" not in accept and "*/*" not in accept:
+            raise HTTPException(status_code=404, detail={"error": "not_found"})
+
+        return FileResponse(index_html)
+
+
+def _register_root_file(app: FastAPI, asset: Path, url_path: str) -> None:
+    """Register a single static file at ``url_path``."""
+
+    @app.get(url_path, include_in_schema=False)
+    async def _serve_root_file() -> FileResponse:  # noqa: D401
+        return FileResponse(asset)
+
+
+# ---------------------------------------------------------------------------
+# Module-level app instance for ``uvicorn autosdr.webhook:app``.
+# ---------------------------------------------------------------------------
+
+
+app = create_app()
+
+
+__all__ = ["app", "create_app", "SETUP_REQUIRED_STATUS"]

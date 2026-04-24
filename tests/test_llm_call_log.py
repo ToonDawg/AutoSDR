@@ -49,7 +49,7 @@ async def test_complete_text_writes_row_and_jsonl(fresh_db, llm_stub):
         system="you are a helpful SDR",
         user="write a greeting",
         model="gemini/gemini-3-flash-preview",
-        prompt_version="analysis-v1",
+        prompt_version="analysis-v3.3",
         temperature=0.2,
         context=ctx,
     )
@@ -67,7 +67,7 @@ async def test_complete_text_writes_row_and_jsonl(fresh_db, llm_stub):
         assert row.workspace_id == "ws-1"
         assert row.thread_id == "thread-1"
         assert row.model == "gemini/gemini-3-flash-preview"
-        assert row.prompt_version == "analysis-v1"
+        assert row.prompt_version == "analysis-v3.3"
         assert row.attempt == 1
         assert row.response_text == "ok"
         assert row.error is None
@@ -100,7 +100,7 @@ async def test_complete_json_parses_and_backfills_parsed(fresh_db, llm_stub):
         system="extract",
         user="raw data dump",
         model="gemini/gemini-3-flash-preview",
-        prompt_version="analysis-v1",
+        prompt_version="analysis-v3.3",
         context=ctx,
     )
 
@@ -161,7 +161,7 @@ async def test_disabled_logging_skips_db_and_jsonl(
         system="s",
         user="u",
         model="gemini/gemini-3-flash-preview",
-        prompt_version="analysis-v1",
+        prompt_version="analysis-v3.3",
         context=LlmCallContext(purpose=LlmCallPurpose.ANALYSIS),
     )
     assert result.llm_call_id is None
@@ -186,7 +186,7 @@ async def test_provider_error_persists_failed_row(fresh_db, llm_stub, monkeypatc
             system="s",
             user="u",
             model="gemini/gemini-3-flash-preview",
-            prompt_version="analysis-v1",
+            prompt_version="analysis-v3.3",
             context=LlmCallContext(
                 purpose=LlmCallPurpose.ANALYSIS,
                 workspace_id="ws-1",

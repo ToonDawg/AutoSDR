@@ -1,4 +1,4 @@
-"""Outreach pipeline: analyse -> generate -> evaluate -> send."""
+"""First-contact outreach pipeline: analyse -> generate -> evaluate -> send."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from autosdr.connectors.base import BaseConnector, OutgoingMessage
-from autosdr.llm import LlmCallContext, complete_json, complete_text
+from autosdr.llm import LlmCallContext, complete_json
 from autosdr.models import (
     Campaign,
     CampaignLead,
@@ -23,7 +23,16 @@ from autosdr.models import (
     ThreadStatus,
     Workspace,
 )
-from autosdr.prompts import analysis, evaluation, generation
+from autosdr.pipeline._shared import (
+    build_send_metadata,
+    generate_and_evaluate,
+    hitl_context_from_loop_failure,
+    hitl_context_from_send_failure,
+    pause_thread_for_hitl,
+    read_loop_settings,
+    thread_history,
+)
+from autosdr.prompts import analysis
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +52,9 @@ def _ensure_thread(
 ) -> tuple[Thread, bool]:
     """Return the thread for this campaign_lead; create if missing.
 
-    We always commit before returning. This serves two purposes:
-
-    1. If we just created a new thread, it's now durable and LLM contexts
-       can safely reference ``thread.id``.
-    2. It flushes any pending writes from a prior lead's pipeline in the
-       same scheduler tick (the outer session is reused across leads) so
-       the SQLite writer lock is released before we start issuing LLM
-       calls. Without this, the outer session holds the writer lock for
-       the full ~30-60s pipeline run and every ``_log_call`` insert
-       times out on ``busy_timeout`` and rolls back, hollowing out
-       ``autosdr logs llm`` and thread replay.
+    We always commit before returning so the thread id is durable for the
+    LLM call log and the outer scheduler loop can release SQLite's writer
+    lock before we begin issuing LLM calls.
     """
 
     thread = (
@@ -137,162 +138,6 @@ async def _run_analysis(
     return parsed, truncated
 
 
-async def _generate_and_evaluate(
-    *,
-    settings_llm: dict[str, Any],
-    eval_threshold: float,
-    eval_max_attempts: int,
-    workspace: Workspace,
-    campaign: Campaign,
-    lead: Lead,
-    thread: Thread,
-    angle: str,
-    lead_short_name: str | None = None,
-    message_history: list[dict[str, str]] | None,
-) -> dict[str, Any]:
-    """Run the generate/evaluate loop up to ``eval_max_attempts`` times.
-
-    Returns a dict with: ``status`` (pass|fail), ``draft`` (final draft if pass),
-    ``attempts`` (int), ``drafts`` (list of dicts per attempt), ``last_feedback``.
-    """
-
-    system_gen = generation.build_system_prompt(thread.tone_snapshot)
-    system_eval = evaluation.build_system_prompt()
-
-    gen_ctx = LlmCallContext(
-        purpose=LlmCallPurpose.GENERATION,
-        workspace_id=workspace.id,
-        campaign_id=campaign.id,
-        thread_id=thread.id,
-        lead_id=lead.id,
-    )
-    eval_ctx = LlmCallContext(
-        purpose=LlmCallPurpose.EVALUATION,
-        workspace_id=workspace.id,
-        campaign_id=campaign.id,
-        thread_id=thread.id,
-        lead_id=lead.id,
-    )
-
-    attempts: list[dict[str, Any]] = []
-    feedback: str | None = None
-
-    for attempt_num in range(1, eval_max_attempts + 1):
-        gen_user = generation.build_user_prompt(
-            business_data=workspace.business_data or {},
-            business_dump=workspace.business_dump,
-            campaign_goal=campaign.goal,
-            angle=angle,
-            lead_name=lead.name,
-            lead_short_name=lead_short_name,
-            lead_category=lead.category,
-            lead_address=lead.address,
-            previous_feedback=feedback,
-            message_history=message_history,
-        )
-        logger.info(
-            "generation attempt=%d thread=%s model=%s",
-            attempt_num,
-            thread.id,
-            settings_llm["model_main"],
-        )
-        gen_result = await complete_text(
-            system=system_gen,
-            user=gen_user,
-            model=settings_llm["model_main"],
-            prompt_version=generation.PROMPT_VERSION,
-            temperature=float(settings_llm.get("temperature_main", 1.0)),
-            context=gen_ctx,
-        )
-        draft = gen_result.text.strip()
-
-        eval_user = evaluation.build_user_prompt(
-            tone_snapshot=thread.tone_snapshot,
-            campaign_goal=campaign.goal,
-            angle=angle,
-            draft=draft,
-            lead_category=lead.category,
-        )
-        eval_raw, eval_result = await complete_json(
-            system=system_eval,
-            user=eval_user,
-            model=settings_llm["model_eval"],
-            prompt_version=evaluation.PROMPT_VERSION,
-            temperature=float(settings_llm.get("temperature_eval", 1.0)),
-            context=eval_ctx,
-        )
-        normalised = evaluation.evaluate_result(
-            eval_raw, draft=draft, threshold=eval_threshold
-        )
-
-        attempts.append(
-            {
-                "attempt": attempt_num,
-                "draft": draft,
-                "scores": normalised["scores"],
-                "overall": normalised["overall"],
-                "pass": normalised["pass"],
-                "feedback": normalised["feedback"],
-                "gen_tokens_in": gen_result.tokens_in,
-                "gen_tokens_out": gen_result.tokens_out,
-                "gen_llm_call_id": gen_result.llm_call_id,
-                "eval_tokens_in": eval_result.tokens_in,
-                "eval_tokens_out": eval_result.tokens_out,
-                "eval_llm_call_id": eval_result.llm_call_id,
-            }
-        )
-
-        logger.info(
-            "evaluation attempt=%d thread=%s overall=%.3f pass=%s length=%d",
-            attempt_num,
-            thread.id,
-            normalised["overall"],
-            normalised["pass"],
-            len(draft),
-        )
-
-        if normalised["pass"]:
-            return {
-                "status": "pass",
-                "draft": draft,
-                "attempts": attempt_num,
-                "drafts": attempts,
-                "overall": normalised["overall"],
-                "scores": normalised["scores"],
-                "last_feedback": normalised["feedback"],
-            }
-
-        feedback = normalised["feedback"]
-        logger.info(
-            "evaluation rejected attempt=%d thread=%s feedback=%r",
-            attempt_num,
-            thread.id,
-            (feedback or "")[:200],
-        )
-
-    return {
-        "status": "fail",
-        "draft": None,
-        "attempts": eval_max_attempts,
-        "drafts": attempts,
-        "overall": attempts[-1]["overall"] if attempts else 0.0,
-        "last_feedback": feedback,
-    }
-
-
-def _thread_history(session: Session, thread: Thread, *, limit: int = 10) -> list[dict[str, str]]:
-    """Load the most recent N messages for a thread, oldest-first."""
-
-    rows = (
-        session.query(Message)
-        .filter(Message.thread_id == thread.id)
-        .order_by(Message.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-    return [{"role": m.role, "content": m.content} for m in reversed(rows)]
-
-
 async def run_outreach_for_campaign_lead(
     *,
     session: Session,
@@ -305,9 +150,7 @@ async def run_outreach_for_campaign_lead(
     """Execute the outreach pipeline for a single campaign-lead assignment."""
 
     settings_blob = workspace.settings or {}
-    settings_llm = settings_blob.get("llm") or {}
-    eval_threshold = float(settings_blob.get("eval_threshold", 0.85))
-    eval_max_attempts = int(settings_blob.get("eval_max_attempts", 3))
+    settings_llm, eval_threshold, eval_max_attempts = read_loop_settings(workspace)
     raw_data_size_limit_kb = int(settings_blob.get("raw_data_size_limit_kb", 50))
 
     if campaign_lead.status != CampaignLeadStatus.QUEUED:
@@ -326,8 +169,7 @@ async def run_outreach_for_campaign_lead(
         campaign.id,
     )
 
-    # 1. Analysis (first-contact only; replies re-use thread.angle)
-    message_history = _thread_history(session, thread)
+    message_history = thread_history(session, thread)
     analysis_meta: dict[str, Any] = {}
     if created or not thread.angle:
         analysis_result, truncated = await _run_analysis(
@@ -341,9 +183,6 @@ async def run_outreach_for_campaign_lead(
         angle = str(analysis_result.get("angle") or "").strip()
         if not angle:
             angle = f"{lead.category or 'business'} in {lead.address or 'the area'}"
-        # If analysis confidently identified the owner's first name, prepend
-        # it as a labelled line so the generation / evaluation prompts can
-        # reliably see it (and it survives across reply turns via thread.angle).
         owner_first_name = str(analysis_result.get("owner_first_name") or "").strip()
         if owner_first_name:
             angle = f"Recipient owner's first name: {owner_first_name}\n\n{angle}"
@@ -375,8 +214,7 @@ async def run_outreach_for_campaign_lead(
         angle = thread.angle
         lead_short_name = None
 
-    # 2+3. Generate and evaluate
-    loop_result = await _generate_and_evaluate(
+    loop_result = await generate_and_evaluate(
         settings_llm=settings_llm,
         eval_threshold=eval_threshold,
         eval_max_attempts=eval_max_attempts,
@@ -390,20 +228,11 @@ async def run_outreach_for_campaign_lead(
     )
 
     if loop_result["status"] != "pass":
-        thread.status = ThreadStatus.PAUSED_FOR_HITL
-        thread.hitl_reason = "eval_failed_after_3_attempts"
-        thread.hitl_context = {
-            "last_drafts": [a["draft"] for a in loop_result["drafts"]],
-            "last_scores": [
-                {
-                    "overall": a["overall"],
-                    "breakdown": a["scores"],
-                    "feedback": a["feedback"],
-                }
-                for a in loop_result["drafts"]
-            ],
-            "attempts": loop_result["attempts"],
-        }
+        pause_thread_for_hitl(
+            thread,
+            reason="eval_failed_after_max_attempts",
+            context=hitl_context_from_loop_failure(loop_result),
+        )
         session.flush()
         logger.warning(
             "outreach escalated lead=%s thread=%s reason=eval_failed attempts=%d last_overall=%.3f",
@@ -420,7 +249,6 @@ async def run_outreach_for_campaign_lead(
             overall_score=loop_result["overall"],
         )
 
-    # 4. Send
     draft: str = loop_result["draft"]
     logger.info(
         "outreach sending lead=%s thread=%s connector=%s chars=%d",
@@ -434,13 +262,15 @@ async def run_outreach_for_campaign_lead(
     )
 
     if not send_result.success:
-        thread.status = ThreadStatus.PAUSED_FOR_HITL
-        thread.hitl_reason = "connector_send_failed"
-        thread.hitl_context = {
-            "last_drafts": [draft],
-            "connector_error": send_result.error,
-            "attempts": loop_result["attempts"],
-        }
+        pause_thread_for_hitl(
+            thread,
+            reason="connector_send_failed",
+            context=hitl_context_from_send_failure(
+                draft=draft,
+                send_result=send_result,
+                loop_result=loop_result,
+            ),
+        )
         session.flush()
         logger.error(
             "outreach connector failed lead=%s thread=%s error=%s",
@@ -456,20 +286,12 @@ async def run_outreach_for_campaign_lead(
             overall_score=loop_result["overall"],
         )
 
-    # 5. Append message + propagate statuses
-    metadata = {
-        "eval_score": loop_result["overall"],
-        "eval_attempts": loop_result["attempts"],
-        "eval_scores_breakdown": loop_result["scores"],
-        "angle_used": angle,
-        "model": settings_llm.get("model_main"),
-        "eval_model": settings_llm.get("model_eval"),
-        "prompt_version": generation.PROMPT_VERSION,
-        "eval_prompt_version": evaluation.PROMPT_VERSION,
-        "provider_message_id": send_result.provider_message_id,
-        "gen_llm_call_ids": [a.get("gen_llm_call_id") for a in loop_result["drafts"]],
-        "eval_llm_call_ids": [a.get("eval_llm_call_id") for a in loop_result["drafts"]],
-    }
+    metadata = build_send_metadata(
+        loop_result=loop_result,
+        settings_llm=settings_llm,
+        send_result=send_result,
+        angle_used=angle,
+    )
     if analysis_meta:
         metadata["analysis"] = analysis_meta
 
@@ -505,13 +327,4 @@ async def run_outreach_for_campaign_lead(
     )
 
 
-_generate_and_evaluate_for_reply = _generate_and_evaluate
-_thread_history_for_reply = _thread_history
-
-
-__all__ = [
-    "OutreachResult",
-    "run_outreach_for_campaign_lead",
-    "_generate_and_evaluate_for_reply",
-    "_thread_history_for_reply",
-]
+__all__ = ["OutreachResult", "run_outreach_for_campaign_lead"]

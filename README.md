@@ -1,182 +1,235 @@
 # AutoSDR
 
 Autonomous SDR for small business owners. Self-hosted, open-source. You point
-it at a lead list + a goal, it runs the outreach + reply loop on your behalf
-over SMS (via an Android phone), and it hands the conversation back to you
-when it gets stuck.
+it at a lead list + a goal, and it sends the first outreach SMS for you. When
+a lead replies, it drafts 2–3 candidate responses, scores them against your
+tone, and parks the thread — you pick which one goes out (or write your own).
+No auto-replies, no runaway spam. One human in the loop.
 
-This repo is the **proof-of-concept (POC)** — single-process, SQLite, Gemini,
-CLI only. The full v1 stack (Postgres, Redis/Celery, Next.js PWA with Web Push)
-is described in the four spec docs in this directory; the POC implements the
-core AI loop end-to-end so the hard part can be validated before the rest is
-built.
+Single process: FastAPI serves the API *and* the built React UI from the same
+port. SQLite for storage. Gemini (or any LiteLLM-supported provider) for the
+language model. TextBee / SMSGate on an Android phone for SMS, or a local
+file-backed connector for dev.
 
-Spec docs:
+---
 
-- [autosdr-doc1-product-overview.md](./autosdr-doc1-product-overview.md)
-- [autosdr-doc2-data-architecture.md](./autosdr-doc2-data-architecture.md)
-- [autosdr-doc3-ai-messaging.md](./autosdr-doc3-ai-messaging.md)
-- [autosdr-doc4-onboarding-config.md](./autosdr-doc4-onboarding-config.md)
+## What it does
 
-## What the POC does
+1. Import a CSV / JSON lead list. Phones normalise to E.164; landlines and
+   toll-free numbers are flagged so the scheduler never texts them.
+2. For each queued lead, the pipeline analyses the raw record, picks a
+   personalisation angle, drafts an SMS in your tone, and self-evaluates it
+   against five criteria (tone, personalisation, goal, length, naturalness).
+   Rewrites up to three times; escalates to HITL if it can't pass.
+3. Sends via your configured connector.
+4. When a lead replies, the classifier reads intent. Clear negatives and
+   goal-reached conversations close automatically. Everything else pauses the
+   thread, generates two or three AI-drafted candidate replies, and waits for
+   you to pick one, edit one, or type your own.
+5. Enforces a per-campaign rolling-24h send cap.
+6. Persists every LLM call — prompts, response, tokens, latency, error — to
+   the `llm_call` table and `data/logs/llm-YYYYMMDD.jsonl`, so you can audit
+   and iterate on prompts after the fact.
+7. Honours a kill switch: pause from the UI, the CLI, or a flag file.
 
-1. Imports a CSV or NDJSON lead list, normalising phone numbers to E.164 and
-   flagging non-mobile rows so they don't burn gateway attempts.
-2. Analyses each lead with an LLM to extract a personalisation angle from
-   whatever raw data the import carried (reviews, ratings, categories, etc.).
-3. Drafts an outreach SMS in your tone and self-evaluates it against five
-   criteria (tone, personalisation, goal alignment, length, naturalness).
-   Rewrites up to 3 times; escalates to HITL if it can't pass.
-4. Sends via your configured connector (TextBee Android gateway, or a local
-   file-backed connector for dev / testing).
-5. Classifies inbound replies and either auto-responds (positive / objection /
-   question) or escalates (bot check, low confidence, max-replies reached,
-   goal achieved, clear negative). Inbound is polled from TextBee — no public
-   URL or tunnel is required.
-6. Enforces a rolling 24-hour per-campaign send cap with a configurable
-   inter-send delay.
-7. Obeys a three-layer kill switch (Ctrl+C, flag file, CLI).
-8. Persists every LLM call (system + user prompts, response, tokens, latency,
-   error) to an `llm_call` table and to `data/logs/llm-YYYYMMDD.jsonl` so you
-   can audit and refine prompts after the fact via `autosdr logs llm` and
-   `autosdr logs thread <id>`.
+Configuration lives in the database (`workspace.settings`), not in `.env`.
+The only environment variables the server reads are pure infrastructure:
+`DATABASE_URL`, `HOST`, `PORT`, `PAUSE_FLAG_PATH`. Everything else — LLM keys,
+model slugs, connector credentials, scheduler intervals, evaluator thresholds,
+rehearsal mode — is set from the Settings page and hot-reloaded at runtime.
+
+---
 
 ## Requirements
 
 - Python 3.11+
-- A Google Gemini API key (the free tier is fine for the POC — get one at
-  https://aistudio.google.com/app/apikey)
-- For real SMS: an Android phone with the
-  [TextBee](https://textbee.dev) app installed and a TextBee API key + device
-  id. No tunnel / public URL required — the scheduler polls TextBee's REST API.
-- For dev-only testing: nothing beyond Python + the Gemini key — a file-backed
-  connector lets you drive the reply pipeline without a phone.
+- Node 20+ (to build the UI)
+- A Google Gemini API key (free tier fine for the POC —
+  <https://aistudio.google.com/app/apikey>)
+- For real SMS: an Android phone running [TextBee](https://textbee.dev) or
+  [SMSGate](https://sms-gate.app). No tunnel / public URL — the scheduler
+  polls the gateway's REST API.
+- For local testing: nothing extra. The file connector writes outbound SMS
+  to `data/outbox.jsonl` and lets you simulate inbound replies from the CLI.
 
-## Quickstart (dev — file connector, no phone needed)
+---
 
-```bash
-git clone <this repo> && cd AutoSDR
-python -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'
-
-cp .env.example .env
-# set GEMINI_API_KEY. leave CONNECTOR=file.
-
-autosdr init \
-  --business-dump "We run a staffing platform that helps aged-care facilities reduce agency spend and weekend understaffing. We onboard in under a week. We charge per shift filled, not a subscription." \
-  --tone "Casual and direct. One idea per sentence. No corporate language. Open with a grounded observation about the recipient, close with a single low-pressure question."
-
-autosdr import example-leads.json
-autosdr campaign create --name "Pilot" --goal "Book a 15-minute call to walk through the staffing platform" --per-day 5
-# the command above prints the campaign id — copy it
-
-autosdr campaign assign <campaign-id> --all-unassigned
-autosdr campaign activate <campaign-id>
-
-autosdr run
-# in another terminal: tail -f data/outbox.jsonl  to see drafted SMSes
-# simulate a reply:
-# autosdr sim inbound --from "+61400000001" --content "tell me more"
-# Ctrl+C to stop. `autosdr pause` / `autosdr resume` to toggle without stopping.
-```
-
-## Switching to real SMS (TextBee)
-
-1. Install the TextBee app on your Android phone (https://textbee.dev/download).
-   Toggle "Receive SMS" on in its settings.
-2. At https://textbee.dev/dashboard, register the device, copy the API key and
-   the device id.
-3. Edit `.env`:
-   ```
-   CONNECTOR=textbee
-   TEXTBEE_API_KEY=...
-   TEXTBEE_DEVICE_ID=...
-   ```
-4. Smoke-test: `autosdr test sms --to "+61400000000"` — sends to your own
-   number. The CLI first validates the device is reachable.
-5. `autosdr run`. The scheduler polls TextBee every `INBOUND_POLL_S` seconds
-   (default 20 s) so replies flow back in without any public URL.
-
-## Reviewing the AI loop
-
-Every LLM call is persisted so you can audit and iterate on prompt quality:
+## Quickstart
 
 ```bash
-# Last 20 calls in a compact table.
-autosdr logs llm
+git clone <this-repo> && cd AutoSDR
 
-# Full system/user/response for the last 5 generation calls.
-autosdr logs llm --purpose generation --tail 5 --show-prompts
+cd frontend && npm install && npm run build && cd ..
+uv sync                          # or: pip install -e '.[dev]'
 
-# Everything that happened on a single thread, inbound + outbound + every
-# model call in between (chronological).
-autosdr logs thread <thread-id>
-autosdr logs thread <thread-id> --show-prompts
+uv run autosdr run               # defaults to http://localhost:8000
 ```
 
-There's also `data/logs/llm-YYYYMMDD.jsonl` if you'd rather grep / pipe through
-jq, and `data/logs/autosdr.log` (rotating) which captures the scheduler +
-pipeline INFO stream.
+Open <http://localhost:8000>. The app lands on `/setup` because no workspace
+exists yet. Walk through the three-step wizard:
+
+1. **Business** — name, a short description, your outreach tone.
+2. **LLM** — paste your Gemini API key, pick a model (default
+   `gemini/gemini-2.5-flash`).
+3. **Connector** — pick `file` (dev), `textbee`, or `smsgate`. For TextBee
+   you need the API key and device id; for SMSGate the endpoint + basic-auth
+   credentials.
+
+Submit. The server creates the workspace row, seeds the default settings,
+wires up the connector, and drops you on the Dashboard. From there:
+
+- **Leads → Import** — drag a CSV / JSON / NDJSON file in; preview shows what
+  will import vs. skip; commit.
+- **Campaigns → New campaign** — name, goal, sends-per-day. Save, then
+  **Activate** and **Assign all eligible leads**.
+- The scheduler starts sending on the next tick. Watch the Dashboard for
+  outbound volume; reply-triggered threads land in **Inbox**.
+
+Auto-reply is off by default — the "first-message-only" mode. You can flip it
+back on from Settings → AI behaviour if you trust the loop, but the whole
+product is designed around keeping a human on every reply.
+
+---
+
+## Simulating a reply (file connector)
+
+With the file connector active, there's no real SMS going out. To exercise
+the reply pipeline:
+
+```bash
+uv run autosdr sim inbound --from "+61400000001" --content "tell me more"
+```
+
+AutoSDR classifies the intent, generates candidate drafts, parks the thread
+as "Needs you", and the UI's Inbox will surface it within a few seconds.
+
+---
 
 ## Kill switch
 
-Three redundant ways to halt processing immediately:
+Three ways to halt everything immediately:
 
-| I want to... | Run this |
-|---|---|
-| Pause without stopping the process | `autosdr pause` (creates `data/.autosdr-pause`) |
-| Resume | `autosdr resume` |
-| Stop the process gracefully | `autosdr stop` (or `Ctrl+C` in the run terminal) |
-| Check state | `autosdr status` |
+| I want to…                          | Do this                               |
+| ----------------------------------- | ------------------------------------- |
+| Pause without stopping the process  | **Pause** button (top-right of the UI) or `autosdr pause` |
+| Resume                              | **Resume** button or `autosdr resume` |
+| Stop the process                    | `Ctrl+C` in the `autosdr run` terminal |
+| Check state                         | `autosdr status`                      |
 
-Pause is checked before every LLM call, every connector send, and at every
-scheduler tick. Webhooks still return 202 while paused so the gateway does not
-retry; processing is dropped silently.
+Pause is checked before every LLM call, every connector send, and on every
+scheduler tick. Inbound webhooks still return 202 so gateways don't retry;
+processing is skipped silently.
+
+---
+
+## Reviewing the AI loop
+
+Every LLM call is persisted. There are three ways to look at them:
+
+- **UI** — the **Logs** route is a filterable table of every analysis,
+  generation, evaluation and classification call. Deep-links from a thread
+  show just that thread's calls.
+- **CLI** — `autosdr logs llm` (compact table) or
+  `autosdr logs llm --purpose generation --tail 5 --show-prompts` for
+  full system/user/response.
+- **Disk** — `data/logs/llm-YYYYMMDD.jsonl` (grep / jq -friendly) and the
+  rotating `data/logs/autosdr.log` which captures scheduler + pipeline INFO.
+
+---
 
 ## Project layout
 
 ```
 autosdr/
-  config.py         # pydantic-settings; reads .env
+  api/              # FastAPI routers (setup, workspace, campaigns, leads, threads, ...)
+    schemas.py      # Pydantic request/response models; mirrors frontend TS types
+    deps.py         # db_session + require_workspace dependencies
+  config.py         # pydantic-settings; infrastructure-only env vars
   db.py             # SQLAlchemy engine/session; SQLite by default
-  models.py         # ORM models for every table in Doc 2 + llm_call
+  models.py         # ORM models for every table
   killswitch.py     # signals + flag file + hot-path guard
-  llm/client.py     # LiteLLM wrapper; retries, kill-switch, persistent call log
+  llm/
+    client.py       # LiteLLM wrapper + persistent call log
   prompts/          # versioned analysis / generation / evaluation / classification
   importer.py       # CSV + NDJSON import, E.164 normalisation, mobile detection
   connectors/
     base.py         # BaseConnector ABC (send + parse_webhook + poll_incoming)
-    file_connector.py  # dev/testing
-    textbee.py         # real Android SMS gateway via TextBee REST
+    file_connector.py
+    textbee.py
+    smsgate.py
   pipeline/
-    outreach.py     # analyse -> generate -> evaluate -> send
-    reply.py        # classify -> route (won/lost/auto-reply/escalate)
+    _shared.py      # generate_and_evaluate + thread_history helpers
+    outreach.py     # analyse → generate → evaluate → send
+    reply.py        # classify → close / park / (if auto-reply on) respond
+    suggestions.py  # generate_reply_variants(n=2-3) for the HITL card
   scheduler.py      # outreach tick + inbound poller; rolling-24h quota
-  webhook.py        # FastAPI app: /healthz, /api/webhooks/sim
-  cli.py            # typer CLI (init / import / campaign / run / logs / ...)
+  webhook.py        # FastAPI app: mounts routers + serves frontend/dist
+  cli.py            # typer CLI (import / logs / sim / run / pause / resume / status)
 
+frontend/           # React 19 + Vite 8 + Tailwind v4 operator console
 tests/              # pytest suite; LLM calls are mocked
 ```
 
-## Running the tests
+---
+
+## Development
+
+Two-process dev is optional — the backend serves the built frontend from
+`frontend/dist`, so you can rebuild the UI whenever you like and refresh.
+If you want HMR, the easiest path is the bundled dev script, which starts
+uvicorn (with `--reload`) and Vite together, prefixes their output, and
+stops both cleanly on Ctrl+C:
 
 ```bash
-python -m pytest
+./scripts/dev.sh
 ```
 
-Tests are hermetic — they mock the LLM and run everything against SQLite files
-in a tmp dir, so they're free to run locally without hitting Gemini.
+Then open <http://localhost:5173>. The `/api/*` calls are proxied to
+`:8000`, so there's still exactly one backend in play. Override the ports
+via `BACKEND_PORT` / `FRONTEND_PORT` if you need to.
 
-## What this POC does NOT include (deferred to v1)
+If you'd rather drive the two processes by hand:
 
-- Any frontend / PWA / Web Push (HITL surfaces via `autosdr hitl list` and
-  `autosdr logs thread`).
-- Swipe-based tone calibration (you provide tone as text on `autosdr init`).
-- Business-data extraction agent (the `business_dump` is used directly).
-- Field-mapping agent during import (a fixed-column schema is used).
-- Postgres / Redis / Celery (SQLite + `BackgroundTasks` + an asyncio scheduler
-  cover the POC's ingress and throughput needs).
-- Webhook-based inbound (polling is simpler for the POC; the `BaseConnector`
-  ABC supports `parse_webhook` for anyone who wants to add a push path later).
+```bash
+uv run uvicorn autosdr.webhook:app --reload --port 8000
+# in another terminal:
+cd frontend && npm run dev      # Vite on 5173, proxies /api -> 8000
+```
 
-Everything excluded is UI or scale. The AI loop — the hard part — is complete.
+Tests:
+
+```bash
+uv run pytest
+```
+
+The suite is hermetic — LLM calls are mocked, the DB is a tmp SQLite file.
+No network.
+
+---
+
+## Deployment
+
+One process, one port. On the server:
+
+```bash
+git pull
+cd frontend && npm install && npm run build && cd ..
+uv sync
+DATABASE_URL=sqlite:///data/autosdr.db HOST=0.0.0.0 PORT=8000 uv run autosdr run
+```
+
+Put it behind nginx / Caddy / Tailscale as you prefer. There's no built-in
+auth — this is a single-operator tool; put it on a trusted network or behind
+your own authentication layer.
+
+---
+
+## What's deliberately not included
+
+- Multi-user auth. Single-operator by design.
+- A second LLM provider out of the box (LiteLLM can talk to any of them —
+  OpenAI, Anthropic, local via Ollama — just put the key in Settings and
+  change the model slug).
+- Web Push notifications. Poll-based refresh handles the send volumes
+  AutoSDR is designed for.
+- Anything mobile-first. Laptop UI. Works down to ~1024px.

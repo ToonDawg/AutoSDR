@@ -1,22 +1,25 @@
-"""Environment-backed configuration.
+"""Infrastructure-only settings.
 
-Settings are loaded once at process start via :class:`Settings`. Workspace-level
-values (tone, LLM model slots, scheduler knobs) also live in the database so
-they can be changed at runtime without a redeploy; env values act as defaults
-that a fresh ``autosdr init`` writes into the workspace row.
+AutoSDR's behaviour-affecting configuration — LLM keys, connector choice,
+thresholds, dry-run, override, scheduler knobs — lives in
+``workspace.settings`` (a JSON blob on the workspace row). That is the
+single source of truth at runtime and is mutated via the REST API.
+
+Only truly infrastructural values (database url, server host/port, paths for
+the kill-switch flag/PID file, log directory, built-frontend location) are
+read from the environment. These rarely change and don't belong in the UI.
 """
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
-from typing import Literal
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Process-wide configuration read from environment and ``.env``."""
+    """Infra-only settings. Read once at process start from environment / .env."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -24,39 +27,6 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
-
-    # LLM
-    gemini_api_key: str | None = None
-    openai_api_key: str | None = None
-    anthropic_api_key: str | None = None
-
-    llm_model_main: str = "gemini/gemini-3-flash-preview"
-    llm_model_analysis: str = "gemini/gemini-3-flash-preview"
-    llm_model_eval: str = "gemini/gemini-3.1-flash-lite-preview"
-    llm_model_classification: str = "gemini/gemini-3.1-flash-lite-preview"
-    llm_temperature_main: float = 1.0
-    llm_temperature_eval: float = 1.0
-
-    # Connector
-    connector: Literal["file", "textbee", "smsgate"] = "file"
-    textbee_api_url: str = "https://api.textbee.dev"
-    textbee_api_key: str | None = None
-    textbee_device_id: str | None = None
-    textbee_poll_limit: int = 50
-
-    # SmsGate (capcom6/android-sms-gateway). API URL should include the full
-    # ``/3rdparty/v1`` path — e.g. http://localhost:3000/api/3rdparty/v1 for a
-    # local docker server, or http://<lan-ip>:8080/3rdparty/v1 for local mode.
-    smsgate_api_url: str = "http://localhost:3000/api/3rdparty/v1"
-    smsgate_username: str | None = None
-    smsgate_password: str | None = None
-
-    # Test modes (both composable, both honored by ``get_connector``)
-    # DRY_RUN=true forces FileConnector regardless of CONNECTOR — no SMS is
-    # ever sent. SMS_OVERRIDE_TO=+61... wraps whichever connector is active so
-    # every outbound goes to that one number (real sends, one phone).
-    dry_run: bool = False
-    sms_override_to: str | None = None
 
     # Server
     host: str = "127.0.0.1"
@@ -69,69 +39,124 @@ class Settings(BaseSettings):
     pause_flag_path: Path = Path("data/.autosdr-pause")
     pid_file_path: Path = Path("data/autosdr.pid")
 
-    # Scheduler overrides (optional — workspace.settings is the source of truth;
-    # when set here, these override the DB values at tick time).
-    scheduler_tick_s: int | None = None
-    min_inter_send_delay_s: int | None = None
-    max_batch_per_tick: int | None = None
-    inbound_poll_s: int | None = None
-
     # FileConnector outbox
     outbox_path: Path = Path("data/outbox.jsonl")
 
-    # Logging / observability
+    # Logging
     log_dir: Path = Path("data/logs")
     llm_log_enabled: bool = True
     llm_log_max_prompt_chars: int = 16000
 
-    # ----- Derived helpers -------------------------------------------------
-
-    @property
-    def webhook_path_sim(self) -> str:
-        return "/api/webhooks/sim"
+    # Built frontend (served from FastAPI at / when present).
+    frontend_dist_dir: Path = Path("frontend/dist")
 
 
-_DEFAULT_WORKSPACE_SETTINGS: dict = {
-    "max_auto_replies": 5,
+# ---------------------------------------------------------------------------
+# workspace.settings — the DB-backed source of truth for everything else.
+# These defaults are written the first time a workspace is created (setup
+# wizard) and can be edited live via PATCH /api/workspace/settings.
+# ---------------------------------------------------------------------------
+
+DEFAULT_WORKSPACE_SETTINGS: dict = {
+    # Behaviour
+    "auto_reply_enabled": False,  # first-message-only mode by default
+    "default_region": "AU",
+    "suggestions_count": 3,  # number of reply drafts to offer the human
+
+    # AI loop
     "eval_threshold": 0.85,
     "eval_max_attempts": 3,
     "raw_data_size_limit_kb": 50,
-    "default_region": "AU",
+
+    # Scheduler
     "scheduler_tick_s": 60,
     "min_inter_send_delay_s": 30,
     "max_batch_per_tick": 2,
     "inbound_poll_s": 20,
+
+    # LLM
     "llm": {
+        "provider_api_keys": {
+            "gemini": None,
+            "openai": None,
+            "anthropic": None,
+        },
         "model_main": "gemini/gemini-3-flash-preview",
         "model_analysis": "gemini/gemini-3-flash-preview",
         "model_eval": "gemini/gemini-3.1-flash-lite-preview",
         "model_classification": "gemini/gemini-3.1-flash-lite-preview",
         "temperature_main": 1.0,
-        "temperature_eval": 1.0,
+        "temperature_eval": 0.0,
+    },
+
+    # Connector
+    "connector": {
+        "type": "file",
+        "textbee": {
+            "api_url": "https://api.textbee.dev",
+            "api_key": None,
+            "device_id": None,
+            "poll_limit": 50,
+        },
+        "smsgate": {
+            "api_url": "http://localhost:3000/api/3rdparty/v1",
+            "username": None,
+            "password": None,
+        },
+    },
+
+    # Rehearsal modes
+    "rehearsal": {
+        "dry_run": False,
+        "override_to": None,
     },
 }
 
 
-def default_workspace_settings(env: Settings) -> dict:
-    """Seed `workspace.settings` from env defaults at `autosdr init` time."""
+def default_workspace_settings() -> dict:
+    """Return a fresh deep copy of the default workspace settings blob."""
 
-    merged = {**_DEFAULT_WORKSPACE_SETTINGS}
-    merged["llm"] = {
-        "model_main": env.llm_model_main,
-        "model_analysis": env.llm_model_analysis,
-        "model_eval": env.llm_model_eval,
-        "model_classification": env.llm_model_classification,
-        "temperature_main": env.llm_temperature_main,
-        "temperature_eval": env.llm_temperature_eval,
-    }
+    return copy.deepcopy(DEFAULT_WORKSPACE_SETTINGS)
+
+
+def _deep_merge(base: dict, overrides: dict) -> dict:
+    """Recursively merge ``overrides`` into ``base`` (mutating ``base``)."""
+
+    for key, value in overrides.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(base.get(key), dict)
+        ):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def merge_workspace_settings(existing: dict | None, updates: dict) -> dict:
+    """Return a deep-merged copy of ``existing`` with ``updates`` applied.
+
+    Missing keys in ``existing`` are backfilled from the defaults — safe to
+    call on legacy workspace rows without a full settings blob.
+    """
+
+    merged = default_workspace_settings()
+    if existing:
+        _deep_merge(merged, existing)
+    _deep_merge(merged, updates)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
 
 
 _settings: Settings | None = None
 
 
 def get_settings() -> Settings:
-    """Return a process-wide :class:`Settings` singleton."""
+    """Return the process-wide infra settings singleton."""
 
     global _settings
     if _settings is None:

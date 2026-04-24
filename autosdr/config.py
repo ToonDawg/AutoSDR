@@ -34,8 +34,8 @@ class Settings(BaseSettings):
     llm_model_analysis: str = "gemini/gemini-3-flash-preview"
     llm_model_eval: str = "gemini/gemini-3.1-flash-lite-preview"
     llm_model_classification: str = "gemini/gemini-3.1-flash-lite-preview"
-    llm_temperature_main: float = 0.7
-    llm_temperature_eval: float = 0.0
+    llm_temperature_main: float = 1.0
+    llm_temperature_eval: float = 1.0
 
     # Connector
     connector: Literal["file", "textbee", "smsgate"] = "file"
@@ -106,8 +106,8 @@ _DEFAULT_WORKSPACE_SETTINGS: dict = {
         "model_analysis": "gemini/gemini-3-flash-preview",
         "model_eval": "gemini/gemini-3.1-flash-lite-preview",
         "model_classification": "gemini/gemini-3.1-flash-lite-preview",
-        "temperature_main": 0.7,
-        "temperature_eval": 0.0,
+        "temperature_main": 1.0,
+        "temperature_eval": 1.0,
     },
 }
 

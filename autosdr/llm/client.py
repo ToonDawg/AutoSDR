@@ -464,7 +464,7 @@ async def complete_text(
     user: str,
     model: str,
     prompt_version: str,
-    temperature: float = 0.7,
+    temperature: float = 1.0,
     context: LlmCallContext | None = None,
 ) -> CompletionResult:
     """Free-form text completion."""
@@ -518,7 +518,7 @@ async def complete_json(
     user: str,
     model: str,
     prompt_version: str,
-    temperature: float = 0.0,
+    temperature: float = 1.0,
     context: LlmCallContext | None = None,
 ) -> tuple[dict[str, Any], CompletionResult]:
     """JSON-structured completion with one self-heal retry on parse failure."""

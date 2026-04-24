@@ -223,7 +223,7 @@ async def process_incoming_message(
             ),
             model=settings_llm.get("model_classification", settings_llm["model_main"]),
             prompt_version=classification.PROMPT_VERSION,
-            temperature=float(settings_llm.get("temperature_eval", 0.0)),
+            temperature=float(settings_llm.get("temperature_eval", 1.0)),
             context=LlmCallContext(
                 purpose=LlmCallPurpose.CLASSIFICATION,
                 workspace_id=workspace.id,

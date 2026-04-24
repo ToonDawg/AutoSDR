@@ -98,7 +98,7 @@ async def _run_analysis(
         raw_data_size_limit_kb=raw_data_size_limit_kb,
     )
     model = settings_llm.get("model_analysis", settings_llm["model_main"])
-    temperature = float(settings_llm.get("temperature_main", 0.7))
+    temperature = float(settings_llm.get("temperature_main", 1.0))
     parsed, result = await complete_json(
         system=analysis.SYSTEM_PROMPT,
         user=user_prompt,
@@ -201,7 +201,7 @@ async def _generate_and_evaluate(
             user=gen_user,
             model=settings_llm["model_main"],
             prompt_version=generation.PROMPT_VERSION,
-            temperature=float(settings_llm.get("temperature_main", 0.7)),
+            temperature=float(settings_llm.get("temperature_main", 1.0)),
             context=gen_ctx,
         )
         draft = gen_result.text.strip()
@@ -218,7 +218,7 @@ async def _generate_and_evaluate(
             user=eval_user,
             model=settings_llm["model_eval"],
             prompt_version=evaluation.PROMPT_VERSION,
-            temperature=float(settings_llm.get("temperature_eval", 0.0)),
+            temperature=float(settings_llm.get("temperature_eval", 1.0)),
             context=eval_ctx,
         )
         normalised = evaluation.evaluate_result(

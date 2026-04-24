@@ -192,24 +192,21 @@ def _canonical_key(key: str) -> str:
 
 
 def _split_core_and_raw(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Partition a row into core-field values + raw_data blob."""
+    """Partition a row into core-field values + raw_data blob.
+
+    Note: core fields are NOT stripped from raw_data; the LLM uses raw_data
+    as its primary context, so it needs the full source record.
+    """
 
     core: dict[str, Any] = {}
-    raw: dict[str, Any] = {}
+    raw: dict[str, Any] = dict(row)
 
     for key, value in row.items():
         if value in (None, ""):
             continue
         canon = _canonical_key(key)
         target = _CORE_ALIASES.get(canon, canon if canon in _CORE_FIELDS else None)
-        if target is None:
-            raw[key] = value
-            continue
-        # If multiple columns map to the same core field, first wins; the rest
-        # go to raw_data under their original key.
-        if target in core:
-            raw[key] = value
-        else:
+        if target is not None and target not in core:
             core[target] = value
 
     return core, raw

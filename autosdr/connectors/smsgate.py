@@ -95,6 +95,7 @@ class SmsGateConnector(BaseConnector):
     async def send(self, message: OutgoingMessage) -> SendResult:
         killswitch.raise_if_paused()
 
+        # Try plural first (Private Server default)
         url = f"{self.api_url}/messages"
         payload = {
             "phoneNumbers": [message.contact_uri],
@@ -108,6 +109,15 @@ class SmsGateConnector(BaseConnector):
                     headers={**self._headers(), "Content-Type": "application/json"},
                     json=payload,
                 )
+                
+                # If 404, retry with singular (Local Device mode)
+                if response.status_code == 404:
+                    url_singular = f"{self.api_url}/message"
+                    response = await client.post(
+                        url_singular,
+                        headers={**self._headers(), "Content-Type": "application/json"},
+                        json=payload,
+                    )
         except httpx.HTTPError as exc:
             self.consecutive_failures += 1
             logger.warning("smsgate network error: %s", exc)

@@ -74,6 +74,7 @@ One-liner per module so you can navigate the code:
 | `autosdr/killswitch.py` | Three-layer pause/stop mechanism shared by every hot path. |
 | `autosdr/importer.py` | CSV / NDJSON import with phone normalisation and contact-type detection. |
 | `autosdr/llm/client.py` | LiteLLM wrapper: retries, kill-switch, usage counters, persistent call log. |
+| `autosdr/compliance.py` | Deterministic STOP / opt-out keyword matcher (Spam Act / TCPA shortcut). Pure function — no I/O, no LLM. |
 | `autosdr/prompts/` | Versioned system + user prompts for analysis, generation, evaluation, classification. |
 | `autosdr/connectors/` | Pluggable SMS connectors plus a file-backed dev stub and an override wrapper. |
 | `autosdr/pipeline/outreach.py` | The analyse → generate → evaluate → send pipeline for first contacts and replies. |
@@ -285,6 +286,19 @@ an SMSGate webhook), the reply pipeline:
   WAL writer lock. The point is that two inbound messages for the same
   thread cannot race through classification and double-reply.
 - Records the inbound as a message on the thread.
+- **Deterministic STOP / opt-out shortcut.** Before any LLM call, the
+  pipeline runs `autosdr.compliance.match_opt_out` against the inbound
+  body. On a hit (default keywords: `STOP`, `STOP ALL`, `UNSUBSCRIBE`,
+  `UNSUB`, `REMOVE ME`, `OPT OUT`, `CANCEL`, `END`, `QUIT`; word-boundary
+  match with a small third-party denylist), the pipeline flags the lead
+  with `do_not_contact_at` + `do_not_contact_reason="opt_out:<KEYWORD>"`,
+  closes the thread lost, writes a sentinel `LlmCall` audit row
+  (`model="(deterministic-opt-out)"`, `purpose=other`,
+  `tokens=latency=0`) so the timeline in `autosdr logs thread` stays
+  intact, and exits with `action=closed_opt_out`. The classifier never
+  runs. The flag is permanent: outreach, scheduler, importer, and
+  `assign_leads` all honour it; clearing requires manual DB intervention
+  or a future Settings → Compliance card.
 - Runs the classification prompt and routes by intent:
   - **Negative** and **goal_achieved** close the thread (lost/won
     respectively) and propagate the status down to `campaign_lead` and

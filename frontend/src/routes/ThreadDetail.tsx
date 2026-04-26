@@ -7,8 +7,14 @@ import { MessageBubble } from '@/components/domain/MessageBubble';
 import { AngleTag } from '@/components/domain/AngleTag';
 import { ThreadStatusBadge } from '@/components/domain/ThreadStatusBadge';
 import { Badge } from '@/components/ui/Badge';
-import { HITL_LABEL, formatPhone, relTime } from '@/lib/format';
-import { ThreadStatus, type Suggestion } from '@/lib/types';
+import {
+  HITL_LABEL,
+  absTime,
+  formatDoNotContactReason,
+  formatPhone,
+  relTime,
+} from '@/lib/format';
+import { MessageRole, ThreadStatus, type Suggestion } from '@/lib/types';
 import { SuggestedReplies } from './thread/SuggestedReplies';
 import { ComposeBar } from './thread/ComposeBar';
 import { LlmTrail } from './thread/LlmTrail';
@@ -71,6 +77,11 @@ export function ThreadDetail() {
     queryKey: ['campaign', thread?.campaign_id],
     queryFn: () => (thread ? api.getCampaign(thread.campaign_id) : null),
     enabled: !!thread,
+  });
+  const { data: lead } = useQuery({
+    queryKey: ['lead', thread?.lead_id],
+    queryFn: () => (thread ? api.getLead(thread.lead_id) : null),
+    enabled: !!thread?.lead_id,
   });
   const { data: llmCalls } = useQuery({
     queryKey: ['llm-calls', id],
@@ -156,6 +167,16 @@ export function ThreadDetail() {
   const pausedForHitl = thread.status === ThreadStatus.PAUSED_FOR_HITL;
   const showSuggestions = pausedForHitl || suggestions.length > 0;
 
+  // When the thread was closed because the lead opted out, surface the
+  // matched inbound + keyword instead of the generic "Closed lost" frame.
+  // Detection: thread is LOST and the lead is DNC-flagged. The matched
+  // message is the most recent inbound (role=lead) message.
+  const optOutClosed =
+    thread.status === ThreadStatus.LOST && !!lead?.do_not_contact_at;
+  const optOutInbound = optOutClosed
+    ? [...(messages ?? [])].reverse().find((m) => m.role === MessageRole.LEAD)
+    : null;
+
   return (
     <div className="grid grid-cols-12 min-h-[calc(100vh-3rem)]">
       <div className="col-span-12 lg:col-span-8 xl:col-span-8 border-r border-rule flex flex-col min-w-0">
@@ -187,6 +208,30 @@ export function ThreadDetail() {
             )}
           </div>
         </div>
+
+        {optOutClosed && (
+          <div className="px-8 py-3 border-b border-oxblood/40 bg-oxblood-soft/60 flex items-start gap-4">
+            <Badge tone="oxblood" dot>
+              Opted out
+            </Badge>
+            <div className="flex-1 text-sm text-ink">
+              <div>
+                {formatDoNotContactReason(lead?.do_not_contact_reason ?? null)}
+                {lead?.do_not_contact_at && (
+                  <span className="text-ink-muted">
+                    {' '}
+                    · {absTime(lead.do_not_contact_at)}
+                  </span>
+                )}
+              </div>
+              {optOutInbound?.content && (
+                <div className="mt-1 text-sm text-ink-muted">
+                  Lead message: &ldquo;{optOutInbound.content}&rdquo;
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {pausedForHitl && thread.hitl_reason && (
           <div className="px-8 py-3 border-b border-rust/40 bg-rust-soft/60 flex items-start gap-4">

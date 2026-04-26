@@ -49,6 +49,11 @@ def list_leads(
     only knows what's currently on screen. ``counts_by_status`` always
     reflects the *filtered* set (i.e. search is applied, status filter
     is not), so the filter tabs stay accurate as the operator searches.
+
+    A pseudo-status ``do_not_contact`` is also accepted in ``status_filter``
+    and exposed in ``counts_by_status``: it selects leads with
+    ``do_not_contact_at IS NOT NULL`` regardless of their underlying
+    ``status`` (a DNC lead can be ``new`` / ``contacted`` / ``lost``).
     """
 
     with db_session() as session:
@@ -83,8 +88,29 @@ def list_leads(
         counts_by_status: dict[str, int] = {s: int(n) for s, n in counts_rows}
         counts_by_status["all"] = sum(counts_by_status.values())
 
+        # Cross-cutting DNC count — shown as its own filter chip in the UI.
+        dnc_count_stmt = select(func.count(Lead.id)).where(
+            Lead.workspace_id == workspace.id,
+            Lead.do_not_contact_at.is_not(None),
+        )
+        if q:
+            needle = f"%{q.strip().lower()}%"
+            dnc_count_stmt = dnc_count_stmt.where(
+                or_(
+                    func.lower(Lead.name).like(needle),
+                    func.lower(Lead.category).like(needle),
+                    func.lower(Lead.contact_uri).like(needle),
+                    func.lower(Lead.address).like(needle),
+                )
+            )
+        counts_by_status["do_not_contact"] = int(
+            session.execute(dnc_count_stmt).scalar_one()
+        )
+
         page = base
-        if status_filter and status_filter != "all":
+        if status_filter == "do_not_contact":
+            page = page.where(Lead.do_not_contact_at.is_not(None))
+        elif status_filter and status_filter != "all":
             page = page.where(Lead.status == status_filter)
 
         total = int(

@@ -18,7 +18,9 @@ import {
 import { LeadStatus, type LeadStatusT } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
-const FILTERS: ReadonlyArray<FilterOption<LeadStatusT | 'all'>> = [
+type LeadFilterId = LeadStatusT | 'all' | 'do_not_contact';
+
+const FILTERS: ReadonlyArray<FilterOption<LeadFilterId>> = [
   { id: 'all', label: 'All' },
   { id: LeadStatus.NEW, label: 'Queued' },
   { id: LeadStatus.CONTACTED, label: 'Contacted' },
@@ -26,6 +28,7 @@ const FILTERS: ReadonlyArray<FilterOption<LeadStatusT | 'all'>> = [
   { id: LeadStatus.WON, label: 'Won' },
   { id: LeadStatus.LOST, label: 'Lost' },
   { id: LeadStatus.SKIPPED, label: 'Skipped' },
+  { id: 'do_not_contact', label: 'Do not contact' },
 ];
 
 const STATUS_TONE: Record<LeadStatusT, Parameters<typeof Badge>[0]['tone']> = {
@@ -53,7 +56,7 @@ const PAGE_SIZE = 100;
  */
 export function Leads() {
   const navigate = useNavigate();
-  const [filter, setFilter] = useState<LeadStatusT | 'all'>('all');
+  const [filter, setFilter] = useState<LeadFilterId>('all');
   const [qDraft, setQDraft] = useState('');
   const [q, setQ] = useState('');
   const [page, setPage] = useState(0);
@@ -67,7 +70,7 @@ export function Leads() {
     return () => clearTimeout(id);
   }, [qDraft]);
 
-  const handleFilterChange = (next: LeadStatusT | 'all') => {
+  const handleFilterChange = (next: LeadFilterId) => {
     setFilter(next);
     setPage(0);
   };
@@ -169,11 +172,20 @@ export function Leads() {
                   {String(l.import_order).padStart(3, '0')}
                 </td>
                 <td>
-                  <div className="text-sm font-medium text-ink">{l.name ?? '—'}</div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-ink truncate">
+                      {l.name ?? '—'}
+                    </span>
+                    {l.do_not_contact_at && (
+                      <Badge tone="oxblood" dot>
+                        Opted out
+                      </Badge>
+                    )}
+                  </div>
                   {l.address && (
                     <div className="text-[11px] text-ink-muted mt-0.5">{l.address}</div>
                   )}
-                  {l.skip_reason && (
+                  {l.skip_reason && l.skip_reason !== 'do_not_contact' && (
                     <div className="text-[11px] text-oxblood mt-1">
                       {formatSkipReason(l.skip_reason)}
                     </div>

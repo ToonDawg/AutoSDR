@@ -297,8 +297,15 @@ def _process_row(
     # to be a LANDLINE/TOLL_FREE could still sit at ``status=new`` and get
     # assigned to a campaign — we'd then text a landline in production.
     # Only touch pre-engagement states (``new`` and ``skipped``); never
-    # clobber ``contacted``/``replied``/``won``/``lost``.
-    if existing.contact_type != contact_type and contact_type != ContactType.UNKNOWN:
+    # clobber ``contacted``/``replied``/``won``/``lost``. Leads flagged
+    # ``do_not_contact`` are also exempt — Spam Act 2003 / TCPA require we
+    # honour the opt-out across re-imports, so we never reset their status
+    # or skip_reason.
+    if (
+        existing.contact_type != contact_type
+        and contact_type != ContactType.UNKNOWN
+        and existing.do_not_contact_at is None
+    ):
         existing.contact_type = contact_type
         changed = True
 
@@ -319,6 +326,11 @@ def _process_row(
                     existing.skip_reason = default_skip_reason
                 elif existing.skip_reason != default_skip_reason:
                     existing.skip_reason = default_skip_reason
+    elif existing.contact_type != contact_type and contact_type != ContactType.UNKNOWN:
+        # DNC lead: still record the refined contact_type for accurate UI,
+        # but do not touch ``status`` or ``skip_reason``.
+        existing.contact_type = contact_type
+        changed = True
 
     if changed:
         session.flush()

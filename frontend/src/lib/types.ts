@@ -185,6 +185,10 @@ export interface Lead {
   source_file: string | null;
   status: LeadStatusT;
   skip_reason: string | null;
+  /** Set when the lead has opted out (Spam Act / TCPA shortcut). */
+  do_not_contact_at: ISODate | null;
+  /** Stable ``opt_out:<KEYWORD>`` string or operator-supplied free text. */
+  do_not_contact_reason: string | null;
   created_at: ISODate;
 }
 
@@ -236,6 +240,15 @@ export interface Campaign {
   replied_count: number;
   won_count: number;
   sent_24h: number;
+}
+
+/**
+ * Result of ``POST /campaigns/{id}/assign-leads`` — a Campaign plus the IDs
+ * of any leads the API refused to enqueue (today: do-not-contact-flagged).
+ */
+export interface CampaignAssignLeadsResult extends Campaign {
+  skipped_lead_ids: UUID[];
+  skipped_reason: string | null;
 }
 
 export interface CampaignKickoffResult {

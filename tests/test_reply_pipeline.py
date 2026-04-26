@@ -156,7 +156,9 @@ async def test_negative_intent_closes_lost_and_propagates(active_thread, fresh_d
         },
     )
     connector = FileConnector(outbox_path=active_thread["outbox_path"])
-    incoming = IncomingMessage(contact_uri="+61400000001", content="Stop. Not interested.")
+    # Use a non-keyword negative so the deterministic opt-out shortcut
+    # doesn't preempt the LLM classifier path under test.
+    incoming = IncomingMessage(contact_uri="+61400000001", content="Nah, not interested.")
 
     result = await process_incoming_message(
         connector=connector,
@@ -448,7 +450,9 @@ async def test_multi_campaign_routes_to_most_recent_outbound(
     result = await process_incoming_message(
         connector=connector,
         workspace_id=ws_id,
-        incoming=IncomingMessage(contact_uri="+61400000002", content="stop"),
+        # Non-keyword negative — keeps this test on the classifier path
+        # (see deterministic opt-out shortcut in autosdr/pipeline/reply.py).
+        incoming=IncomingMessage(contact_uri="+61400000002", content="not interested"),
     )
     assert result.action == "closed_lost"
     assert result.thread_id == newer_thread_id

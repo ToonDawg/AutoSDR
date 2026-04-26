@@ -7,6 +7,8 @@ import { BackLink } from '@/components/ui/BackLink';
 import {
   CONTACT_TYPE_LABEL,
   LEAD_STATUS_LABEL,
+  absTime,
+  formatDoNotContactReason,
   formatPhone,
   formatSkipReason,
   relTime,
@@ -104,6 +106,11 @@ export function LeadDetail() {
           <Badge tone={STATUS_TONE[lead.status]} dot>
             {LEAD_STATUS_LABEL[lead.status]}
           </Badge>
+          {lead.do_not_contact_at && (
+            <Badge tone="oxblood" dot>
+              Opted out
+            </Badge>
+          )}
           {lead.contact_type && (
             <Badge tone="outline">
               {CONTACT_TYPE_LABEL[lead.contact_type] ?? lead.contact_type}
@@ -119,7 +126,21 @@ export function LeadDetail() {
         )}
       </header>
 
-      {lead.skip_reason && (
+      {lead.do_not_contact_at && (
+        <div className="border border-oxblood/40 bg-oxblood-soft/60 px-5 py-3 text-sm text-ink">
+          <div className="flex items-center justify-between gap-3">
+            <span>
+              <span className="label text-oxblood mr-2">Do not contact</span>
+              {formatDoNotContactReason(lead.do_not_contact_reason)}
+            </span>
+            <span className="font-mono text-[11px] text-ink-faint shrink-0">
+              {absTime(lead.do_not_contact_at)}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {lead.skip_reason && lead.skip_reason !== 'do_not_contact' && (
         <div className="border border-oxblood/30 bg-oxblood-soft/40 px-5 py-3 text-sm text-ink">
           <span className="label text-oxblood mr-2">Not messaging</span>
           {formatSkipReason(lead.skip_reason)}

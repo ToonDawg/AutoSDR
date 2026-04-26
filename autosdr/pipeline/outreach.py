@@ -223,6 +223,22 @@ async def run_outreach_for_campaign_lead(
     settings_llm, eval_threshold, eval_max_attempts = read_loop_settings(workspace)
     raw_data_size_limit_kb = int(settings_blob.get("raw_data_size_limit_kb", 50))
 
+    # Compliance guard — pre-claim. A lead flagged ``do_not_contact`` must
+    # never trigger an analysis call, much less a connector send. Skip the
+    # assignment, propagate the reason, and exit before claiming.
+    if lead.do_not_contact_at is not None:
+        if campaign_lead.status == CampaignLeadStatus.QUEUED:
+            campaign_lead.status = CampaignLeadStatus.SKIPPED
+        if not lead.skip_reason:
+            lead.skip_reason = "do_not_contact"
+        session.commit()
+        logger.info(
+            "outreach skipped lead=%s reason=do_not_contact since=%s",
+            lead.id,
+            lead.do_not_contact_at,
+        )
+        return OutreachResult(sent=False, reason="do_not_contact")
+
     existing_thread = (
         session.query(Thread)
         .filter(Thread.campaign_lead_id == campaign_lead.id)
@@ -376,6 +392,26 @@ async def run_outreach_for_campaign_lead(
     session.refresh(campaign_lead)
     session.refresh(lead)
     current_contact_uri = (lead.contact_uri or "").strip()
+    # Race-window compliance check: an inbound STOP could land between the
+    # claim above and this point. Refusing to send here is the whole point
+    # of the deterministic shortcut.
+    if lead.do_not_contact_at is not None:
+        campaign_lead.status = CampaignLeadStatus.SKIPPED
+        if not lead.skip_reason:
+            lead.skip_reason = "do_not_contact"
+        session.commit()
+        logger.info(
+            "outreach aborted-before-send lead=%s thread=%s reason=do_not_contact",
+            lead.id,
+            thread.id,
+        )
+        return OutreachResult(
+            sent=False,
+            reason="do_not_contact",
+            thread_id=thread.id,
+            attempts=loop_result["attempts"],
+            overall_score=loop_result["overall"],
+        )
     if campaign_lead.status != CampaignLeadStatus.SENDING:
         return OutreachResult(
             sent=False,

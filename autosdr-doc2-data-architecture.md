@@ -115,7 +115,15 @@ CREATE TABLE lead (
   status        TEXT NOT NULL DEFAULT 'new',
                                      -- new | contacted | replied | won | lost | skipped
   skip_reason   TEXT,                -- populated when status='skipped' at import time
-                                     -- e.g. 'not_a_mobile_number', 'no_contact_uri'
+                                     -- e.g. 'not_a_mobile_number', 'no_contact_uri',
+                                     -- or 'do_not_contact' once the lead opts out
+  do_not_contact_at     TIMESTAMPTZ, -- set when the lead opts out (Spam Act / TCPA
+                                     -- shortcut, or manual operator override).
+                                     -- Permanent: outreach + assign + importer all
+                                     -- skip leads with this column populated.
+  do_not_contact_reason TEXT,        -- machine-readable: 'opt_out:STOP',
+                                     -- 'opt_out:UNSUBSCRIBE', 'manual',
+                                     -- 'manual:phoned-in', etc.
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -149,6 +157,15 @@ CREATE INDEX idx_lead_import_order ON lead(workspace_id, import_order);
 - Core fields (`name`, `contact_uri`, etc.) may be NULL if the import file did not
   contain mappable data. A lead without a `contact_uri` cannot be contacted and will
   be flagged during import validation.
+- `do_not_contact_at` is **sticky**. Once set, every consumer in the
+  system honours it: the inbound STOP-keyword shortcut sets it
+  (`autosdr/pipeline/reply.py:_apply_opt_out_shortcut`); the outbound
+  pipeline aborts before connector send; `assign_leads` excludes the
+  lead from `all_eligible` and returns it via `skipped_lead_ids`; the
+  importer preserves the flag through re-imports and refuses to mutate
+  `status` / `skip_reason` on a DNC row. Clearing the flag is a manual
+  operation (DB edit today; the future Settings → Compliance card
+  surfaces a one-click clear).
 
 ---
 

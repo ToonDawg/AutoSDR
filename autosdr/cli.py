@@ -53,10 +53,12 @@ app = typer.Typer(help="AutoSDR POC — autonomous SDR for small business owners
 test_app = typer.Typer(help="Connectivity and health tests.")
 sim_app = typer.Typer(help="Simulate inbound messages (for testing).")
 logs_app = typer.Typer(help="Inspect LLM call and thread transcripts.")
+leads_app = typer.Typer(help="Lead-level operations (manual opt-out, etc.).")
 
 app.add_typer(test_app, name="test")
 app.add_typer(sim_app, name="sim")
 app.add_typer(logs_app, name="logs")
+app.add_typer(leads_app, name="leads")
 
 console = Console()
 
@@ -606,6 +608,125 @@ def logs_thread(
             else:
                 snippet = _shorten(obj.response_text, 100)
                 console.print(f"{header}  {snippet}")
+
+
+# ---------------------------------------------------------------------------
+# leads (manual operations)
+# ---------------------------------------------------------------------------
+
+
+@leads_app.command("opt-out")
+def leads_opt_out(
+    contact_uri: str = typer.Argument(
+        ..., help="Phone number (E.164 or local format) to flag as do-not-contact."
+    ),
+    reason: str = typer.Option(
+        "manual",
+        "--reason",
+        help=(
+            "Stable machine-readable reason stored on the lead. Defaults to 'manual'. "
+            "Use this to carry context (e.g. 'manual:phoned-in')."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt. Required for non-interactive scripts.",
+    ),
+) -> None:
+    """Manually flag a lead as do-not-contact.
+
+    Covers the case where a lead phones / emails / replies on a different
+    channel to opt out — i.e. anything that doesn't go through the SMS
+    reply pipeline's deterministic STOP-keyword shortcut.
+
+    Setting the flag is idempotent: re-running on an already-flagged lead
+    is a no-op (and prints the existing flag for confirmation).
+
+    Future outreach is blocked by the same `do_not_contact_at` guard the
+    outbound pipeline already enforces, and the lead is excluded from
+    `assign_leads` for any subsequent campaigns.
+    """
+
+    from datetime import datetime, timezone
+    from autosdr.importer import normalise_phone
+
+    _configure_logging()
+    create_all()
+
+    with session_scope() as session:
+        workspace = session.query(Workspace).first()
+        if workspace is None:
+            console.print(
+                "[red]no workspace — complete the setup wizard at /setup first[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        region_hint = (workspace.settings or {}).get("default_region", "AU")
+
+        candidates = list(
+            session.execute(
+                select(Lead).where(
+                    Lead.workspace_id == workspace.id,
+                    Lead.contact_uri == contact_uri,
+                )
+            ).scalars()
+        )
+        if not candidates:
+            normalised, _type = normalise_phone(contact_uri, region_hint=region_hint)
+            if normalised and normalised != contact_uri:
+                candidates = list(
+                    session.execute(
+                        select(Lead).where(
+                            Lead.workspace_id == workspace.id,
+                            Lead.contact_uri == normalised,
+                        )
+                    ).scalars()
+                )
+
+        if not candidates:
+            console.print(
+                f"[red]no lead with contact_uri matching {contact_uri!r}[/red]"
+            )
+            raise typer.Exit(code=1)
+        if len(candidates) > 1:
+            console.print(
+                f"[red]ambiguous: {len(candidates)} leads share contact_uri "
+                f"{contact_uri!r} — refusing to act.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        lead = candidates[0]
+
+        if lead.do_not_contact_at is not None:
+            console.print(
+                f"[yellow]already opted out[/yellow] "
+                f"({lead.do_not_contact_at.isoformat()}, "
+                f"reason={lead.do_not_contact_reason!r}) — no change."
+            )
+            return
+
+        console.print(
+            f"lead=[cyan]{lead.name or '(unnamed)'}[/cyan] "
+            f"contact={lead.contact_uri}  status={lead.status}"
+        )
+
+        if not yes:
+            confirm = typer.confirm(
+                "Mark this lead as do-not-contact? Future sends will be blocked.",
+                default=False,
+            )
+            if not confirm:
+                console.print("[yellow]aborted[/yellow]")
+                raise typer.Exit(code=1)
+
+        lead.do_not_contact_at = datetime.now(timezone.utc)
+        lead.do_not_contact_reason = reason
+        session.flush()
+        console.print(
+            f"[green]opted out[/green] lead={lead.id}  reason={reason!r}"
+        )
 
 
 def _resolve_thread_by_id(session, thread_id: str) -> Thread | None:

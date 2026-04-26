@@ -15,6 +15,7 @@
 
 import type {
   Campaign,
+  CampaignAssignLeadsResult,
   CampaignKickoffResult,
   ConnectorTestRequest,
   ConnectorTestResult,
@@ -232,8 +233,8 @@ export const api = {
   async assignLeads(
     id: string,
     payload: { lead_ids?: string[]; all_eligible?: boolean },
-  ): Promise<Campaign> {
-    return req<Campaign>(`/campaigns/${id}/assign-leads`, {
+  ): Promise<CampaignAssignLeadsResult> {
+    return req<CampaignAssignLeadsResult>(`/campaigns/${id}/assign-leads`, {
       method: 'POST',
       body: payload,
     });

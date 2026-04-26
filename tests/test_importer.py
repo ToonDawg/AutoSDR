@@ -334,3 +334,98 @@ def test_row_result_record_counts_updated_as_imported():
     assert summary.imported_count == 2
     assert summary.skipped_count == 1
     assert summary.error_count == 1
+
+
+def test_reimport_preserves_do_not_contact_flag(tmp_path, workspace_factory, fresh_db):
+    """A re-import that re-encounters an opted-out ``contact_uri`` must NOT clear
+    ``do_not_contact_at`` / ``do_not_contact_reason``. Spam Act 2003 / TCPA
+    require the opt-out to survive across re-imports."""
+
+    from datetime import datetime, timezone
+
+    ws_id = workspace_factory()
+    mobile_phone = "+61413123456"
+    opt_out_at = datetime.now(timezone.utc)
+
+    with fresh_db() as session:
+        lead = Lead(
+            workspace_id=ws_id,
+            name="Opted Out Lead",
+            contact_uri=mobile_phone,
+            contact_type=ContactType.MOBILE,
+            raw_data={},
+            import_order=1,
+            source_file="initial.json",
+            status=LeadStatus.LOST,
+            skip_reason=None,
+            do_not_contact_at=opt_out_at,
+            do_not_contact_reason="opt_out:STOP",
+        )
+        session.add(lead)
+        session.flush()
+        lead_id = lead.id
+
+    path = tmp_path / "refresh.json"
+    _write_ndjson(
+        path,
+        [
+            {
+                "name": "Opted Out Lead",
+                "phone": "0413 123 456",
+                "category": "Retail",
+            }
+        ],
+    )
+    with fresh_db() as session:
+        import_file(session=session, workspace_id=ws_id, path=path, region_hint="AU")
+
+    with fresh_db() as session:
+        refreshed = session.get(Lead, lead_id)
+        # DNC flag survives the re-import.
+        assert refreshed.do_not_contact_at is not None
+        assert refreshed.do_not_contact_reason == "opt_out:STOP"
+        # Status is not reset (was LOST, stays LOST — DNC blocks status mutation).
+        assert refreshed.status == LeadStatus.LOST
+
+
+def test_reimport_does_not_promote_dnc_lead_back_to_new(
+    tmp_path, workspace_factory, fresh_db
+):
+    """A DNC lead skipped for non-mobile must NOT be promoted to NEW even when
+    a refined contact_type re-import claims the number is mobile."""
+
+    from datetime import datetime, timezone
+
+    ws_id = workspace_factory()
+    phone = "+61413123456"
+
+    with fresh_db() as session:
+        lead = Lead(
+            workspace_id=ws_id,
+            name="Should Stay Skipped",
+            contact_uri=phone,
+            contact_type=ContactType.UNKNOWN,
+            raw_data={},
+            import_order=1,
+            source_file="initial.json",
+            status=LeadStatus.SKIPPED,
+            skip_reason="not_a_mobile_number:unknown",
+            do_not_contact_at=datetime.now(timezone.utc),
+            do_not_contact_reason="opt_out:UNSUBSCRIBE",
+        )
+        session.add(lead)
+        session.flush()
+        lead_id = lead.id
+
+    path = tmp_path / "refresh.json"
+    _write_ndjson(path, [{"name": "Should Stay Skipped", "phone": "0413 123 456"}])
+    with fresh_db() as session:
+        import_file(session=session, workspace_id=ws_id, path=path, region_hint="AU")
+
+    with fresh_db() as session:
+        refreshed = session.get(Lead, lead_id)
+        # contact_type is updated (refining is informational); status is not.
+        assert refreshed.contact_type == ContactType.MOBILE
+        assert refreshed.status == LeadStatus.SKIPPED
+        assert refreshed.skip_reason == "not_a_mobile_number:unknown"
+        assert refreshed.do_not_contact_at is not None

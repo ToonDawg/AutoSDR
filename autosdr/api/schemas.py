@@ -250,6 +250,18 @@ class CampaignAssignLeads(BaseModel):
     all_eligible: bool = False
 
 
+class CampaignAssignLeadsOut(CampaignOut):
+    """Result of POST ``/campaigns/{id}/assign-leads``.
+
+    Extends :class:`CampaignOut` with the lead IDs the API refused to assign
+    so the operator can see at a glance which ones got skipped (today: leads
+    flagged ``do_not_contact`` for compliance reasons).
+    """
+
+    skipped_lead_ids: list[str] = Field(default_factory=list)
+    skipped_reason: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Lead
 # ---------------------------------------------------------------------------
@@ -268,6 +280,8 @@ class LeadOut(BaseModel):
     source_file: str | None
     status: str
     skip_reason: str | None
+    do_not_contact_at: datetime | None = None
+    do_not_contact_reason: str | None = None
     created_at: datetime
 
 

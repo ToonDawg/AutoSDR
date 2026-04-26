@@ -163,8 +163,25 @@ export function formatSkipReason(reason: string | null | undefined): string {
       return 'Phone number could not be parsed';
     case 'duplicate_no_new_data':
       return 'Duplicate — no new data to merge';
+    case 'do_not_contact':
+      return 'Lead opted out — do not contact';
     default:
       return reason.replace(/_/g, ' ');
   }
+}
+
+/**
+ * Humanise a ``Lead.do_not_contact_reason`` string. Backend stores stable
+ * machine-readable values like ``opt_out:STOP``; the UI surfaces the keyword
+ * directly so the operator can see *why* the lead was flagged.
+ */
+export function formatDoNotContactReason(reason: string | null | undefined): string {
+  if (!reason) return 'Opted out';
+  if (reason.startsWith('opt_out:')) {
+    const keyword = reason.slice('opt_out:'.length).trim();
+    return keyword ? `Opted out — replied "${keyword}"` : 'Opted out';
+  }
+  if (reason === 'manual') return 'Opted out — manual override';
+  return `Opted out — ${reason.replace(/_/g, ' ')}`;
 }
 

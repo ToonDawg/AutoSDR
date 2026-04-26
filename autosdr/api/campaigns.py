@@ -17,6 +17,7 @@ from autosdr import killswitch
 from autosdr.api.deps import db_session, require_workspace
 from autosdr.api.schemas import (
     CampaignAssignLeads,
+    CampaignAssignLeadsOut,
     CampaignCreate,
     CampaignKickoffRequest,
     CampaignKickoffResult,
@@ -324,8 +325,10 @@ def _set_status(campaign_id: str, new_status: str) -> CampaignOut:
         return _to_out(session, campaign)
 
 
-@router.post("/{campaign_id}/assign-leads", response_model=CampaignOut)
-def assign_leads(campaign_id: str, payload: CampaignAssignLeads) -> CampaignOut:
+@router.post("/{campaign_id}/assign-leads", response_model=CampaignAssignLeadsOut)
+def assign_leads(
+    campaign_id: str, payload: CampaignAssignLeads
+) -> CampaignAssignLeadsOut:
     """Push leads into the campaign queue.
 
     Two modes:
@@ -334,6 +337,10 @@ def assign_leads(campaign_id: str, payload: CampaignAssignLeads) -> CampaignOut:
       in this campaign. This is the one-click flow after import.
     * ``lead_ids=[...]`` assigns a specific set — used by per-lead selection
       in the Leads page.
+
+    Compliance: leads with ``do_not_contact_at IS NOT NULL`` are silently
+    excluded in both modes and reported back via ``skipped_lead_ids`` so the
+    UI can surface the count.
     """
 
     with db_session() as session:
@@ -358,7 +365,7 @@ def assign_leads(campaign_id: str, payload: CampaignAssignLeads) -> CampaignOut:
         )
 
         if payload.all_eligible:
-            leads = list(
+            candidates = list(
                 session.execute(
                     select(Lead)
                     .where(
@@ -370,7 +377,7 @@ def assign_leads(campaign_id: str, payload: CampaignAssignLeads) -> CampaignOut:
                 ).scalars()
             )
         else:
-            leads = list(
+            candidates = list(
                 session.execute(
                     select(Lead).where(
                         Lead.workspace_id == campaign.workspace_id,
@@ -379,6 +386,14 @@ def assign_leads(campaign_id: str, payload: CampaignAssignLeads) -> CampaignOut:
                     )
                 ).scalars()
             )
+
+        leads: list[Lead] = []
+        skipped_lead_ids: list[str] = []
+        for lead in candidates:
+            if lead.do_not_contact_at is not None:
+                skipped_lead_ids.append(lead.id)
+                continue
+            leads.append(lead)
 
         for idx, lead in enumerate(leads, start=1):
             session.add(
@@ -391,7 +406,12 @@ def assign_leads(campaign_id: str, payload: CampaignAssignLeads) -> CampaignOut:
             )
         session.flush()
         session.refresh(campaign)
-        return _to_out(session, campaign)
+        out = _to_out(session, campaign)
+        return CampaignAssignLeadsOut(
+            **out.model_dump(),
+            skipped_lead_ids=skipped_lead_ids,
+            skipped_reason="do_not_contact" if skipped_lead_ids else None,
+        )
 
 
 __all__ = ["router"]

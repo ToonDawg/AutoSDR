@@ -113,6 +113,8 @@ _ADDITIVE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("campaign", "followup", "JSON"),
     ("campaign", "quota_reset_at", "DATETIME"),
     ("thread", "hitl_dismissed_at", "DATETIME"),
+    ("lead", "do_not_contact_at", "DATETIME"),
+    ("lead", "do_not_contact_reason", "TEXT"),
 )
 
 

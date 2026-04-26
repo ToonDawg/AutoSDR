@@ -690,3 +690,127 @@ async def test_outreach_skips_if_contact_uri_changes_before_send(
     with fresh_db() as session:
         cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
         assert cl.status == CampaignLeadStatus.QUEUED
+
+
+# ---------------------------------------------------------------------------
+# Compliance — do_not_contact guard
+# ---------------------------------------------------------------------------
+
+
+async def test_outreach_skips_do_not_contact(prepared_campaign, fresh_db, monkeypatch):
+    """A queued CampaignLead whose Lead is flagged DNC must not trigger an LLM call or a send."""
+
+    from datetime import datetime, timezone
+
+    with fresh_db() as session:
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        lead.do_not_contact_at = datetime.now(timezone.utc)
+        lead.do_not_contact_reason = "opt_out:STOP"
+        session.flush()
+
+    async def _refuse(**_kwargs):
+        raise AssertionError("LLM must not be invoked for a do-not-contact lead")
+
+    monkeypatch.setattr("autosdr.pipeline.outreach.complete_json", _refuse)
+    monkeypatch.setattr("autosdr.pipeline._shared.complete_json", _refuse)
+    monkeypatch.setattr("autosdr.pipeline._shared.complete_text", _refuse)
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert not result.sent
+    assert result.reason == "do_not_contact"
+    assert not prepared_campaign["outbox_path"].exists()
+
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        assert cl.status == CampaignLeadStatus.SKIPPED
+        assert lead.skip_reason == "do_not_contact"
+        # No thread, no AI message — we never burned an analysis call.
+        assert session.query(Thread).count() == 0
+        assert session.query(Message).count() == 0
+
+
+async def test_outreach_aborts_when_lead_opts_out_during_pipeline(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """Race window: lead opts out *between* claim and send. Send must be aborted."""
+
+    from datetime import datetime, timezone
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.3": {
+                "angle": "Rating 3 — opportunity",
+                "signal": "rating",
+                "confidence": 0.7,
+            },
+            "generation-v6": "hey, quick one?",
+            "evaluation-v4.2": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+
+    async def fake_generate_and_evaluate(**_kwargs):
+        # Simulate inbound STOP firing while we're mid-loop: the inbound
+        # handler stamps DNC on the Lead row in another session.
+        with fresh_db() as session:
+            lead = session.get(Lead, prepared_campaign["lead_id"])
+            lead.do_not_contact_at = datetime.now(timezone.utc)
+            lead.do_not_contact_reason = "opt_out:STOP"
+            session.flush()
+        return {
+            "status": "pass",
+            "draft": "hey, quick one?",
+            "attempts": 1,
+            "overall": 0.9,
+            "scores": {},
+            "feedback": "",
+        }
+
+    monkeypatch.setattr(
+        "autosdr.pipeline.outreach.generate_and_evaluate", fake_generate_and_evaluate
+    )
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert not result.sent
+    assert result.reason == "do_not_contact"
+    assert not prepared_campaign["outbox_path"].exists()
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        assert cl.status == CampaignLeadStatus.SKIPPED
+        # Thread was created during the analysis stage (before the race) — that's fine.
+        assert session.query(Message).count() == 0

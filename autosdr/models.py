@@ -166,6 +166,10 @@ class Lead(Base):
         String(32), nullable=False, default=LeadStatus.NEW
     )
     skip_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    do_not_contact_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    do_not_contact_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

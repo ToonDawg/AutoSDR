@@ -6,6 +6,11 @@
       "sourceType": "github",
       "computedHash": "6b2c73ca8ee9f2104958476078f50f92ac61ab1b63880762b52816c968a6fea6"
     },
+    "council": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "computedHash": "633c474bdb57d7df0c5cf30f4e1952974cdfd7d5ea3c9ec3f3d330b21c80c5ac"
+    },
     "frontend-design": {
       "source": "anthropics/skills",
       "sourceType": "github",

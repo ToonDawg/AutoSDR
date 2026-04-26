@@ -32,9 +32,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from datetime import datetime, timezone
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from autosdr import killswitch
+from autosdr.compliance import OptOutMatch, match_opt_out
 from autosdr.connectors.base import BaseConnector, IncomingMessage, OutgoingMessage
 from autosdr.db import session_scope
 from autosdr.importer import normalise_phone
@@ -45,6 +49,7 @@ from autosdr.models import (
     CampaignLeadStatus,
     Lead,
     LeadStatus,
+    LlmCall,
     LlmCallPurpose,
     Message,
     MessageRole,
@@ -72,10 +77,19 @@ logger = logging.getLogger(__name__)
 # waiting for the operator to pick one of the suggested drafts.
 HITL_AWAITING_HUMAN_REPLY = "awaiting_human_reply"
 
+# Sentinel ``LlmCall.model`` value for synthetic audit rows written by the
+# deterministic opt-out shortcut. Filtering on this string excludes synthetic
+# rows from any future cost / token aggregate. See
+# ``docs/tickets/0001-stop-opt-out-keywords.md`` § Resolved questions for the
+# rationale (we repurpose ``LlmCall`` instead of adding a new ``routing_event``
+# table; the trade-off is documented).
+OPT_OUT_AUDIT_MODEL = "(deterministic-opt-out)"
+
 
 @dataclass
 class ReplyResult:
-    action: str  # sent | escalated_hitl | closed_won | closed_lost | unmatched | ignored
+    # closed_opt_out fires for the deterministic STOP / opt-out shortcut.
+    action: str  # sent | escalated_hitl | closed_won | closed_lost | closed_opt_out | unmatched | ignored
     thread_id: str | None = None
     intent: str | None = None
     confidence: float | None = None
@@ -185,6 +199,23 @@ async def process_incoming_message(
         if isinstance(resolved, ReplyResult):
             return resolved
         thread, campaign_lead, campaign, lead = resolved
+
+        # Deterministic compliance shortcut — Spam Act 2003 (AU) / TCPA (US).
+        # Runs *before* any LLM call so a literal STOP / UNSUBSCRIBE keyword
+        # never depends on classifier confidence. Cheap pure-Python regex; if
+        # it doesn't match, we fall through to the normal classify-and-route
+        # path below.
+        opt_out = _apply_opt_out_shortcut(
+            session=session,
+            workspace=workspace,
+            campaign=campaign,
+            campaign_lead=campaign_lead,
+            lead=lead,
+            thread=thread,
+            incoming=incoming,
+        )
+        if opt_out is not None:
+            return opt_out
 
         history = thread_history(session, thread)
         settings_llm = settings_blob.get("llm") or {}
@@ -331,6 +362,85 @@ def _resolve_and_capture_inbound(
     campaign = session.get(Campaign, campaign_lead.campaign_id)
     lead = session.get(Lead, campaign_lead.lead_id)
     return thread, campaign_lead, campaign, lead
+
+
+# ---------------------------------------------------------------------------
+# Stage 1b: deterministic opt-out shortcut (compliance)
+# ---------------------------------------------------------------------------
+
+
+def _apply_opt_out_shortcut(
+    *,
+    session: Session,
+    workspace: Workspace,
+    campaign: Campaign,
+    campaign_lead: CampaignLead,
+    lead: Lead,
+    thread: Thread,
+    incoming: IncomingMessage,
+) -> ReplyResult | None:
+    """Close-lost the thread + flag the lead do-not-contact when the inbound is a STOP keyword.
+
+    Returns a terminal :class:`ReplyResult` on hit, ``None`` otherwise so the
+    caller falls through to the normal LLM classifier path. Writes a sentinel
+    :class:`LlmCall` audit row so ``autosdr logs thread`` shows the routing
+    decision in the same timeline as real LLM events.
+    """
+
+    match: OptOutMatch | None = match_opt_out(incoming.content)
+    if match is None:
+        return None
+
+    # The opt-out shortcut bypasses the LLM, so the LLM client's killswitch
+    # check no longer covers this branch. The webhook will 5xx if paused; the
+    # connector will retry the inbound, or the operator can replay it from
+    # ``unmatched_webhook`` once the killswitch clears.
+    killswitch.raise_if_paused()
+
+    now = datetime.now(timezone.utc)
+    if lead.do_not_contact_at is None:
+        lead.do_not_contact_at = now
+    if not lead.do_not_contact_reason:
+        lead.do_not_contact_reason = match.reason
+
+    _close_thread(thread, campaign_lead, lead, won=False)
+
+    session.add(
+        LlmCall(
+            workspace_id=workspace.id,
+            campaign_id=campaign.id,
+            thread_id=thread.id,
+            lead_id=lead.id,
+            purpose=LlmCallPurpose.OTHER,
+            model=OPT_OUT_AUDIT_MODEL,
+            prompt_version=None,
+            temperature=None,
+            attempt=1,
+            response_format="text",
+            system_prompt="(deterministic opt-out shortcut)",
+            user_prompt=incoming.content,
+            response_text=match.keyword,
+            response_parsed={"keyword": match.keyword, "reason": match.reason},
+            tokens_in=0,
+            tokens_out=0,
+            latency_ms=0,
+        )
+    )
+    session.flush()
+
+    logger.info(
+        "reply route thread=%s action=closed_opt_out keyword=%r",
+        thread.id,
+        match.keyword,
+    )
+
+    return ReplyResult(
+        action="closed_opt_out",
+        thread_id=thread.id,
+        intent="opt_out",
+        confidence=1.0,
+        detail=match.keyword,
+    )
 
 
 # ---------------------------------------------------------------------------

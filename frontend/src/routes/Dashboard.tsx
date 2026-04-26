@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { ArrowRight } from 'lucide-react';
@@ -6,7 +7,8 @@ import { QuotaMeter } from '@/components/domain/QuotaMeter';
 import { Badge } from '@/components/ui/Badge';
 import { Stat } from '@/components/ui/Stat';
 import { HITL_LABEL, relTime, shortDate } from '@/lib/format';
-import { CampaignStatus, ThreadStatus, type SendsByDay } from '@/lib/types';
+import { CampaignStatus, type SendsByDay } from '@/lib/types';
+import { useHitlCount, useHitlThreads } from '@/lib/useHitlThreads';
 
 /**
  * Operator dashboard — the one screen an SDR checks first thing.
@@ -22,15 +24,16 @@ import { CampaignStatus, ThreadStatus, type SendsByDay } from '@/lib/types';
  * easy on the eyes during long triage sessions.
  */
 export function Dashboard() {
+  // TopBar already polls system-status — share the cache instead of polling twice.
   const { data: status } = useQuery({
     queryKey: ['system-status'],
     queryFn: () => api.getSystemStatus(),
-    refetchInterval: 10_000,
   });
-  const { data: hitl } = useQuery({
-    queryKey: ['threads', { status: ThreadStatus.PAUSED_FOR_HITL, limit: 10 }],
-    queryFn: () => api.listThreads({ status: ThreadStatus.PAUSED_FOR_HITL, limit: 10 }),
-  });
+  // Pull a small preview list for the panel and a separate cheap count
+  // for the "Open inbox" badge — the badge stays accurate even when the
+  // operator has dozens of waiting threads.
+  const { data: hitlPreview } = useHitlThreads({ dismissed: false, limit: 6 });
+  const { data: hitlCounts } = useHitlCount();
   const { data: campaigns } = useQuery({
     queryKey: ['campaigns'],
     queryFn: () => api.listCampaigns(),
@@ -40,10 +43,16 @@ export function Dashboard() {
     queryFn: () => api.getSends14d(),
   });
 
-  const hitlCount = hitl?.length ?? 0;
-  const activeCampaigns =
-    campaigns?.filter((c) => c.status === CampaignStatus.ACTIVE) ?? [];
-  const totalSent24h = activeCampaigns.reduce((a, c) => a + c.sent_24h, 0);
+  const hitlCount = hitlCounts?.active ?? 0;
+  const previewRows = useMemo(() => hitlPreview ?? [], [hitlPreview]);
+  const activeCampaigns = useMemo(
+    () => campaigns?.filter((c) => c.status === CampaignStatus.ACTIVE) ?? [],
+    [campaigns],
+  );
+  const totalSent24h = useMemo(
+    () => activeCampaigns.reduce((a, c) => a + c.sent_24h, 0),
+    [activeCampaigns],
+  );
 
   return (
     <div className="page gap-8">
@@ -71,12 +80,13 @@ export function Dashboard() {
       <StatusStrip
         paused={status?.paused ?? false}
         connector={status?.active_connector ?? 'file'}
-        dryRun={status?.dry_run ?? false}
         overrideTo={status?.override_to ?? null}
         autoReply={status?.auto_reply_enabled ?? false}
         callsToday={status?.llm_usage.calls_today ?? 0}
         tokensInToday={status?.llm_usage.tokens_in_today ?? 0}
         tokensOutToday={status?.llm_usage.tokens_out_today ?? 0}
+        schedulerTickS={status?.scheduler.tick_s ?? 60}
+        inboundPollS={status?.scheduler.poll_s ?? 20}
       />
 
       <div className="grid grid-cols-12 gap-8">
@@ -89,9 +99,9 @@ export function Dashboard() {
               </Link>
             }
           />
-          {hitl && hitl.length > 0 ? (
+          {previewRows.length > 0 ? (
             <ul className="paper-card divide-y divide-rule">
-              {hitl.slice(0, 6).map((t) => (
+              {previewRows.map((t) => (
                 <li key={t.id} className="group">
                   <Link
                     to={`/threads/${t.id}`}
@@ -210,15 +220,16 @@ function PanelHeader({
 function StatusStrip(props: {
   paused: boolean;
   connector: string;
-  dryRun: boolean;
   overrideTo: string | null;
   autoReply: boolean;
   callsToday: number;
   tokensInToday: number;
   tokensOutToday: number;
+  schedulerTickS: number;
+  inboundPollS: number;
 }) {
   return (
-    <div className="paper-card grid grid-cols-2 md:grid-cols-4 divide-x divide-y md:divide-y-0 divide-rule">
+    <div className="paper-card grid grid-cols-2 md:grid-cols-5 divide-x divide-y md:divide-y-0 divide-rule">
       <Stat
         label="Scheduler"
         value={props.paused ? 'Paused' : 'Running'}
@@ -228,13 +239,18 @@ function StatusStrip(props: {
         label="Connector"
         value={props.connector}
         capitalize
-        hint={props.dryRun ? 'dry-run' : props.overrideTo ? `override → ${props.overrideTo}` : undefined}
+        hint={props.overrideTo ? `override → ${props.overrideTo}` : undefined}
       />
       <Stat
         label="Auto-reply"
         value={props.autoReply ? 'On' : 'Off'}
         tone={props.autoReply ? 'mustard' : 'neutral'}
         hint={props.autoReply ? undefined : 'first-message only'}
+      />
+      <Stat
+        label="Cadence"
+        value={`${props.schedulerTickS}s tick`}
+        hint={`${props.inboundPollS}s inbound poll`}
       />
       <Stat
         label="LLM today"

@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
 import { BackLink } from '@/components/ui/BackLink';
 import { PageHeader } from '@/components/ui/PageHeader';
-import { CONTACT_TYPE_LABEL, formatPhone } from '@/lib/format';
+import { CONTACT_TYPE_LABEL, formatPhone, formatSkipReason } from '@/lib/format';
 import type { ImportPreview } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -158,9 +158,13 @@ export function LeadsImport() {
               </div>
               <div className="mt-2 flex flex-col gap-1 text-xs">
                 {preview.would_skip.map((s) => (
-                  <div key={s.reason} className="flex items-center justify-between">
-                    <span className="text-ink-muted">{s.reason}</span>
-                    <span className="font-mono text-ink tabular-nums">{s.count}</span>
+                  <div key={s.reason} className="flex items-center justify-between gap-3">
+                    <span className="text-ink-muted truncate">
+                      {formatSkipReason(s.reason)}
+                    </span>
+                    <span className="font-mono text-ink tabular-nums shrink-0">
+                      {s.count}
+                    </span>
                   </div>
                 ))}
               </div>

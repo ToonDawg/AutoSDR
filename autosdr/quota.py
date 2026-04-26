@@ -16,10 +16,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from autosdr.models import CampaignLead, Message, MessageRole, Thread
+from autosdr.models import Campaign, CampaignLead, Message, MessageRole, Thread
 
 
 def count_ai_messages_last_24h(session: Session, campaign_id: str) -> int:
@@ -53,10 +53,15 @@ def count_ai_messages_last_24h_bulk(
         select(CampaignLead.campaign_id, func.count(Message.id))
         .join(Thread, Thread.id == Message.thread_id)
         .join(CampaignLead, CampaignLead.id == Thread.campaign_lead_id)
+        .join(Campaign, Campaign.id == CampaignLead.campaign_id)
         .where(
             CampaignLead.campaign_id.in_(ids),
             Message.role == MessageRole.AI,
             Message.created_at >= cutoff,
+            or_(
+                Campaign.quota_reset_at.is_(None),
+                Message.created_at >= Campaign.quota_reset_at,
+            ),
         )
         .group_by(CampaignLead.campaign_id)
     )

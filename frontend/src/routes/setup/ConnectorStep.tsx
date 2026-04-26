@@ -72,10 +72,15 @@ export function ConnectorStep({
 
       {state.connector_type === 'smsgate' && (
         <div className="mt-4 space-y-4">
-          <Field label="API URL" required>
+          <Field
+            label="API URL"
+            required
+            hint="Full base URL the API is mounted at. On-device (Android Local Server): the host:port the app shows, e.g. 192.168.0.13:8080 (the API is at the root — no path needed). Docker private server: http://localhost:3000/api/3rdparty/v1. Cloud: https://api.sms-gate.app/3rdparty/v1."
+          >
             <Input
               value={state.smsgate_api_url}
               onChange={(e) => set('smsgate_api_url', e.target.value)}
+              placeholder="192.168.0.13:8080"
             />
           </Field>
           <Field label="Username" required>

@@ -1,8 +1,8 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useParams, useNavigate } from 'react-router-dom';
-import { useState } from 'react';
-import { ArrowLeft } from 'lucide-react';
-import { api } from '@/lib/api';
+import { useCallback, useState } from 'react';
+import { AlertTriangle, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
+import { api, ApiError } from '@/lib/api';
 import { MessageBubble } from '@/components/domain/MessageBubble';
 import { AngleTag } from '@/components/domain/AngleTag';
 import { ThreadStatusBadge } from '@/components/domain/ThreadStatusBadge';
@@ -12,6 +12,29 @@ import { ThreadStatus, type Suggestion } from '@/lib/types';
 import { SuggestedReplies } from './thread/SuggestedReplies';
 import { ComposeBar } from './thread/ComposeBar';
 import { LlmTrail } from './thread/LlmTrail';
+
+/** Turn the structured API error payload into an operator-friendly line. */
+function sendDraftErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    const body = err.payload as { error?: string; reason?: string } | null;
+    const code = body?.error;
+    if (code === 'system_shutting_down') {
+      return 'AutoSDR is shutting down — your message was not sent.';
+    }
+    if (code === 'connector_send_failed') {
+      return `Connector rejected the send${body?.reason ? `: ${body.reason}` : '.'}`;
+    }
+    if (code === 'empty_draft') {
+      return 'Nothing to send — the draft is empty.';
+    }
+    if (code === 'lead_missing_contact_uri') {
+      return 'This lead has no phone number on file.';
+    }
+    if (code) return code.replace(/_/g, ' ');
+    return err.message;
+  }
+  return err instanceof Error ? err.message : 'Send failed.';
+}
 
 /**
  * Single-thread workspace.
@@ -36,11 +59,13 @@ export function ThreadDetail() {
   const { data: thread } = useQuery({
     queryKey: ['thread', id],
     queryFn: () => api.getThread(id),
+    enabled: !!id,
   });
   const { data: messages } = useQuery({
     queryKey: ['messages', id],
     queryFn: () => api.listMessages(id),
     refetchInterval: 8_000,
+    enabled: !!id,
   });
   const { data: campaign } = useQuery({
     queryKey: ['campaign', thread?.campaign_id],
@@ -50,7 +75,21 @@ export function ThreadDetail() {
   const { data: llmCalls } = useQuery({
     queryKey: ['llm-calls', id],
     queryFn: () => api.listLlmCalls({ threadId: id, limit: 12 }),
+    enabled: !!id,
   });
+
+  // Invalidate the specific thread record + the user-facing list views.
+  // The campaign-scoped list and HITL list both move when a thread sends/closes.
+  const invalidateAffectedThreadLists = () => {
+    qc.invalidateQueries({ queryKey: ['thread', id] });
+    qc.invalidateQueries({ queryKey: ['threads'], exact: true });
+    qc.invalidateQueries({ queryKey: ['threads', 'hitl'] });
+    if (thread?.campaign_id) {
+      qc.invalidateQueries({
+        queryKey: ['threads', 'campaign', thread.campaign_id],
+      });
+    }
+  };
 
   const sendDraft = useMutation({
     mutationFn: (payload: { draft: string; source: 'ai_suggested' | 'manual' }) =>
@@ -58,10 +97,10 @@ export function ThreadDetail() {
     onSuccess: () => {
       setManualDraft('');
       qc.invalidateQueries({ queryKey: ['messages', id] });
-      qc.invalidateQueries({ queryKey: ['thread', id] });
-      qc.invalidateQueries({ queryKey: ['threads'] });
+      invalidateAffectedThreadLists();
     },
   });
+  const sendError = sendDraft.isError ? sendDraftErrorMessage(sendDraft.error) : null;
 
   const regenerate = useMutation({
     mutationFn: () => api.regenerateSuggestions(id),
@@ -73,10 +112,36 @@ export function ThreadDetail() {
   const close = useMutation({
     mutationFn: (outcome: 'won' | 'lost') => api.closeThread(id, outcome),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['thread', id] });
-      qc.invalidateQueries({ queryKey: ['threads'] });
+      invalidateAffectedThreadLists();
     },
   });
+
+  // Dismiss / restore live alongside take-over and close, but they don't
+  // change the thread's outcome — the thread stays paused, it just stops
+  // showing up in the operator's "Needs your eye" queue. A new HITL
+  // event clears the flag automatically (see ``pause_thread_for_hitl``).
+  const dismiss = useMutation({
+    mutationFn: () => api.dismissThread(id),
+    onSuccess: () => {
+      invalidateAffectedThreadLists();
+    },
+  });
+  const restore = useMutation({
+    mutationFn: () => api.restoreThread(id),
+    onSuccess: () => {
+      invalidateAffectedThreadLists();
+    },
+  });
+
+  const sendMutate = sendDraft.mutate;
+  const handleSendSuggestion = useCallback(
+    (draft: string) => sendMutate({ draft, source: 'ai_suggested' }),
+    [sendMutate],
+  );
+  const handleEditSuggestion = useCallback(
+    (draft: string) => setManualDraft(draft),
+    [],
+  );
 
   if (!thread) {
     return (
@@ -125,17 +190,46 @@ export function ThreadDetail() {
 
         {pausedForHitl && thread.hitl_reason && (
           <div className="px-8 py-3 border-b border-rust/40 bg-rust-soft/60 flex items-start gap-4">
-            <Badge tone="rust" dot>
-              Paused for you
+            <Badge tone={thread.hitl_dismissed_at ? 'neutral' : 'rust'} dot>
+              {thread.hitl_dismissed_at ? 'Dismissed' : 'Paused for you'}
             </Badge>
             <div className="flex-1 text-sm text-ink">
               {HITL_LABEL[thread.hitl_reason] ?? thread.hitl_reason}
+              {thread.hitl_dismissed_at && (
+                <span className="text-ink-muted">
+                  {' '}
+                  · set aside {relTime(thread.hitl_dismissed_at)}
+                </span>
+              )}
               {thread.hitl_context?.incoming_message && (
                 <div className="mt-1 text-sm text-ink-muted">
                   Last from lead: &ldquo;{thread.hitl_context.incoming_message}&rdquo;
                 </div>
               )}
             </div>
+            {thread.hitl_dismissed_at ? (
+              <button
+                type="button"
+                onClick={() => restore.mutate()}
+                disabled={restore.isPending}
+                className="text-xs text-ink-muted hover:text-ink px-2 py-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1 shrink-0"
+                title="Pull this thread back to the inbox"
+              >
+                <RotateCcw className="h-3 w-3" strokeWidth={1.5} />
+                Restore
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => dismiss.mutate()}
+                disabled={dismiss.isPending}
+                className="text-xs text-ink-muted hover:text-rust px-2 py-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1 shrink-0"
+                title="Set this thread aside without changing its outcome"
+              >
+                <Trash2 className="h-3 w-3" strokeWidth={1.5} />
+                Dismiss
+              </button>
+            )}
           </div>
         )}
 
@@ -160,12 +254,25 @@ export function ThreadDetail() {
           <SuggestedReplies
             suggestions={suggestions}
             pausedForHitl={pausedForHitl}
-            onSend={(draft) => sendDraft.mutate({ draft, source: 'ai_suggested' })}
-            onEdit={(draft) => setManualDraft(draft)}
+            onSend={handleSendSuggestion}
+            onEdit={handleEditSuggestion}
             onRegenerate={() => regenerate.mutate()}
             regenerating={regenerate.isPending}
             sendingDraft={sendDraft.isPending}
           />
+        )}
+
+        {sendError && (
+          <div
+            role="alert"
+            className="border-t border-oxblood/30 bg-oxblood-soft px-8 py-3 flex items-start gap-2 text-sm text-oxblood"
+          >
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" strokeWidth={1.75} />
+            <div>
+              <div className="font-medium">Send failed</div>
+              <div className="text-xs mt-0.5">{sendError}</div>
+            </div>
+          </div>
         )}
 
         <ComposeBar

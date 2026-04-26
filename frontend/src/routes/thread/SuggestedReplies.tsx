@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Edit3, RefreshCcw, Send, Sparkles } from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
@@ -75,8 +76,8 @@ export function SuggestedReplies({
               key={s.gen_llm_call_id ?? `${idx}`}
               index={idx}
               suggestion={s}
-              onSend={() => onSend(s.draft)}
-              onEdit={() => onEdit(s.draft)}
+              onSend={onSend}
+              onEdit={onEdit}
               disabled={sendingDraft}
             />
           ))}
@@ -86,7 +87,11 @@ export function SuggestedReplies({
   );
 }
 
-function SuggestionRow({
+// Memoized: rows only re-render when their suggestion / disabled flag changes.
+// Parent can pass stable `onSend`/`onEdit` (e.g. via `useCallback`) and the
+// row binds the per-row draft locally without creating a new closure for the
+// child each render.
+const SuggestionRow = memo(function SuggestionRow({
   index,
   suggestion,
   onSend,
@@ -95,8 +100,8 @@ function SuggestionRow({
 }: {
   index: number;
   suggestion: Suggestion;
-  onSend: () => void;
-  onEdit: () => void;
+  onSend: (draft: string) => void;
+  onEdit: (draft: string) => void;
   disabled: boolean;
 }) {
   const score = Math.round((suggestion.overall ?? 0) * 100);
@@ -127,7 +132,7 @@ function SuggestionRow({
           variant="primary"
           size="sm"
           iconLeft={<Send className="h-3.5 w-3.5" strokeWidth={1.5} />}
-          onClick={onSend}
+          onClick={() => onSend(suggestion.draft)}
           disabled={disabled}
         >
           Send this
@@ -136,11 +141,11 @@ function SuggestionRow({
           variant="ghost"
           size="sm"
           iconLeft={<Edit3 className="h-3.5 w-3.5" strokeWidth={1.5} />}
-          onClick={onEdit}
+          onClick={() => onEdit(suggestion.draft)}
         >
           Edit
         </Button>
       </div>
     </li>
   );
-}
+});

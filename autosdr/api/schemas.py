@@ -101,6 +101,38 @@ class WorkspaceSettingsPatch(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Connector test
+# ---------------------------------------------------------------------------
+
+
+class ConnectorTestRequest(BaseModel):
+    """Optional override of the saved connector for ``POST /connector/test``.
+
+    The Settings page lets the operator click "Test connection" before
+    saving — the unsaved form state is posted here verbatim. When every
+    field is omitted we validate the currently-cached connector instead.
+
+    ``textbee`` / ``smsgate`` are plain dicts so the connector's own
+    constructor + ``validate_config`` surface credential issues in the
+    response body rather than 422'ing at the schema layer.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["file", "textbee", "smsgate"] | None = None
+    textbee: dict[str, Any] | None = None
+    smsgate: dict[str, Any] | None = None
+
+
+class ConnectorTestResult(BaseModel):
+    """Outcome of a connector connectivity probe."""
+
+    ok: bool
+    detail: str
+    connector_type: str
+
+
+# ---------------------------------------------------------------------------
 # Status
 # ---------------------------------------------------------------------------
 
@@ -128,7 +160,6 @@ class SystemStatusOut(BaseModel):
     paused: bool
     started_at: datetime | None
     active_connector: str
-    dry_run: bool
     override_to: str | None
     auto_reply_enabled: bool
     setup_required: bool
@@ -142,6 +173,23 @@ class SystemStatusOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class FollowupConfig(BaseModel):
+    """Per-campaign follow-up beat config.
+
+    Mirrors the shape stored on ``campaign.followup``. All fields are
+    optional so a partial PATCH can toggle the feature without the
+    frontend having to round-trip the full blob. The backend fills
+    reasonable defaults before persisting.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    template: str = ""
+    delay_s: int = 10
+    delay_jitter_s: int = 5
+
+
 class CampaignOut(BaseModel):
     id: str
     name: str
@@ -149,12 +197,29 @@ class CampaignOut(BaseModel):
     outreach_per_day: int
     connector_type: str
     status: str
+    followup: FollowupConfig
+    quota_reset_at: datetime | None = None
     created_at: datetime
     lead_count: int = 0
     contacted_count: int = 0
     replied_count: int = 0
     won_count: int = 0
     sent_24h: int = 0
+
+
+class CampaignKickoffRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    count: int = Field(default=1, ge=1, le=100)
+
+
+class CampaignKickoffResult(BaseModel):
+    requested: int
+    attempted: int
+    sent: int
+    failed: int
+    remaining_queued: int
+    campaign: CampaignOut
 
 
 class CampaignCreate(BaseModel):
@@ -164,6 +229,7 @@ class CampaignCreate(BaseModel):
     goal: str
     outreach_per_day: int = 50
     connector_type: str | None = None
+    followup: FollowupConfig | None = None
 
 
 class CampaignPatch(BaseModel):
@@ -173,6 +239,7 @@ class CampaignPatch(BaseModel):
     goal: str | None = None
     outreach_per_day: int | None = None
     status: Literal["draft", "active", "paused", "completed"] | None = None
+    followup: FollowupConfig | None = None
 
 
 class CampaignAssignLeads(BaseModel):
@@ -202,6 +269,22 @@ class LeadOut(BaseModel):
     status: str
     skip_reason: str | None
     created_at: datetime
+
+
+class LeadListOut(BaseModel):
+    """Paginated leads response.
+
+    The Leads page can be fed tens of thousands of rows (e.g. a single
+    regional scrape), so the server is the source of truth for both
+    pagination and per-status counts. ``counts_by_status`` includes the
+    ``all`` bucket so the filter tabs can render without an extra round-trip.
+    """
+
+    leads: list[LeadOut]
+    total: int
+    limit: int
+    offset: int
+    counts_by_status: dict[str, int] = Field(default_factory=dict)
 
 
 class ImportPreviewRow(BaseModel):
@@ -270,6 +353,7 @@ class ThreadOut(BaseModel):
     tone_snapshot: str | None
     hitl_reason: str | None
     hitl_context: dict[str, Any] | None
+    hitl_dismissed_at: datetime | None
     last_message_at: datetime | None
     created_at: datetime
 
@@ -363,11 +447,15 @@ __all__ = [
     "CampaignQuota",
     "CloseThreadRequest",
     "ConnectorSmsGateCreds",
+    "ConnectorTestRequest",
+    "ConnectorTestResult",
     "ConnectorTextBeeCreds",
+    "FollowupConfig",
     "ImportCommitOut",
     "ImportPreviewOut",
     "ImportPreviewRow",
     "ImportPreviewSkipReason",
+    "LeadListOut",
     "LeadOut",
     "LlmCallOut",
     "LlmUsage",

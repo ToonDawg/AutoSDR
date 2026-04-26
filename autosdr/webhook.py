@@ -35,7 +35,7 @@ from autosdr.api.deps import SETUP_REQUIRED_STATUS
 from autosdr.api.errors import install_exception_handlers
 from autosdr.config import get_settings, merge_workspace_settings
 from autosdr.connectors import get_connector
-from autosdr.db import session_scope
+from autosdr.db import create_all, session_scope
 from autosdr.llm import apply_llm_provider_keys, get_usage_snapshot
 from autosdr.models import Workspace
 from autosdr.scheduler import run_inbound_poller, run_scheduler
@@ -56,6 +56,11 @@ def _load_and_backfill_workspace_settings() -> dict | None:
     defaults back in once at boot keeps the DB, the UI, and the runtime
     in sync. We keep the read + write in one session so the caller gets a
     dict that already reflects what was just committed.
+
+    Obsolete keys (settings we used to support but have since removed) are
+    pruned here too — see :func:`_strip_obsolete_settings`. Without this
+    sweep, deep-merge would keep them in the JSON forever; with it, the
+    next boot quietly cleans up after the previous schema.
     """
 
     with session_scope() as session:
@@ -64,15 +69,32 @@ def _load_and_backfill_workspace_settings() -> dict | None:
             return None
 
         existing = dict(workspace.settings or {})
+        _strip_obsolete_settings(existing)
         merged = merge_workspace_settings(existing, {})
-        if merged != existing:
+        if merged != (workspace.settings or {}):
             workspace.settings = merged
             flag_modified(workspace, "settings")
             logger.info(
-                "workspace=%s settings backfilled with defaults for missing keys",
+                "workspace=%s settings backfilled / pruned to current schema",
                 workspace.id,
             )
         return dict(merged)
+
+
+def _strip_obsolete_settings(blob: dict) -> None:
+    """Remove keys we no longer honour from a settings dict in place.
+
+    Currently:
+
+    * ``rehearsal.dry_run`` — replaced by ``connector.type == "file"``.
+      The factory ignores the flag at runtime, but we want it gone from
+      the persisted JSON so old workspaces stop carrying a misleading
+      "dry-run is on!" hint that has no effect.
+    """
+
+    rehearsal = blob.get("rehearsal")
+    if isinstance(rehearsal, dict):
+        rehearsal.pop("dry_run", None)
 
 
 def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
@@ -87,6 +109,19 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
         scheduler_task: asyncio.Task | None = None
         poller_task: asyncio.Task | None = None
         flag_watcher: asyncio.Task | None = None
+
+        # Create any missing tables + apply additive column migrations
+        # *before* any session opens. This keeps ``uvicorn
+        # autosdr.webhook:app`` boots in parity with the CLI entrypoints,
+        # which call ``create_all()`` in their own startup paths. Without
+        # this, pulling new code that adds a nullable column to an
+        # existing table (e.g. ``campaign.followup``) produces an
+        # ``OperationalError: no such column`` on the next read.
+        try:
+            create_all()
+        except Exception:
+            logger.exception("failed to initialise db schema on boot")
+            raise
 
         # Apply LLM provider keys from settings into os.environ before any
         # scheduler tick runs — LiteLLM reads them at call time.

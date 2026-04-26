@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Link } from "react-router-dom";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { ThreadStatusBadge } from "@/components/domain/ThreadStatusBadge";
 import { FilterTabs, type FilterOption } from "@/components/ui/FilterTabs";
@@ -16,6 +17,10 @@ const FILTERS: ReadonlyArray<FilterOption<ThreadStatusT | "all">> = [
   { id: "won", label: "Won" },
   { id: "lost", label: "Lost" },
 ];
+
+const ROW_GRID =
+  "grid grid-cols-[28%_24%_22%_12%_14%] items-start";
+const ROW_HEIGHT = 56;
 
 /**
  * Full threads index with status filter + client-side search. The
@@ -55,6 +60,15 @@ export function Threads() {
     return m;
   }, [threads]);
 
+  // Virtualize: even at limit:500 we only render the visible rows.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: filtered.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 8,
+  });
+
   return (
     <div className="page gap-5">
       <PageHeader
@@ -73,64 +87,76 @@ export function Threads() {
       <FilterTabs options={FILTERS} active={filter} onChange={setFilter} counts={counts} />
 
       <div className="paper-card">
-        <table className="t-table">
-          <colgroup>
-            <col style={{ width: "28%" }} />
-            <col style={{ width: "24%" }} />
-            <col style={{ width: "22%" }} />
-            <col style={{ width: "12%" }} />
-            <col style={{ width: "14%" }} />
-          </colgroup>
-          <thead>
-            <tr>
-              <th>Lead</th>
-              <th>Campaign</th>
-              <th>Angle</th>
-              <th>Status</th>
-              <th>Last activity</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((t) => (
-              <tr key={t.id}>
-                <td>
-                  <Link to={`/threads/${t.id}`} className="group block">
-                    <div className="text-sm text-ink group-hover:text-rust font-medium">
-                      {t.lead_name ?? "Unknown lead"}
-                    </div>
-                    <div className="text-[11px] text-ink-faint font-mono mt-0.5">
-                      {formatPhone(t.lead_phone)}
-                    </div>
-                  </Link>
-                </td>
-                <td>
-                  <Link
-                    to={`/campaigns/${t.campaign_id}`}
-                    className="text-sm text-ink-muted hover:text-ink"
-                  >
-                    {t.campaign_name}
-                  </Link>
-                </td>
-                <td className="text-xs text-ink-muted">
-                  {t.angle ? (
-                    <span className="text-ink">{t.angle}</span>
-                  ) : (
-                    <span className="italic text-ink-faint">No angle</span>
-                  )}
-                </td>
-                <td>
-                  <ThreadStatusBadge status={t.status} />
-                </td>
-                <td className="font-mono text-[11px] text-ink-muted">
-                  {relTime(t.last_message_at)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {filtered.length === 0 && (
+        <div
+          className={`${ROW_GRID} label px-3 py-2.5 border-b border-rule bg-paper-deep`}
+        >
+          <div>Lead</div>
+          <div>Campaign</div>
+          <div>Angle</div>
+          <div>Status</div>
+          <div>Last activity</div>
+        </div>
+        {filtered.length === 0 ? (
           <div className="py-14 text-center text-ink-muted text-sm">
             No threads match the current filter.
+          </div>
+        ) : (
+          <div
+            ref={scrollRef}
+            className="overflow-auto"
+            style={{ maxHeight: "calc(100vh - 22rem)" }}
+          >
+            <div
+              className="relative"
+              style={{ height: rowVirtualizer.getTotalSize() }}
+            >
+              {rowVirtualizer.getVirtualItems().map((vRow) => {
+                const t = filtered[vRow.index];
+                return (
+                  <div
+                    key={t.id}
+                    data-index={vRow.index}
+                    className={`${ROW_GRID} absolute inset-x-0 border-b border-rule px-3 py-3 hover:bg-paper-deep`}
+                    style={{
+                      transform: `translateY(${vRow.start}px)`,
+                      height: ROW_HEIGHT,
+                    }}
+                  >
+                    <div className="min-w-0 pr-3">
+                      <Link to={`/threads/${t.id}`} className="group block">
+                        <div className="text-sm text-ink group-hover:text-rust font-medium truncate">
+                          {t.lead_name ?? "Unknown lead"}
+                        </div>
+                        <div className="text-[11px] text-ink-faint font-mono mt-0.5">
+                          {formatPhone(t.lead_phone)}
+                        </div>
+                      </Link>
+                    </div>
+                    <div className="min-w-0 pr-3">
+                      <Link
+                        to={`/campaigns/${t.campaign_id}`}
+                        className="text-sm text-ink-muted hover:text-ink truncate block"
+                      >
+                        {t.campaign_name}
+                      </Link>
+                    </div>
+                    <div className="text-xs text-ink-muted truncate pr-3">
+                      {t.angle ? (
+                        <span className="text-ink">{t.angle}</span>
+                      ) : (
+                        <span className="italic text-ink-faint">No angle</span>
+                      )}
+                    </div>
+                    <div className="pr-3">
+                      <ThreadStatusBadge status={t.status} />
+                    </div>
+                    <div className="font-mono text-[11px] text-ink-muted">
+                      {relTime(t.last_message_at)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
       </div>

@@ -325,9 +325,10 @@ def test_sms(
 ) -> None:
     """Send a test SMS via the configured connector.
 
-    Uses whatever is in ``workspace.settings`` — if you want to test in
-    dry-run or override-to mode, flip the Rehearsal toggles in the UI
-    first.
+    Uses whatever is in ``workspace.settings`` — if you want to sandbox the
+    test, switch the connector type to ``file`` (writes to the outbox) or
+    set ``rehearsal.override_to`` in the UI first so the send is redirected
+    to a phone you own.
     """
 
     _configure_logging()

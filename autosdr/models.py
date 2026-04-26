@@ -73,6 +73,8 @@ class CampaignStatus:
 
 class CampaignLeadStatus:
     QUEUED = "queued"
+    SENDING = "sending"
+    PAUSED_FOR_HITL = "paused_for_hitl"
     CONTACTED = "contacted"
     REPLIED = "replied"
     WON = "won"
@@ -214,6 +216,15 @@ class Campaign(Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=CampaignStatus.DRAFT
     )
+    # Optional follow-up beat config — a second, literal-template SMS fired
+    # ``delay_s ± delay_jitter_s`` seconds after the first-contact send for
+    # "one more thing" texture. Structured as
+    # ``{enabled, template, delay_s, delay_jitter_s}``. ``None`` = disabled
+    # (the default for legacy campaign rows).
+    followup: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    quota_reset_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -273,6 +284,13 @@ class Thread(Base):
     tone_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     hitl_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     hitl_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Set when an operator dismisses a thread off the "Needs your eye" queue.
+    # Cleared automatically whenever the pipeline raises a fresh HITL event
+    # (see ``pause_thread_for_hitl`` / ``regenerate_suggestions`` / ``take_over``)
+    # so dismiss behaves like "ack the current event", not "silence forever".
+    hitl_dismissed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

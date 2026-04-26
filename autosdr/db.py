@@ -8,15 +8,18 @@ can share a connection pool with the scheduler.
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from autosdr.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _engine: Engine | None = None
 _SessionLocal: sessionmaker[Session] | None = None
@@ -97,12 +100,65 @@ def session_scope() -> Iterator[Session]:
         session.close()
 
 
+# Known additive column migrations for legacy DBs.
+#
+# SQLAlchemy's ``create_all`` is idempotent per-table: it will NOT add new
+# columns to tables that already exist. For a POC that ships without
+# Alembic, we hand-roll a tiny "add missing nullable column" step for any
+# column we've introduced since the initial schema shipped. Each entry is
+# ``(table, column_name, sql_type)`` — the type has to be the raw SQL
+# declaration because SQLAlchemy's typed ADD COLUMN helper wants a
+# migration context we deliberately don't set up here.
+_ADDITIVE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("campaign", "followup", "JSON"),
+    ("campaign", "quota_reset_at", "DATETIME"),
+    ("thread", "hitl_dismissed_at", "DATETIME"),
+)
+
+
+def _apply_additive_column_migrations(engine: Engine) -> None:
+    """Apply any missing columns in :data:`_ADDITIVE_COLUMN_MIGRATIONS`.
+
+    Only adds nullable columns with no default — any DB value we care about
+    goes through the ORM default/server-side logic in ``models.py`` and the
+    API layer. This keeps the migration safe to re-run and cheap on
+    established installs (inspector returns cached columns).
+    """
+
+    if not _ADDITIVE_COLUMN_MIGRATIONS:
+        return
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        for table, column, sql_type in _ADDITIVE_COLUMN_MIGRATIONS:
+            if table not in existing_tables:
+                continue
+            present = {col["name"] for col in inspector.get_columns(table)}
+            if column in present:
+                continue
+            logger.info(
+                "db: adding missing column %s.%s (%s) to legacy DB",
+                table,
+                column,
+                sql_type,
+            )
+            conn.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            )
+
+
 def create_all() -> None:
-    """Create all tables. Safe to call repeatedly (idempotent)."""
+    """Create all tables + apply additive schema migrations.
+
+    Safe to call repeatedly: ``create_all`` is idempotent per-table, and the
+    additive-column step is guarded by an inspector check.
+    """
 
     from autosdr.models import Base  # local import avoids circular imports
 
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _apply_additive_column_migrations(engine)
 
 
 def reset_for_tests() -> None:

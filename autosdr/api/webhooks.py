@@ -70,6 +70,13 @@ async def webhook_sms(
     except Exception:
         raise HTTPException(status_code=400, detail={"error": "invalid_json"})
 
+    workspace_id = _resolve_workspace_id()
+    if workspace_id is None:
+        return JSONResponse(
+            content={"accepted": False, "reason": "no_workspace"},
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+
     connector = get_connector()
     try:
         incoming = connector.parse_webhook(payload)
@@ -77,13 +84,6 @@ async def webhook_sms(
         logger.info("ignoring non-inbound webhook: %s", exc)
         return JSONResponse(
             content={"accepted": False, "reason": str(exc)},
-            status_code=status.HTTP_202_ACCEPTED,
-        )
-
-    workspace_id = _resolve_workspace_id()
-    if workspace_id is None:
-        return JSONResponse(
-            content={"accepted": False, "reason": "no_workspace"},
             status_code=status.HTTP_202_ACCEPTED,
         )
 

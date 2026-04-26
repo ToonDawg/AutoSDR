@@ -69,21 +69,25 @@ def test_smsgate_with_credentials():
     assert connector.username == "ops"
 
 
-def test_dry_run_overrides_connector_choice():
+def test_legacy_dry_run_flag_is_ignored():
+    """The old ``rehearsal.dry_run`` toggle is gone — extra keys must
+    pass through ``build_connector`` without effect.
+
+    Older workspaces still have ``"dry_run": true`` baked into their
+    settings JSON; we want those to keep using whatever connector is
+    configured (file / textbee / smsgate) until the operator picks
+    again. The deep-merge defaults strip the key on read, but this
+    test keeps us honest if someone re-introduces ``dry_run`` handling
+    by accident.
+    """
+
     settings = _settings(type="textbee")
     settings["connector"]["textbee"].update(
         {"api_key": "k", "device_id": "d"}
     )
     settings["rehearsal"]["dry_run"] = True
     connector = build_connector(settings)
-    assert isinstance(connector, FileConnector)
-
-
-def test_dry_run_bypasses_missing_smsgate_creds():
-    settings = _settings(type="smsgate")
-    settings["rehearsal"]["dry_run"] = True
-    connector = build_connector(settings)
-    assert isinstance(connector, FileConnector)
+    assert isinstance(connector, TextBeeConnector)
 
 
 def test_override_wraps_file_connector():
@@ -104,15 +108,6 @@ def test_override_wraps_textbee_connector():
     connector = build_connector(settings)
     assert isinstance(connector, OverrideConnector)
     assert isinstance(connector.inner, TextBeeConnector)
-
-
-def test_dry_run_and_override_compose():
-    settings = _settings(type="textbee")
-    settings["rehearsal"]["dry_run"] = True
-    settings["rehearsal"]["override_to"] = "+61400000099"
-    connector = build_connector(settings)
-    assert isinstance(connector, OverrideConnector)
-    assert isinstance(connector.inner, FileConnector)
 
 
 def test_get_connector_requires_workspace(fresh_db):

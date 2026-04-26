@@ -8,10 +8,16 @@ import type {
   ThreadStatusT,
 } from './types';
 
+function parseApiDate(iso: string): Date {
+  const value = iso.trim();
+  const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
+  return parseISO(hasTimezone ? value : `${value.replace(' ', 'T')}Z`);
+}
+
 export function relTime(iso: string | null | undefined): string {
   if (!iso) return '—';
   try {
-    return formatDistanceToNowStrict(parseISO(iso), { addSuffix: true });
+    return formatDistanceToNowStrict(parseApiDate(iso), { addSuffix: true });
   } catch {
     return '—';
   }
@@ -20,7 +26,7 @@ export function relTime(iso: string | null | undefined): string {
 export function absTime(iso: string | null | undefined, pattern = 'd MMM · HH:mm'): string {
   if (!iso) return '—';
   try {
-    return format(parseISO(iso), pattern);
+    return format(parseApiDate(iso), pattern);
   } catch {
     return '—';
   }
@@ -123,4 +129,42 @@ export const CONTACT_TYPE_LABEL: Partial<Record<ContactTypeT, string>> & Record<
   unknown: 'Unknown',
   email: 'Email',
 };
+
+/**
+ * Humanise the ``skip_reason`` strings that the Python importer emits.
+ *
+ * The server stores machine-tags like ``not_a_mobile_number:landline`` so
+ * the reason column in the leads table is explicit and greppable. The UI
+ * shouldn't leak those into prose — operators see "Landline — SMS won't
+ * reach this lead" instead. Unknown reasons fall through with underscores
+ * converted to spaces so new backend tags don't render as garbage.
+ */
+export function formatSkipReason(reason: string | null | undefined): string {
+  if (!reason) return '—';
+
+  if (reason.startsWith('not_a_mobile_number:')) {
+    const kind = reason.slice('not_a_mobile_number:'.length);
+    switch (kind) {
+      case 'landline':
+        return 'Landline — SMS won\u2019t reach this lead';
+      case 'toll_free':
+        return 'Toll-free — SMS won\u2019t reach this lead';
+      case 'unknown':
+        return 'Unverified number type — not messaging to be safe';
+      default:
+        return `Not a mobile (${kind.replace(/_/g, ' ')}) — not messaging`;
+    }
+  }
+
+  switch (reason) {
+    case 'no_contact_uri':
+      return 'No phone number in the source row';
+    case 'invalid_phone_format':
+      return 'Phone number could not be parsed';
+    case 'duplicate_no_new_data':
+      return 'Duplicate — no new data to merge';
+    default:
+      return reason.replace(/_/g, ' ');
+  }
+}
 

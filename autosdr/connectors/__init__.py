@@ -2,9 +2,9 @@
 
 The active connector is assembled from ``workspace.settings`` — the DB-backed
 source of truth — at boot time and cached in a module-level singleton. PATCHes
-to ``/api/workspace/settings`` call :func:`rebuild_connector` so that toggling
-CONNECTOR, flipping dry-run, or pasting a new API key takes effect without a
-server restart.
+to ``/api/workspace/settings`` call :func:`rebuild_connector` so that swapping
+the connector type, pasting a new API key, or flipping the override recipient
+takes effect without a server restart.
 """
 
 from __future__ import annotations
@@ -57,12 +57,15 @@ def build_connector(workspace_settings: dict[str, Any]) -> BaseConnector:
 
     Composition, in order:
 
-    1. Base connector selected by ``connector.type`` (file | textbee | smsgate).
-    2. ``rehearsal.dry_run=true`` forces :class:`FileConnector` — nothing hits
-       the wire, every outbound is appended to ``settings.outbox_path``. The
-       LLM still runs normally so eval / logs remain useful.
-    3. ``rehearsal.override_to`` wraps the result in :class:`OverrideConnector`
-       so every outbound is redirected to that number. Composable with dry-run.
+    1. Base connector selected by ``connector.type``:
+       * ``file`` — write every outbound to ``settings.outbox_path``. Nothing
+         leaves the machine. This is the "dry-run" mode; pick it from the
+         connector picker when you want an LLM-only rehearsal.
+       * ``textbee`` / ``smsgate`` — the real SMS paths.
+    2. ``rehearsal.override_to`` wraps the result in :class:`OverrideConnector`
+       so every outbound is redirected to that single number. Use with a real
+       connector (SmsGate / TextBee) for a one-phone dress-rehearsal; use with
+       the file connector to also exercise the override rewrite logic.
     """
 
     infra = get_settings()
@@ -70,13 +73,8 @@ def build_connector(workspace_settings: dict[str, Any]) -> BaseConnector:
     rehearsal = (workspace_settings or {}).get("rehearsal") or {}
     ctype = str(connector_cfg.get("type") or "file").lower()
 
-    if rehearsal.get("dry_run"):
-        logger.warning(
-            "dry-run mode active: forcing FileConnector (configured=%s)",
-            ctype,
-        )
-        inner: BaseConnector = FileConnector(outbox_path=infra.outbox_path)
-    elif ctype == "file":
+    inner: BaseConnector
+    if ctype == "file":
         inner = FileConnector(outbox_path=infra.outbox_path)
     elif ctype == "textbee":
         tb = connector_cfg.get("textbee") or {}
@@ -136,8 +134,9 @@ def rebuild_connector(workspace_settings: dict[str, Any] | None = None) -> BaseC
     """Replace the cached connector with a fresh one.
 
     Called by PATCH /api/workspace/settings so connector changes (swapping
-    TextBee for SmsGate, flipping dry-run, rotating credentials) take effect
-    immediately without restarting the process.
+    TextBee for SmsGate, switching to the file connector for a local
+    rehearsal, rotating credentials) take effect immediately without
+    restarting the process.
     """
 
     global _connector

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
 
+from autosdr.connectors.base import SendResult
 from autosdr.connectors.file_connector import FileConnector
 from autosdr.models import (
     Campaign,
@@ -241,6 +243,13 @@ async def test_outreach_happy_path(prepared_campaign, fresh_db, monkeypatch):
         assert message.metadata_["eval_score"] >= 0.85
         assert message.metadata_["angle_used"] == thread.angle
 
+    records = [
+        json.loads(line)
+        for line in prepared_campaign["outbox_path"].read_text().splitlines()
+        if line.strip()
+    ]
+    assert [record["contact_uri"] for record in records] == ["+61400000001"]
+
 
 async def test_outreach_retries_then_passes(prepared_campaign, fresh_db, monkeypatch):
     """First draft fails eval; second passes. Ensure we don't send the first."""
@@ -344,6 +353,8 @@ async def test_outreach_escalates_after_max_attempts(
 
     with fresh_db() as session:
         thread = session.query(Thread).one()
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        assert cl.status == CampaignLeadStatus.PAUSED_FOR_HITL
         assert thread.status == ThreadStatus.PAUSED_FOR_HITL
         assert thread.hitl_reason == "eval_failed_after_max_attempts"
         assert len(thread.hitl_context["last_drafts"]) == 3
@@ -392,3 +403,290 @@ async def test_outreach_rejects_message_over_max_length(
 
     assert not result.sent
     assert result.reason == "eval_failed"
+
+
+async def test_outreach_skips_when_campaign_lead_already_claimed(
+    prepared_campaign, fresh_db
+):
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        cl.status = CampaignLeadStatus.SENDING
+        session.flush()
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert not result.sent
+    assert result.reason == "campaign_lead_not_queued:sending"
+    assert not prepared_campaign["outbox_path"].exists()
+
+
+async def test_outreach_marks_existing_outbound_contacted_without_resending(
+    prepared_campaign, fresh_db
+):
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        thread = Thread(
+            campaign_lead_id=cl.id,
+            connector_type="android_sms",
+            status=ThreadStatus.ACTIVE,
+            angle="x",
+            tone_snapshot="x",
+        )
+        session.add(thread)
+        session.flush()
+        session.add(
+            Message(
+                thread_id=thread.id,
+                role=MessageRole.AI,
+                content="previous outbound",
+                metadata_={},
+            )
+        )
+        session.flush()
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert not result.sent
+    assert result.reason == "existing_outbound_message"
+    assert not prepared_campaign["outbox_path"].exists()
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        assert cl.status == CampaignLeadStatus.CONTACTED
+        assert lead.status == LeadStatus.CONTACTED
+        assert session.query(Message).count() == 1
+
+
+async def test_outreach_does_not_claim_inactive_thread(prepared_campaign, fresh_db):
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        thread = Thread(
+            campaign_lead_id=cl.id,
+            connector_type="android_sms",
+            status=ThreadStatus.PAUSED_FOR_HITL,
+            angle="x",
+            tone_snapshot="x",
+        )
+        session.add(thread)
+        session.flush()
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert not result.sent
+    assert result.reason == "thread_not_active:paused_for_hitl"
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        assert cl.status == CampaignLeadStatus.PAUSED_FOR_HITL
+
+
+async def test_outreach_rejects_mismatched_campaign_lead_and_lead(
+    prepared_campaign, fresh_db
+):
+    with fresh_db() as session:
+        other = Lead(
+            workspace_id=prepared_campaign["workspace_id"],
+            name="Wrong Lead",
+            contact_uri="+61400000002",
+            contact_type="mobile",
+            category="Retail",
+            address="Brisbane",
+            raw_data={},
+            import_order=2,
+            source_file="test.csv",
+            status=LeadStatus.NEW,
+        )
+        session.add(other)
+        session.flush()
+        other_id = other.id
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, other_id),
+        )
+
+    assert not result.sent
+    assert result.reason == "lead_mismatch"
+    assert not prepared_campaign["outbox_path"].exists()
+
+
+async def test_outreach_requeues_claim_when_analysis_crashes_before_send(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    async def fake_run_analysis(**kwargs):
+        raise RuntimeError("analysis exploded")
+
+    monkeypatch.setattr("autosdr.pipeline.outreach._run_analysis", fake_run_analysis)
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with pytest.raises(RuntimeError, match="analysis exploded"):
+        with fresh_db() as session:
+            await run_outreach_for_campaign_lead(
+                session=session,
+                connector=connector,
+                workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+                campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+                campaign_lead=session.get(
+                    CampaignLead, prepared_campaign["campaign_lead_id"]
+                ),
+                lead=session.get(Lead, prepared_campaign["lead_id"]),
+            )
+
+    assert not prepared_campaign["outbox_path"].exists()
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        assert cl.status == CampaignLeadStatus.QUEUED
+        assert session.query(Message).count() == 0
+
+
+async def test_outreach_pauses_campaign_lead_when_connector_send_fails(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.3": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v6": "hey, quick chat?",
+            "evaluation-v4.2": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+
+    async def fake_send(message):
+        return SendResult(success=False, error="forced_failure")
+
+    monkeypatch.setattr(connector, "send", fake_send)
+
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert not result.sent
+    assert result.reason == "connector_failed:forced_failure"
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        thread = session.query(Thread).one()
+        assert cl.status == CampaignLeadStatus.PAUSED_FOR_HITL
+        assert thread.status == ThreadStatus.PAUSED_FOR_HITL
+        assert session.query(Message).count() == 0
+
+
+async def test_outreach_skips_if_contact_uri_changes_before_send(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.3": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v6": "unused",
+            "evaluation-v4.2": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+
+    async def fake_generate_and_evaluate(**kwargs):
+        with fresh_db() as session:
+            lead = session.get(Lead, prepared_campaign["lead_id"])
+            lead.contact_uri = "+61400009999"
+            session.flush()
+        return {
+            "status": "pass",
+            "draft": "hey, quick one?",
+            "attempts": 1,
+            "overall": 0.9,
+            "scores": {},
+            "feedback": "",
+        }
+
+    monkeypatch.setattr(
+        "autosdr.pipeline.outreach.generate_and_evaluate",
+        fake_generate_and_evaluate,
+    )
+
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert not result.sent
+    assert result.reason == "lead_contact_uri_changed_before_send"
+    assert not prepared_campaign["outbox_path"].exists()
+    with fresh_db() as session:
+        cl = session.get(CampaignLead, prepared_campaign["campaign_lead_id"])
+        assert cl.status == CampaignLeadStatus.QUEUED

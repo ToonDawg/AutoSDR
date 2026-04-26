@@ -5,8 +5,13 @@ the process-wide ``asyncio.Event`` that the scheduler awaits. One signal
 requests a graceful drain; a second signal forces an immediate exit.
 
 Layer 2 — Flag file. A file at ``pause_flag_path`` (checked every second by
-:func:`watch_flag_file`) pauses all processing. Webhooks still ack 202; the
-scheduler tick idles; LLM and connector hot paths raise :class:`KillSwitchTripped`.
+:func:`watch_flag_file`) pauses the *autopilot*. Webhooks still ack 202; the
+scheduler tick idles; LLM and autonomous connector hot paths raise
+:class:`KillSwitchTripped`. The pause flag is **not** meant to block explicit
+human-initiated actions (HITL send-draft, operator connectivity tests) — the
+pilot can still fly manually while autopilot is off. Those call sites open a
+:func:`allow_manual_send` context so the guard sees the pause as cleared for
+the duration of the action. Shutdown (layer 1) still aborts either way.
 
 Layer 3 — CLI wrappers in ``autosdr.cli`` (``pause`` / ``resume`` / ``stop``)
 that manipulate the flag file or send a signal to the PID recorded at startup.
@@ -15,9 +20,12 @@ that manipulate the flag file or send a signal to the PID recorded at startup.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import logging
 import os
 import signal
+from collections.abc import Iterator
 from pathlib import Path
 
 from autosdr.config import get_settings
@@ -35,6 +43,16 @@ class KillSwitchTripped(RuntimeError):
 _shutdown_event: asyncio.Event | None = None
 _signals_installed = False
 _hard_stop = False
+
+# Per-task opt-out for the *pause* check only. Explicit human-initiated
+# actions set this True via :func:`allow_manual_send` so ``is_paused()``
+# ignores the flag file while the hard-stop (SIGTERM / lifespan shutdown)
+# still wins. Using a ``ContextVar`` means each asyncio task — each FastAPI
+# request handler — gets its own copy and we don't have to thread a keyword
+# argument through every connector implementation.
+_bypass_pause_flag: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "autosdr.killswitch.bypass_pause_flag", default=False
+)
 
 
 def _get_or_create_event() -> asyncio.Event:
@@ -112,9 +130,18 @@ def mark_shutting_down() -> None:
 
 
 def is_paused() -> bool:
-    """Combined check: shutting down OR pause flag present."""
+    """Combined check: shutting down OR (pause flag present AND not bypassed).
 
-    return _hard_stop or is_flag_set()
+    Hard-stop always wins. The user-requested pause flag can be suspended per
+    task via :func:`allow_manual_send` so HITL sends and operator tests don't
+    get swallowed by the autopilot kill switch.
+    """
+
+    if _hard_stop:
+        return True
+    if _bypass_pause_flag.get():
+        return False
+    return is_flag_set()
 
 
 def raise_if_paused() -> None:
@@ -122,6 +149,29 @@ def raise_if_paused() -> None:
 
     if is_paused():
         raise KillSwitchTripped()
+
+
+@contextlib.contextmanager
+def allow_manual_send() -> Iterator[None]:
+    """Locally treat the pause flag as cleared for explicit human actions.
+
+    Wrap a deliberate, user-initiated connector call (``send-draft`` from the
+    HITL UI, a connectivity test from Settings) in this context so the
+    downstream ``raise_if_paused()`` guards don't fire. Shutdown (SIGINT /
+    SIGTERM / lifespan finalisation) still aborts — this *only* suppresses
+    the user-requested pause flag, not the hard stop.
+
+    The bypass is scoped to the current ``asyncio`` task via a
+    :class:`~contextvars.ContextVar`, so it never leaks into the scheduler,
+    the inbound poller, the auto-reply path, or the follow-up beat running
+    concurrently on other tasks.
+    """
+
+    token = _bypass_pause_flag.set(True)
+    try:
+        yield
+    finally:
+        _bypass_pause_flag.reset(token)
 
 
 async def await_shutdown_or_timeout(seconds: float) -> bool:
@@ -218,3 +268,10 @@ def reset_for_tests() -> None:
     _shutdown_event = None
     _signals_installed = False
     _hard_stop = False
+    # ContextVar is per-task; still reset the default-bound view so a test
+    # that forgot to exit its ``allow_manual_send()`` doesn't bleed into
+    # the next case.
+    try:
+        _bypass_pause_flag.set(False)
+    except LookupError:  # pragma: no cover - no current context
+        pass

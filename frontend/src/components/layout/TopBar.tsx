@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { FlaskConical, Moon, RadioTower, Sun } from 'lucide-react';
+import { Moon, RadioTower, Sun } from 'lucide-react';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { useTheme } from '@/lib/useTheme';
@@ -9,13 +9,12 @@ import { KillSwitch } from './KillSwitch';
  * Top status bar. Four things live here:
  *
  * - Running / Paused indicator (mirrors the kill-switch state).
- * - Active connector + mode chips (dry-run, override).
+ * - Active connector (plus an override chip when rehearsal redirect is on).
  * - Theme toggle.
  * - The kill-switch button itself.
  *
- * Previously this also showed PID + dollar-cost estimates — dropped
- * because neither is actually available from the status endpoint and
- * neither earns its space on the bar.
+ * "Dry-run" isn't its own chip any more — it was redundant with picking the
+ * file connector, which already visibly renders as ``file`` on this bar.
  */
 export function TopBar() {
   const { data: status } = useQuery({
@@ -48,12 +47,6 @@ export function TopBar() {
           <span className="capitalize">{status?.active_connector ?? 'file'}</span>
         </div>
 
-        {status?.dry_run && (
-          <span className="inline-flex items-center gap-1.5 px-2 h-6 border border-mustard bg-mustard-soft text-mustard text-[10px] uppercase tracking-wide">
-            <FlaskConical className="h-3 w-3" strokeWidth={1.5} />
-            Dry-run
-          </span>
-        )}
         {status?.override_to && (
           <span className="inline-flex items-center gap-1.5 px-2 h-6 border border-teal bg-teal-soft text-teal text-[10px] uppercase tracking-wide">
             Override → {status.override_to}

@@ -1,7 +1,7 @@
 """Infrastructure-only settings.
 
 AutoSDR's behaviour-affecting configuration — LLM keys, connector choice,
-thresholds, dry-run, override, scheduler knobs — lives in
+thresholds, override recipient, scheduler knobs — lives in
 ``workspace.settings`` (a JSON blob on the workspace row). That is the
 single source of truth at runtime and is mutated via the REST API.
 
@@ -105,9 +105,10 @@ DEFAULT_WORKSPACE_SETTINGS: dict = {
         },
     },
 
-    # Rehearsal modes
+    # Rehearsal: redirect every real-connector send to a single phone you own.
+    # Pair with connector.type=file when you just want to write to the outbox
+    # without sending anything at all.
     "rehearsal": {
-        "dry_run": False,
         "override_to": None,
     },
 }

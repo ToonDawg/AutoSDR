@@ -21,8 +21,9 @@ of truth — so toggling a value in the UI takes effect on the next tick.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from autosdr import killswitch
@@ -41,6 +42,15 @@ from autosdr.quota import count_ai_messages_last_24h
 from autosdr.workspace_settings import load_workspace_settings_or_empty
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class OutreachBatchSummary:
+    requested: int
+    attempted: int = 0
+    sent: int = 0
+    failed: int = 0
+    capped_by_quota: bool = False
 
 
 def _next_queued_leads(
@@ -67,6 +77,102 @@ def _next_queued_leads(
     return list(session.execute(stmt).all())
 
 
+def _count_queued_leads(session: Session, campaign_id: str) -> int:
+    """Return queued assignments that are still eligible to receive outreach."""
+
+    return int(
+        session.execute(
+            select(func.count(CampaignLead.id))
+            .join(Lead, Lead.id == CampaignLead.lead_id)
+            .where(
+                and_(
+                    CampaignLead.campaign_id == campaign_id,
+                    CampaignLead.status == CampaignLeadStatus.QUEUED,
+                    Lead.status.in_(["new", "contacted"]),
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def run_campaign_outreach_batch(
+    *,
+    session: Session,
+    connector: BaseConnector,
+    workspace: Workspace,
+    campaign: Campaign,
+    max_count: int,
+    respect_quota: bool,
+    min_delay_s: int = 0,
+    prior_success_count: int = 0,
+) -> OutreachBatchSummary:
+    """Send up to ``max_count`` queued leads for one campaign.
+
+    The scheduler uses ``respect_quota=True``; manual operator kick-offs use
+    ``False`` so they can intentionally spend beyond the rolling cap.
+    """
+
+    requested = max(0, int(max_count))
+    summary = OutreachBatchSummary(requested=requested)
+    if requested <= 0:
+        return summary
+
+    batch_limit = requested
+    if respect_quota:
+        sent_last_24h = count_ai_messages_last_24h(session, campaign.id)
+        remaining = max(0, campaign.outreach_per_day - sent_last_24h)
+        batch_limit = min(batch_limit, remaining)
+        summary.capped_by_quota = batch_limit < requested
+        if batch_limit == 0:
+            logger.debug(
+                "campaign %s at daily cap (%d sent in last 24h)",
+                campaign.name,
+                sent_last_24h,
+            )
+            return summary
+
+    candidates = _next_queued_leads(session, campaign.id, batch_limit)
+    for campaign_lead, lead in candidates:
+        if killswitch.is_paused():
+            raise killswitch.KillSwitchTripped()
+
+        if min_delay_s > 0 and prior_success_count + summary.sent > 0:
+            fired = await killswitch.await_shutdown_or_timeout(min_delay_s)
+            if fired:
+                raise killswitch.KillSwitchTripped()
+
+        summary.attempted += 1
+        try:
+            result = await run_outreach_for_campaign_lead(
+                session=session,
+                connector=connector,
+                workspace=workspace,
+                campaign=campaign,
+                campaign_lead=campaign_lead,
+                lead=lead,
+            )
+        except killswitch.KillSwitchTripped:
+            raise
+        except Exception:
+            logger.exception(
+                "outreach pipeline crashed for campaign_lead=%s", campaign_lead.id
+            )
+            summary.failed += 1
+            continue
+
+        if result.sent:
+            summary.sent += 1
+        else:
+            summary.failed += 1
+            logger.warning(
+                "outreach skipped: campaign_lead=%s reason=%s",
+                campaign_lead.id,
+                result.reason,
+            )
+
+    return summary
+
+
 async def _run_campaign_tick(connector: BaseConnector) -> dict[str, int]:
     """One pass across all active campaigns; returns a send summary."""
 
@@ -90,66 +196,27 @@ async def _run_campaign_tick(connector: BaseConnector) -> dict[str, int]:
         )
         summary["campaigns"] = len(campaigns)
 
-        sends_this_tick = 0
-
         for campaign in campaigns:
             if killswitch.is_paused():
                 break
 
-            sent_last_24h = count_ai_messages_last_24h(session, campaign.id)
-            remaining = max(0, campaign.outreach_per_day - sent_last_24h)
-            batch_limit = min(remaining, max_batch)
-
-            if batch_limit == 0:
-                logger.debug(
-                    "campaign %s at daily cap (%d sent in last 24h)",
-                    campaign.name,
-                    sent_last_24h,
+            try:
+                batch = await run_campaign_outreach_batch(
+                    session=session,
+                    connector=connector,
+                    workspace=workspace,
+                    campaign=campaign,
+                    max_count=max_batch,
+                    respect_quota=True,
+                    min_delay_s=min_delay_s,
+                    prior_success_count=summary["sent"],
                 )
-                continue
+            except killswitch.KillSwitchTripped:
+                logger.info("kill switch tripped mid-outreach; stopping tick")
+                break
 
-            candidates = _next_queued_leads(session, campaign.id, batch_limit)
-            if not candidates:
-                continue
-
-            for campaign_lead, lead in candidates:
-                if killswitch.is_paused():
-                    break
-
-                if sends_this_tick > 0:
-                    fired = await killswitch.await_shutdown_or_timeout(min_delay_s)
-                    if fired:
-                        break
-
-                try:
-                    result = await run_outreach_for_campaign_lead(
-                        session=session,
-                        connector=connector,
-                        workspace=workspace,
-                        campaign=campaign,
-                        campaign_lead=campaign_lead,
-                        lead=lead,
-                    )
-                except killswitch.KillSwitchTripped:
-                    logger.info("kill switch tripped mid-outreach; stopping tick")
-                    break
-                except Exception:
-                    logger.exception(
-                        "outreach pipeline crashed for campaign_lead=%s", campaign_lead.id
-                    )
-                    summary["failed"] += 1
-                    continue
-
-                if result.sent:
-                    summary["sent"] += 1
-                    sends_this_tick += 1
-                else:
-                    summary["failed"] += 1
-                    logger.warning(
-                        "outreach skipped: campaign_lead=%s reason=%s",
-                        campaign_lead.id,
-                        result.reason,
-                    )
+            summary["sent"] += batch.sent
+            summary["failed"] += batch.failed
 
         if summary["sent"] == 0 and summary["failed"] == 0:
             summary["idle"] += 1

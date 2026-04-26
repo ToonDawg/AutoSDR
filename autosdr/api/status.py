@@ -40,7 +40,6 @@ def get_status() -> SystemStatusOut:
         campaigns_out: list[CampaignQuota] = []
 
         active_connector = "file"
-        dry_run = False
         override_to = None
         auto_reply_enabled = False
 
@@ -48,13 +47,12 @@ def get_status() -> SystemStatusOut:
             rehearsal = settings_blob.get("rehearsal") or {}
             connector_cfg = settings_blob.get("connector") or {}
             active_connector = str(connector_cfg.get("type") or "file")
-            dry_run = bool(rehearsal.get("dry_run", False))
             override_to = rehearsal.get("override_to") or None
             auto_reply_enabled = bool(settings_blob.get("auto_reply_enabled", False))
 
             # If we can cheaply surface the *actually-running* connector type
-            # (which may differ from the configured one while dry_run is on),
-            # prefer that for the badge.
+            # (override-wrapped connectors advertise themselves as e.g.
+            # "smsgate+override"), prefer that for the badge.
             try:
                 connector = get_connector()
                 active_connector = getattr(connector, "connector_type", active_connector)
@@ -96,7 +94,6 @@ def get_status() -> SystemStatusOut:
         paused=paused,
         started_at=None,
         active_connector=active_connector,
-        dry_run=dry_run,
         override_to=override_to,
         auto_reply_enabled=auto_reply_enabled,
         setup_required=setup_required,

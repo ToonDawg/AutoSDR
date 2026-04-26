@@ -17,7 +17,7 @@ from autosdr.models import (
     ThreadStatus,
 )
 from autosdr.quota import count_ai_messages_last_24h
-from autosdr.scheduler import _next_queued_leads
+from autosdr.scheduler import _next_queued_leads, run_campaign_outreach_batch
 
 
 def _build_fixture(session, ws_id: str, num_leads: int) -> str:
@@ -95,6 +95,37 @@ def test_count_ai_messages_last_24h_excludes_old_messages(fresh_db, workspace_fa
         assert count == 1
 
 
+def test_count_ai_messages_last_24h_respects_campaign_reset(fresh_db, workspace_factory):
+    ws_id = workspace_factory()
+    with fresh_db() as session:
+        cid = _build_fixture(session, ws_id, 1)
+        campaign = session.get(Campaign, cid)
+        cl = session.query(CampaignLead).first()
+        thread = Thread(
+            campaign_lead_id=cl.id, connector_type="android_sms",
+            status=ThreadStatus.ACTIVE, angle="x", tone_snapshot="x",
+        )
+        session.add(thread)
+        session.flush()
+
+        before_reset = Message(
+            thread_id=thread.id, role=MessageRole.AI, content="before", metadata_={},
+        )
+        session.add(before_reset)
+        session.flush()
+
+        campaign.quota_reset_at = datetime.now(tz=timezone.utc)
+        session.flush()
+
+        after_reset = Message(
+            thread_id=thread.id, role=MessageRole.AI, content="after", metadata_={},
+        )
+        session.add(after_reset)
+        session.flush()
+
+        assert count_ai_messages_last_24h(session, cid) == 1
+
+
 def test_next_queued_leads_orders_by_queue_position(fresh_db, workspace_factory):
     ws_id = workspace_factory()
     with fresh_db() as session:
@@ -112,3 +143,64 @@ def test_next_queued_leads_zero_limit_returns_empty(fresh_db, workspace_factory)
         cid = _build_fixture(session, ws_id, 5)
         assert _next_queued_leads(session, cid, limit=0) == []
         assert _next_queued_leads(session, cid, limit=-1) == []
+
+
+def test_next_queued_leads_excludes_claimed_sending_rows(fresh_db, workspace_factory):
+    ws_id = workspace_factory()
+    with fresh_db() as session:
+        cid = _build_fixture(session, ws_id, 3)
+        first = (
+            session.query(CampaignLead)
+            .filter(CampaignLead.campaign_id == cid)
+            .order_by(CampaignLead.queue_position.asc())
+            .first()
+        )
+        first.status = CampaignLeadStatus.SENDING
+        session.flush()
+
+        got = _next_queued_leads(session, cid, limit=3)
+
+    assert [cl.queue_position for cl, _lead in got] == [2, 3]
+
+
+async def test_run_campaign_outreach_batch_stops_at_quota(
+    fresh_db, workspace_factory
+):
+    ws_id = workspace_factory()
+    with fresh_db() as session:
+        cid = _build_fixture(session, ws_id, 2)
+        campaign = session.get(Campaign, cid)
+        campaign.outreach_per_day = 1
+        cl = session.query(CampaignLead).first()
+        thread = Thread(
+            campaign_lead_id=cl.id,
+            connector_type="android_sms",
+            status=ThreadStatus.ACTIVE,
+            angle="x",
+            tone_snapshot="x",
+        )
+        session.add(thread)
+        session.flush()
+        session.add(
+            Message(
+                thread_id=thread.id,
+                role=MessageRole.AI,
+                content="already sent",
+                metadata_={},
+            )
+        )
+        session.flush()
+
+        summary = await run_campaign_outreach_batch(
+            session=session,
+            connector=object(),
+            workspace=None,
+            campaign=campaign,
+            max_count=2,
+            respect_quota=True,
+        )
+
+    assert summary.requested == 2
+    assert summary.attempted == 0
+    assert summary.sent == 0
+    assert summary.capped_by_quota is True

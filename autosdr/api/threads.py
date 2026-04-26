@@ -17,10 +17,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from autosdr import killswitch
 from autosdr.api.deps import db_session, require_workspace
 from autosdr.api.schemas import (
     CloseThreadRequest,
@@ -42,6 +43,7 @@ from autosdr.models import (
     Thread,
     ThreadStatus,
 )
+from autosdr.pipeline.followup import schedule_followup_send
 from autosdr.pipeline.reply import HITL_AWAITING_HUMAN_REPLY
 from autosdr.pipeline.suggestions import generate_reply_variants
 
@@ -77,6 +79,7 @@ def _build_thread_out(
         tone_snapshot=thread.tone_snapshot,
         hitl_reason=thread.hitl_reason,
         hitl_context=thread.hitl_context,
+        hitl_dismissed_at=thread.hitl_dismissed_at,
         last_message_at=last_message_at or thread.created_at,
         created_at=thread.created_at,
     )
@@ -97,20 +100,33 @@ def _thread_to_out(session: Session, thread: Thread) -> ThreadOut:
 def list_threads(
     status_filter: str | None = None,
     campaign_id: str | None = None,
+    lead_id: str | None = None,
+    dismissed: bool | None = None,
     limit: int = 200,
+    offset: int = 0,
 ) -> list[ThreadOut]:
     limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
     with db_session() as session:
         require_workspace(session)
-        stmt = select(Thread).limit(limit)
+        stmt = select(Thread)
         if status_filter:
             stmt = stmt.where(Thread.status == status_filter)
-        if campaign_id:
+        if dismissed is True:
+            stmt = stmt.where(Thread.hitl_dismissed_at.is_not(None))
+        elif dismissed is False:
+            stmt = stmt.where(Thread.hitl_dismissed_at.is_(None))
+        if campaign_id or lead_id:
+            filters = []
+            if campaign_id:
+                filters.append(CampaignLead.campaign_id == campaign_id)
+            if lead_id:
+                filters.append(CampaignLead.lead_id == lead_id)
             stmt = (
                 stmt.join(CampaignLead, CampaignLead.id == Thread.campaign_lead_id)
-                .where(CampaignLead.campaign_id == campaign_id)
+                .where(*filters)
             )
-        stmt = stmt.order_by(Thread.updated_at.desc())
+        stmt = stmt.order_by(Thread.updated_at.desc()).offset(offset).limit(limit)
         rows = list(session.execute(stmt).scalars())
         if not rows:
             return []
@@ -165,6 +181,30 @@ def list_threads(
             lead = leads.get(cl.lead_id) if cl else None
             out.append(_build_thread_out(t, campaign, lead, last_at.get(t.id)))
         return out
+
+
+@router.get("/hitl/count")
+def hitl_count() -> dict[str, int]:
+    """Cheap counter for the sidebar/dashboard badges.
+
+    Replaces the older pattern of pulling the full HITL list just to read
+    ``len(...)``: at scale that fan-outs into a JSON payload of every paused
+    thread on every refresh tick, which we don't want.
+    """
+
+    with db_session() as session:
+        require_workspace(session)
+        active = session.execute(
+            select(func.count(Thread.id))
+            .where(Thread.status == ThreadStatus.PAUSED_FOR_HITL)
+            .where(Thread.hitl_dismissed_at.is_(None))
+        ).scalar_one()
+        dismissed = session.execute(
+            select(func.count(Thread.id))
+            .where(Thread.status == ThreadStatus.PAUSED_FOR_HITL)
+            .where(Thread.hitl_dismissed_at.is_not(None))
+        ).scalar_one()
+        return {"active": int(active), "dismissed": int(dismissed)}
 
 
 def _load_thread(session: Session, thread_id: str) -> Thread:
@@ -233,6 +273,9 @@ async def regenerate_suggestions(thread_id: str) -> ThreadOut:
         if thread.status == ThreadStatus.ACTIVE:
             thread.status = ThreadStatus.PAUSED_FOR_HITL
             thread.hitl_reason = HITL_AWAITING_HUMAN_REPLY
+        # Fresh suggestions = a new reason for the human to look. Re-surface
+        # the thread if it was previously dismissed.
+        thread.hitl_dismissed_at = None
         session.flush()
         session.refresh(thread)
         return _thread_to_out(session, thread)
@@ -261,18 +304,98 @@ async def send_draft(thread_id: str, payload: SendDraftRequest) -> MessageOut:
             raise HTTPException(
                 status_code=400, detail={"error": "thread_has_no_campaign_lead"}
             )
+        campaign = session.get(Campaign, campaign_lead.campaign_id)
         lead = session.get(Lead, campaign_lead.lead_id)
         if lead is None or not lead.contact_uri:
             raise HTTPException(
                 status_code=400, detail={"error": "lead_missing_contact_uri"}
             )
 
+        # Detect "this is the first outbound on the thread" — drives
+        # whether the follow-up beat fires. Operator-driven sends after
+        # a reply shouldn't schedule follow-ups; the beat only exists
+        # to add texture to the cold open.
+        prior_message_count = session.execute(
+            select(func.count(Message.id)).where(Message.thread_id == thread.id)
+        ).scalar_one()
+        is_first_outbound = int(prior_message_count) == 0
+        first_outbound_claimed = False
+        first_outbound_contact_uri = (lead.contact_uri or "").strip()
+
+        if is_first_outbound:
+            if campaign_lead.status == CampaignLeadStatus.SENDING:
+                raise HTTPException(
+                    status_code=409, detail={"error": "send_in_progress"}
+                )
+            result = session.execute(
+                update(CampaignLead)
+                .where(
+                    CampaignLead.id == campaign_lead.id,
+                    CampaignLead.status.in_(
+                        [
+                            CampaignLeadStatus.QUEUED,
+                            CampaignLeadStatus.PAUSED_FOR_HITL,
+                        ]
+                    ),
+                )
+                .values(status=CampaignLeadStatus.SENDING)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "first_outbound_not_sendable"},
+                )
+            session.commit()
+            first_outbound_claimed = True
+            session.refresh(thread)
+            session.refresh(campaign_lead)
+            session.refresh(lead)
+            current_contact_uri = (lead.contact_uri or "").strip()
+            if not current_contact_uri or current_contact_uri != first_outbound_contact_uri:
+                campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
+                session.commit()
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "lead_contact_uri_changed"},
+                )
+
         # Hold the DB session open across the send so the message row is
         # atomically persisted with the thread/state change.
-        send_result = await connector.send(
-            OutgoingMessage(contact_uri=lead.contact_uri, content=draft)
-        )
+        #
+        # ``send-draft`` is the HITL approve-and-send path — an explicit human
+        # action. The pause flag is meant to stop the *autopilot*, not block
+        # the pilot, so we open a ``allow_manual_send`` context that lets the
+        # connector bypass the pause guard. Hard-stop (SIGTERM / lifespan
+        # shutdown) still aborts; that surfaces as a clear 409.
+        try:
+            with killswitch.allow_manual_send():
+                send_result = await connector.send(
+                    OutgoingMessage(contact_uri=lead.contact_uri, content=draft)
+                )
+        except killswitch.KillSwitchTripped as exc:
+            if first_outbound_claimed:
+                campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
+                session.commit()
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "system_shutting_down"},
+            ) from exc
+        except Exception as exc:
+            if first_outbound_claimed:
+                campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
+                session.commit()
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "connector_send_failed",
+                    "reason": f"connector_exception:{exc}",
+                },
+            ) from exc
         if not send_result.success:
+            if first_outbound_claimed:
+                campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
+                session.commit()
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -307,14 +430,38 @@ async def send_draft(thread_id: str, payload: SendDraftRequest) -> MessageOut:
         thread.auto_reply_count += 1
 
         # Propagate CRM statuses so Leads / Campaigns counters move.
-        if campaign_lead.status == CampaignLeadStatus.QUEUED:
+        if campaign_lead.status in {
+            CampaignLeadStatus.QUEUED,
+            CampaignLeadStatus.SENDING,
+            CampaignLeadStatus.PAUSED_FOR_HITL,
+        }:
             campaign_lead.status = CampaignLeadStatus.CONTACTED
         if lead.status == LeadStatus.NEW:
             lead.status = LeadStatus.CONTACTED
 
         session.flush()
         session.refresh(message)
-        return MessageOut.model_validate(message)
+        message_out = MessageOut.model_validate(message)
+        parent_message_id = message.id
+        campaign_followup = campaign.followup if campaign is not None else None
+        contact_uri = lead.contact_uri
+        lead_name = lead.name
+
+    # Outside the session — the DB write is committed by ``db_session``.
+    # Only schedule a follow-up on the *first* outbound of the thread:
+    # manual replies after the lead has already responded shouldn't get
+    # the "one more thing" beat piled on top.
+    if is_first_outbound:
+        schedule_followup_send(
+            campaign_followup=campaign_followup,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            contact_uri=contact_uri,
+            lead_name=lead_name,
+            connector=connector,
+        )
+
+    return message_out
 
 
 @router.post("/{thread_id}/take-over", response_model=ThreadOut)
@@ -331,6 +478,7 @@ def take_over(thread_id: str, payload: TakeOverRequest) -> ThreadOut:
             ctx["note"] = payload.note
         thread.hitl_context = ctx
         flag_modified(thread, "hitl_context")
+        thread.hitl_dismissed_at = None
         session.flush()
         session.refresh(thread)
         return _thread_to_out(session, thread)
@@ -357,6 +505,43 @@ def close_thread(thread_id: str, payload: CloseThreadRequest) -> ThreadOut:
             if lead:
                 lead.status = LeadStatus.LOST
 
+        session.flush()
+        session.refresh(thread)
+        return _thread_to_out(session, thread)
+
+
+@router.post("/{thread_id}/dismiss", response_model=ThreadOut)
+def dismiss_thread(thread_id: str) -> ThreadOut:
+    """Acknowledge a HITL thread without changing its outcome.
+
+    The thread stays ``paused_for_hitl`` — the operator just doesn't want it
+    nagging them in the inbox right now. A *new* HITL event (lead replies,
+    eval fails again, take-over, regenerate) will clear the flag and the
+    thread re-surfaces. See ``pause_thread_for_hitl``.
+    """
+
+    with db_session() as session:
+        require_workspace(session)
+        thread = _load_thread(session, thread_id)
+        if thread.status != ThreadStatus.PAUSED_FOR_HITL:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "thread_not_in_hitl_state"},
+            )
+        thread.hitl_dismissed_at = datetime.now(tz=timezone.utc)
+        session.flush()
+        session.refresh(thread)
+        return _thread_to_out(session, thread)
+
+
+@router.post("/{thread_id}/restore", response_model=ThreadOut)
+def restore_thread(thread_id: str) -> ThreadOut:
+    """Undo a previous dismiss — pull the thread back onto the inbox."""
+
+    with db_session() as session:
+        require_workspace(session)
+        thread = _load_thread(session, thread_id)
+        thread.hitl_dismissed_at = None
         session.flush()
         session.refresh(thread)
         return _thread_to_out(session, thread)

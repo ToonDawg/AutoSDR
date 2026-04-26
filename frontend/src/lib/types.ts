@@ -153,7 +153,6 @@ export interface WorkspaceSettings {
   };
 
   rehearsal: {
-    dry_run: boolean;
     override_to: string | null;
   };
 
@@ -189,6 +188,39 @@ export interface Lead {
   created_at: ISODate;
 }
 
+/**
+ * Paginated response for ``GET /api/leads``. ``counts_by_status`` always
+ * reflects the search-filtered set (status filter excluded) so filter
+ * tabs can render accurate tallies without a round-trip per tab.
+ */
+export interface LeadList {
+  leads: Lead[];
+  total: number;
+  limit: number;
+  offset: number;
+  counts_by_status: Record<string, number>;
+}
+
+/**
+ * Per-campaign follow-up beat. When ``enabled``, a literal-template
+ * second message is fired ``delay_s ± delay_jitter_s`` seconds after the
+ * first outbound on any thread in the campaign. The backend skips the
+ * send if the lead replies or the thread is closed in the interim.
+ *
+ * ``template`` supports a small set of placeholders — ``{name}``,
+ * ``{short_name}``, ``{owner_first_name}`` — rendered from the same
+ * analysis output as the first message. Unknown tokens render literally
+ * so the operator can spot typos in their own drafts.
+ *
+ * Mirrors ``autosdr/api/schemas.py::FollowupConfig``.
+ */
+export interface FollowupConfig {
+  enabled: boolean;
+  template: string;
+  delay_s: number;
+  delay_jitter_s: number;
+}
+
 export interface Campaign {
   id: UUID;
   name: string;
@@ -196,12 +228,23 @@ export interface Campaign {
   outreach_per_day: number;
   connector_type: string;
   status: CampaignStatusT;
+  followup: FollowupConfig;
+  quota_reset_at: ISODate | null;
   created_at: ISODate;
   lead_count: number;
   contacted_count: number;
   replied_count: number;
   won_count: number;
   sent_24h: number;
+}
+
+export interface CampaignKickoffResult {
+  requested: number;
+  attempted: number;
+  sent: number;
+  failed: number;
+  remaining_queued: number;
+  campaign: Campaign;
 }
 
 /**
@@ -285,6 +328,7 @@ export interface Thread {
   tone_snapshot: string | null;
   hitl_reason: HitlReasonT | string | null;
   hitl_context: HitlContext | null;
+  hitl_dismissed_at: ISODate | null;
   last_message_at: ISODate | null;
   created_at: ISODate;
 }
@@ -305,7 +349,14 @@ export interface Message {
     provider_message_id?: string;
     intent?: ReplyIntentT;
     confidence?: number;
-    source?: 'ai_suggested' | 'manual' | 'auto_reply';
+    // ``followup`` is the delayed second beat set by
+    // ``autosdr/pipeline/followup.py`` — no LLM, static template, parent
+    // points back at the first outbound so the transcript can group
+    // the pair visually.
+    source?: 'ai_suggested' | 'manual' | 'auto_reply' | 'followup';
+    parent_message_id?: string;
+    scheduled_delay_s?: number;
+    sent_at?: string;
     human_sent_at?: string;
     [key: string]: unknown;
   };
@@ -339,7 +390,6 @@ export interface SystemStatus {
   paused: boolean;
   started_at: ISODate | null;
   active_connector: ConnectorType | string;
-  dry_run: boolean;
   override_to: string | null;
   auto_reply_enabled: boolean;
   setup_required: boolean;
@@ -417,4 +467,31 @@ export interface SetupPayload {
 export interface SendsByDay {
   date: string;
   count: number;
+}
+
+/**
+ * Result of ``POST /api/workspace/connector/test``. The backend always
+ * returns 200 and encodes failures as ``ok=false`` with a human-readable
+ * ``detail`` (missing creds, network error, server 4xx, …) so the UI can
+ * render the outcome inline instead of treating every failure as an
+ * unhandled exception.
+ */
+export interface ConnectorTestResult {
+  ok: boolean;
+  detail: string;
+  connector_type: string;
+}
+
+export interface ConnectorTestRequest {
+  type?: ConnectorType;
+  textbee?: {
+    api_url?: string;
+    api_key?: string | null;
+    device_id?: string | null;
+  };
+  smsgate?: {
+    api_url?: string | null;
+    username?: string | null;
+    password?: string | null;
+  };
 }

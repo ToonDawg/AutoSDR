@@ -65,11 +65,17 @@ def pause_thread_for_hitl(
     Persistence is the caller's responsibility (``session.flush()`` or a
     commit at the end of the session scope) — hiding it here would make
     the write boundary harder to spot at call sites.
+
+    Clearing ``hitl_dismissed_at`` here is what makes the dashboard "dismiss"
+    behave like "ack the current event": a previously-dismissed thread that
+    earns a *new* HITL reason (e.g. dismissed connector error → lead actually
+    replies) re-surfaces on the inbox automatically.
     """
 
     thread.status = ThreadStatus.PAUSED_FOR_HITL
     thread.hitl_reason = reason
     thread.hitl_context = context
+    thread.hitl_dismissed_at = None
 
 
 def hitl_context_from_loop_failure(

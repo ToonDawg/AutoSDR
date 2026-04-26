@@ -17,8 +17,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
-from sqlalchemy import select
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from sqlalchemy import func, or_, select
 
 from autosdr.api.deps import db_session, require_workspace
 from autosdr.api.schemas import (
@@ -26,6 +26,7 @@ from autosdr.api.schemas import (
     ImportPreviewOut,
     ImportPreviewRow,
     ImportPreviewSkipReason,
+    LeadListOut,
     LeadOut,
 )
 from autosdr.importer import import_file, preview_import_file
@@ -34,24 +35,76 @@ from autosdr.models import Lead
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
 
-@router.get("", response_model=list[LeadOut])
+@router.get("", response_model=LeadListOut)
 def list_leads(
     status_filter: str | None = None,
-    limit: int = 500,
-) -> list[LeadOut]:
-    limit = max(1, min(int(limit), 5000))
+    q: str | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> LeadListOut:
+    """Paginated lead listing for the Leads page.
+
+    A single regional scrape can produce tens of thousands of rows, so
+    the server owns pagination, search, and per-status counts — the UI
+    only knows what's currently on screen. ``counts_by_status`` always
+    reflects the *filtered* set (i.e. search is applied, status filter
+    is not), so the filter tabs stay accurate as the operator searches.
+    """
+
     with db_session() as session:
         workspace = require_workspace(session)
-        stmt = (
-            select(Lead)
-            .where(Lead.workspace_id == workspace.id)
-            .order_by(Lead.import_order.asc())
-            .limit(limit)
+
+        base = select(Lead).where(Lead.workspace_id == workspace.id)
+        if q:
+            needle = f"%{q.strip().lower()}%"
+            base = base.where(
+                or_(
+                    func.lower(Lead.name).like(needle),
+                    func.lower(Lead.category).like(needle),
+                    func.lower(Lead.contact_uri).like(needle),
+                    func.lower(Lead.address).like(needle),
+                )
+            )
+
+        counts_stmt = select(Lead.status, func.count(Lead.id)).where(
+            Lead.workspace_id == workspace.id
         )
-        if status_filter:
-            stmt = stmt.where(Lead.status == status_filter)
-        rows = list(session.execute(stmt).scalars())
-        return [LeadOut.model_validate(r, from_attributes=True) for r in rows]
+        if q:
+            needle = f"%{q.strip().lower()}%"
+            counts_stmt = counts_stmt.where(
+                or_(
+                    func.lower(Lead.name).like(needle),
+                    func.lower(Lead.category).like(needle),
+                    func.lower(Lead.contact_uri).like(needle),
+                    func.lower(Lead.address).like(needle),
+                )
+            )
+        counts_rows = list(session.execute(counts_stmt.group_by(Lead.status)))
+        counts_by_status: dict[str, int] = {s: int(n) for s, n in counts_rows}
+        counts_by_status["all"] = sum(counts_by_status.values())
+
+        page = base
+        if status_filter and status_filter != "all":
+            page = page.where(Lead.status == status_filter)
+
+        total = int(
+            session.execute(
+                select(func.count()).select_from(page.subquery())
+            ).scalar_one()
+        )
+
+        rows = list(
+            session.execute(
+                page.order_by(Lead.import_order.asc()).limit(limit).offset(offset)
+            ).scalars()
+        )
+        return LeadListOut(
+            leads=[LeadOut.model_validate(r, from_attributes=True) for r in rows],
+            total=total,
+            limit=limit,
+            offset=offset,
+            counts_by_status=counts_by_status,
+        )
 
 
 def _save_upload(upload: UploadFile) -> Path:
@@ -149,6 +202,25 @@ async def commit_import(file: UploadFile = File(...)) -> ImportCommitOut:
             path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+# Defined after the import routes so ``/api/leads/import/preview`` and
+# ``/api/leads/import/commit`` take priority over the ``/{lead_id}`` match.
+@router.get("/{lead_id}", response_model=LeadOut)
+def get_lead(lead_id: str) -> LeadOut:
+    with db_session() as session:
+        workspace = require_workspace(session)
+        lead = session.execute(
+            select(Lead).where(
+                Lead.workspace_id == workspace.id, Lead.id == lead_id
+            )
+        ).scalar_one_or_none()
+        if lead is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "lead_not_found", "lead_id": lead_id},
+            )
+        return LeadOut.model_validate(lead, from_attributes=True)
 
 
 __all__ = ["router"]

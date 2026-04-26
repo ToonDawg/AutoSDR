@@ -63,3 +63,60 @@ async def test_watch_flag_file_exits_on_shutdown():
     asyncio.create_task(_trigger())
     # Should return before 5s because the event fires.
     await asyncio.wait_for(killswitch.watch_flag_file(poll_interval_s=0.1), timeout=2.0)
+
+
+def test_allow_manual_send_suppresses_pause_flag():
+    killswitch.touch_flag()
+    assert killswitch.is_paused()
+    with killswitch.allow_manual_send():
+        assert not killswitch.is_paused()
+        # And the hot-path guard is silent.
+        killswitch.raise_if_paused()
+    # Restored on exit.
+    assert killswitch.is_paused()
+
+
+def test_allow_manual_send_still_respects_hard_stop():
+    killswitch.touch_flag()
+    killswitch.mark_shutting_down()
+    assert killswitch.is_paused()
+    with killswitch.allow_manual_send():
+        # Shutdown beats the bypass.
+        assert killswitch.is_paused()
+        with pytest.raises(killswitch.KillSwitchTripped):
+            killswitch.raise_if_paused()
+
+
+def test_allow_manual_send_does_not_leak_across_calls():
+    killswitch.touch_flag()
+    with killswitch.allow_manual_send():
+        assert not killswitch.is_paused()
+    # After the with-block exits the bypass is reset.
+    assert killswitch.is_paused()
+
+
+async def test_allow_manual_send_is_task_scoped():
+    """A concurrent task must NOT see the bypass set by its sibling."""
+
+    killswitch.touch_flag()
+
+    sibling_saw_paused = asyncio.Event()
+    sibling_done = asyncio.Event()
+
+    async def sibling() -> bool:
+        # Sibling task inherits context from the spawning frame at the moment
+        # of ``create_task`` — but since we create it *before* entering the
+        # bypass, it must see the pause flag as set for its lifetime.
+        observed = killswitch.is_paused()
+        sibling_saw_paused.set()
+        await sibling_done.wait()
+        return observed
+
+    task = asyncio.create_task(sibling())
+    with killswitch.allow_manual_send():
+        assert not killswitch.is_paused()
+        await sibling_saw_paused.wait()
+        sibling_done.set()
+
+    observed = await task
+    assert observed is True

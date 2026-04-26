@@ -15,9 +15,14 @@
 
 import type {
   Campaign,
+  CampaignKickoffResult,
+  ConnectorTestRequest,
+  ConnectorTestResult,
+  FollowupConfig,
   ImportCommit,
   ImportPreview,
   Lead,
+  LeadList,
   LlmCall,
   Message,
   SendsByDay,
@@ -141,6 +146,19 @@ export const api = {
     return req<Workspace>('/workspace/settings', { method: 'PATCH', body: patch });
   },
 
+  /**
+   * Probe connector connectivity. Pass the current (possibly unsaved)
+   * form state to test against those values; omit the payload to test
+   * the live saved connector. The backend always returns 200 — failures
+   * are encoded as ``ok: false`` with a human-readable ``detail``.
+   */
+  async testConnector(payload?: ConnectorTestRequest): Promise<ConnectorTestResult> {
+    return req<ConnectorTestResult>('/workspace/connector/test', {
+      method: 'POST',
+      body: payload ?? {},
+    });
+  },
+
   // ---------- status ----------
 
   async getSystemStatus(): Promise<SystemStatus> {
@@ -170,15 +188,33 @@ export const api = {
     goal: string;
     outreach_per_day?: number;
     connector_type?: string;
+    followup?: FollowupConfig;
   }): Promise<Campaign> {
     return req<Campaign>('/campaigns', { method: 'POST', body: payload });
   },
 
   async patchCampaign(
     id: string,
-    payload: Partial<{ name: string; goal: string; outreach_per_day: number; status: Campaign['status'] }>,
+    payload: Partial<{
+      name: string;
+      goal: string;
+      outreach_per_day: number;
+      status: Campaign['status'];
+      followup: FollowupConfig;
+    }>,
   ): Promise<Campaign> {
     return req<Campaign>(`/campaigns/${id}`, { method: 'PATCH', body: payload });
+  },
+
+  async resetCampaignSendCount(id: string): Promise<Campaign> {
+    return req<Campaign>(`/campaigns/${id}/reset-send-count`, { method: 'POST' });
+  },
+
+  async kickoffCampaign(id: string, count: number): Promise<CampaignKickoffResult> {
+    return req<CampaignKickoffResult>(`/campaigns/${id}/kickoff`, {
+      method: 'POST',
+      body: { count },
+    });
   },
 
   async activateCampaign(id: string): Promise<Campaign> {
@@ -205,13 +241,24 @@ export const api = {
 
   // ---------- leads ----------
 
-  async listLeads(opts?: { status?: string; limit?: number }): Promise<Lead[]> {
-    return req<Lead[]>('/leads', {
+  async listLeads(opts?: {
+    status?: string;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<LeadList> {
+    return req<LeadList>('/leads', {
       query: {
         status_filter: opts?.status,
+        q: opts?.q,
         limit: opts?.limit,
+        offset: opts?.offset,
       },
     });
+  },
+
+  async getLead(id: string): Promise<Lead> {
+    return req<Lead>(`/leads/${id}`);
   },
 
   async previewImport(file: File): Promise<ImportPreview> {
@@ -234,14 +281,28 @@ export const api = {
 
   // ---------- threads ----------
 
-  async listThreads(opts?: { status?: string; campaignId?: string; limit?: number }): Promise<Thread[]> {
+  async listThreads(opts?: {
+    status?: string;
+    campaignId?: string;
+    leadId?: string;
+    dismissed?: boolean;
+    limit?: number;
+    offset?: number;
+  }): Promise<Thread[]> {
     return req<Thread[]>('/threads', {
       query: {
         status_filter: opts?.status,
         campaign_id: opts?.campaignId,
+        lead_id: opts?.leadId,
+        dismissed: opts?.dismissed,
         limit: opts?.limit,
+        offset: opts?.offset,
       },
     });
+  },
+
+  async getHitlCount(): Promise<{ active: number; dismissed: number }> {
+    return req<{ active: number; dismissed: number }>('/threads/hitl/count');
   },
 
   async getThread(id: string): Promise<Thread> {
@@ -280,6 +341,14 @@ export const api = {
       method: 'POST',
       body: { outcome },
     });
+  },
+
+  async dismissThread(threadId: string): Promise<Thread> {
+    return req<Thread>(`/threads/${threadId}/dismiss`, { method: 'POST' });
+  },
+
+  async restoreThread(threadId: string): Promise<Thread> {
+    return req<Thread>(`/threads/${threadId}/restore`, { method: 'POST' });
   },
 
   // ---------- llm calls ----------

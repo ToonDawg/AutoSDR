@@ -12,7 +12,7 @@ import { useQuery } from '@tanstack/react-query';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
-import { ThreadStatus } from '@/lib/types';
+import { useHitlCount } from '@/lib/useHitlThreads';
 
 /**
  * Primary navigation. Flat list, no section markers. The "needs your eye"
@@ -37,17 +37,13 @@ const NAV: NavItem[] = [
 ];
 
 export function Sidebar() {
-  const { data: threads } = useQuery({
-    queryKey: ['threads', { status: ThreadStatus.PAUSED_FOR_HITL }],
-    queryFn: () => api.listThreads({ status: ThreadStatus.PAUSED_FOR_HITL }),
-    refetchInterval: 10_000,
-  });
+  const { data: hitl } = useHitlCount();
   const { data: workspace } = useQuery({
     queryKey: ['workspace'],
     queryFn: () => api.getWorkspace(),
   });
 
-  const hitlCount = threads?.length ?? 0;
+  const hitlCount = hitl?.active ?? 0;
 
   return (
     <aside className="flex flex-col gap-6 h-full w-56 shrink-0 border-r border-rule bg-paper px-4 py-5">

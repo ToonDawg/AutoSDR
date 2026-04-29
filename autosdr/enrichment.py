@@ -32,7 +32,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -66,6 +66,12 @@ EnrichmentStatus = Literal[
 ENVELOPE_VERSION = 3
 CONNECTOR_NAME = "website_crawlee"
 CONNECTOR_VERSION = "2.0"
+
+# Crawlee loads ``/robots.txt`` before the page request via ``send_request``
+# without a per-request timeout; Impit's AsyncClient default is ~3s, which
+# shows up as ~3012ms timeouts on slow robots. Floor the Impit client timeout
+# so robots and navigation stay on the same scale as ``budget_s``.
+IMPIT_TIMEOUT_FLOOR_S = 8.0
 
 USER_AGENT = (
     f"AutoSDR/{__version__} (+https://github.com/autosdr/autosdr; lead-enrichment)"
@@ -192,6 +198,7 @@ async def enrich_urls(
             BeautifulSoupCrawler,
             BeautifulSoupCrawlingContext,
         )
+        from crawlee.http_clients import ImpitHttpClient
     except ImportError as exc:
         raise RuntimeError(
             "crawlee is required for enrichment. Run `uv sync`."
@@ -222,10 +229,15 @@ async def enrich_urls(
     if not to_crawl:
         return results
 
+    impit_timeout_s = max(IMPIT_TIMEOUT_FLOOR_S, float(budget_s))
+    navigation_td = timedelta(seconds=impit_timeout_s)
+
     crawler = BeautifulSoupCrawler(
         max_requests_per_crawl=len(to_crawl) + 10,
         max_request_retries=2,
         request_handler_timeout=__as_timedelta(budget_s),
+        navigation_timeout=navigation_td,
+        http_client=ImpitHttpClient(timeout=impit_timeout_s),
         ignore_http_error_status_codes=_HANDLED_CODES,
         respect_robots_txt_file=respect_robots,
     )
@@ -348,6 +360,7 @@ __all__ = [
     "CONNECTOR_NAME",
     "CONNECTOR_VERSION",
     "ENVELOPE_VERSION",
+    "IMPIT_TIMEOUT_FLOOR_S",
     "EnrichmentResult",
     "EnrichmentStatus",
     "USER_AGENT",

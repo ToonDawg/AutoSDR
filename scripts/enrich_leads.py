@@ -31,7 +31,7 @@ import logging
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -40,7 +40,7 @@ from sqlalchemy import select
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from autosdr.db import session_scope
-from autosdr.enrichment import EnrichmentResult, persist_enrichment
+from autosdr.enrichment import IMPIT_TIMEOUT_FLOOR_S, EnrichmentResult, persist_enrichment
 from autosdr.enrichment_extract import extract_signals_from_soup
 from autosdr.models import Lead
 
@@ -65,7 +65,9 @@ _IGNORE_STATUS_CODES = [404, 410]
 # ---------------------------------------------------------------------------
 
 
-async def _enrich_with_crawlee(urls: list[str]) -> dict[str, EnrichmentResult]:
+async def _enrich_with_crawlee(
+    urls: list[str], *, budget_s: float = 8.0
+) -> dict[str, EnrichmentResult]:
     """Fetch all URLs with one crawlee crawler and return per-URL envelopes.
 
     Status mapping:
@@ -82,6 +84,7 @@ async def _enrich_with_crawlee(urls: list[str]) -> dict[str, EnrichmentResult]:
             BeautifulSoupCrawlingContext,
         )
         from crawlee.basic_crawler import BasicCrawlingContext
+        from crawlee.http_clients import ImpitHttpClient
     except ImportError:
         try:
             from crawlee.crawlers import (
@@ -89,6 +92,7 @@ async def _enrich_with_crawlee(urls: list[str]) -> dict[str, EnrichmentResult]:
                 BeautifulSoupCrawlingContext,
                 BasicCrawlingContext,
             )
+            from crawlee.http_clients import ImpitHttpClient
         except ImportError:
             log.error(
                 "crawlee not installed. Run: uv sync (it is now a hard dep)."
@@ -97,10 +101,15 @@ async def _enrich_with_crawlee(urls: list[str]) -> dict[str, EnrichmentResult]:
 
     results: dict[str, EnrichmentResult] = {}
     url_set = list(dict.fromkeys(urls))
+    impit_timeout_s = max(IMPIT_TIMEOUT_FLOOR_S, float(budget_s))
+    navigation_td = timedelta(seconds=impit_timeout_s)
 
     crawler = BeautifulSoupCrawler(
         max_requests_per_crawl=len(url_set) + 10,
         max_request_retries=2,
+        request_handler_timeout=timedelta(seconds=max(0.5, float(budget_s))),
+        navigation_timeout=navigation_td,
+        http_client=ImpitHttpClient(timeout=impit_timeout_s),
         ignore_http_error_status_codes=_IGNORE_STATUS_CODES,
     )
 
@@ -271,6 +280,14 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--limit", type=int, default=100, help="Max leads to process")
     p.add_argument(
+        "--budget-s",
+        type=float,
+        default=8.0,
+        help="Per-lead wall-clock for crawlee handler + HTTP budget scale "
+        f"(floored at {IMPIT_TIMEOUT_FLOOR_S}s for Impit robots/main timeouts). "
+        "Default: 8",
+    )
+    p.add_argument(
         "--apply",
         action="store_true",
         help="Write results back to DB. Without this flag the script is a dry-run.",
@@ -283,9 +300,9 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-async def diagnose_url(url: str) -> None:
+async def diagnose_url(url: str, *, budget_s: float) -> None:
     log.info("Diagnosing %s via crawlee BeautifulSoupCrawler", url)
-    results = await _enrich_with_crawlee([url])
+    results = await _enrich_with_crawlee([url], budget_s=budget_s)
     result = results[url]
     log.info("  status   = %s", result.status)
     log.info("  meta     = %s", json.dumps(result.meta, indent=2, default=str))
@@ -297,7 +314,7 @@ async def main() -> None:
     args = _parse_args()
 
     if args.url:
-        await diagnose_url(args.url)
+        await diagnose_url(args.url, budget_s=args.budget_s)
         return
 
     raw_statuses = [s.strip() for s in args.statuses.split(",")]
@@ -322,7 +339,7 @@ async def main() -> None:
     id_by_url = {ld["website"]: ld["id"] for ld in lead_dicts if ld.get("website")}
 
     t0 = time.monotonic()
-    results = await _enrich_with_crawlee(urls)
+    results = await _enrich_with_crawlee(urls, budget_s=args.budget_s)
     elapsed = time.monotonic() - t0
 
     stats: Counter = Counter()

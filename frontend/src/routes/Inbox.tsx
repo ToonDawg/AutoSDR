@@ -1,14 +1,14 @@
-import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, RotateCcw, Trash2 } from 'lucide-react';
-import { api } from '@/lib/api';
-import { Badge } from '@/components/ui/Badge';
-import { Button } from '@/components/ui/Button';
-import { FilterTabs, type FilterOption } from '@/components/ui/FilterTabs';
-import { HITL_LABEL, INTENT_LABEL, evalScoreTone, relTime } from '@/lib/format';
-import { type Thread } from '@/lib/types';
-import { useHitlCount, useHitlThreads } from '@/lib/useHitlThreads';
+import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ArrowRight, RotateCcw, Trash2 } from "lucide-react";
+import { api } from "@/lib/api";
+import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { FilterTabs, type FilterOption } from "@/components/ui/FilterTabs";
+import { HITL_LABEL, INTENT_LABEL, evalScoreTone, relTime } from "@/lib/format";
+import { type Thread } from "@/lib/types";
+import { useHitlCount, useHitlThreads } from "@/lib/useHitlThreads";
 
 /**
  * "Needs your eye" — triage view for threads that the operator is on
@@ -26,11 +26,11 @@ import { useHitlCount, useHitlThreads } from '@/lib/useHitlThreads';
  * ``autosdr/pipeline/_shared.py::pause_thread_for_hitl``.
  */
 
-type Tab = 'active' | 'dismissed';
+type Tab = "active" | "dismissed";
 
 const TABS: ReadonlyArray<FilterOption<Tab>> = [
-  { id: 'active', label: 'Active' },
-  { id: 'dismissed', label: 'Recently dismissed' },
+  { id: "active", label: "Active" },
+  { id: "dismissed", label: "Recently dismissed" },
 ];
 
 const PAGE_SIZE = 50;
@@ -39,16 +39,18 @@ const HISTORY_CUTOFF_MS = HISTORY_RETENTION_DAYS * 24 * 3600 * 1000;
 
 export function Inbox() {
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>('active');
+  const [tab, setTab] = useState<Tab>("active");
   const [activePages, setActivePages] = useState(1);
   const [historyPages, setHistoryPages] = useState(1);
-  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
+  const [selected, setSelected] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
 
-  const pages = tab === 'active' ? activePages : historyPages;
-  const setPages = tab === 'active' ? setActivePages : setHistoryPages;
+  const pages = tab === "active" ? activePages : historyPages;
+  const setPages = tab === "active" ? setActivePages : setHistoryPages;
 
   const { data: threads, isLoading } = useHitlThreads({
-    dismissed: tab === 'dismissed',
+    dismissed: tab === "dismissed",
     limit: PAGE_SIZE * pages,
   });
   const { data: count } = useHitlCount();
@@ -57,8 +59,8 @@ export function Inbox() {
   // tab takes the server response as-is.
   const visibleThreads = useMemo(() => {
     if (!threads) return [];
-    if (tab !== 'dismissed') return threads;
-    const cutoff = Date.now() - HISTORY_CUTOFF_MS;
+    if (tab !== "dismissed") return threads;
+    const cutoff = new Date().getTime() - HISTORY_CUTOFF_MS;
     return threads.filter((t) => {
       const at = t.hitl_dismissed_at ? Date.parse(t.hitl_dismissed_at) : 0;
       return at >= cutoff;
@@ -73,7 +75,7 @@ export function Inbox() {
     threads !== undefined && threads.length >= PAGE_SIZE * pages;
 
   const invalidateHitl = () => {
-    qc.invalidateQueries({ queryKey: ['threads', 'hitl'] });
+    qc.invalidateQueries({ queryKey: ["threads", "hitl"] });
   };
 
   const dismiss = useMutation({
@@ -117,16 +119,16 @@ export function Inbox() {
   };
 
   const headerTitle =
-    tab === 'active'
+    tab === "active"
       ? tabCounts.active > 0
-        ? `${tabCounts.active} thread${tabCounts.active === 1 ? '' : 's'} waiting`
-        : 'All clear'
+        ? `${tabCounts.active} thread${tabCounts.active === 1 ? "" : "s"} waiting`
+        : "All clear"
       : `${visibleThreads.length} dismissed in the last ${HISTORY_RETENTION_DAYS} days`;
 
   const headerSubtitle =
-    tab === 'active'
-      ? 'First-message-only mode: AutoSDR never answers a reply without you picking a draft.'
-      : 'Threads you set aside. A new HITL event automatically pulls them back to Active.';
+    tab === "active"
+      ? "First-message-only mode: AutoSDR never answers a reply without you picking a draft."
+      : "Threads you set aside. A new HITL event automatically pulls them back to Active.";
 
   const allVisibleSelected =
     visibleThreads.length > 0 && selected.size === visibleThreads.length;
@@ -149,7 +151,7 @@ export function Inbox() {
         counts={tabCounts}
       />
 
-      {tab === 'active' && visibleThreads.length > 0 && (
+      {tab === "active" && visibleThreads.length > 0 && (
         <div className="paper-card flex items-center justify-between px-4 py-2">
           <div className="flex items-center gap-3 text-xs text-ink-muted">
             <button
@@ -159,7 +161,7 @@ export function Inbox() {
               }
               className="text-xs text-ink-muted hover:text-ink cursor-pointer"
             >
-              {allVisibleSelected ? 'Clear selection' : 'Select all'}
+              {allVisibleSelected ? "Clear selection" : "Select all"}
             </button>
             {selected.size > 0 && (
               <span className="font-mono">{selected.size} selected</span>
@@ -172,7 +174,7 @@ export function Inbox() {
             disabled={selected.size === 0 || actionPending}
             onClick={() => dismissBulk.mutate(Array.from(selected))}
           >
-            Dismiss {selected.size || ''}
+            Dismiss {selected.size || ""}
           </Button>
         </div>
       )}
@@ -200,14 +202,14 @@ export function Inbox() {
       {!isLoading && visibleThreads.length === 0 && (
         <div className="paper-card px-6 py-12 text-center">
           <div className="text-sm font-medium mb-1">
-            {tab === 'active'
-              ? 'Nothing to look at.'
+            {tab === "active"
+              ? "Nothing to look at."
               : `Nothing dismissed in the last ${HISTORY_RETENTION_DAYS} days.`}
           </div>
           <p className="text-sm text-ink-muted">
-            {tab === 'active' ? (
+            {tab === "active" ? (
               <>
-                New lead replies will show up here the moment they arrive.{' '}
+                New lead replies will show up here the moment they arrive.{" "}
                 <Link to="/threads" className="underline">
                   Browse all threads
                 </Link>
@@ -222,11 +224,7 @@ export function Inbox() {
 
       {canLoadMore && (
         <div className="flex justify-center">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setPages(pages + 1)}
-          >
+          <Button variant="ghost" size="sm" onClick={() => setPages(pages + 1)}>
             Load more
           </Button>
         </div>
@@ -255,7 +253,7 @@ function HitlRow({
   actionPending,
 }: HitlRowProps) {
   const ctx = thread.hitl_context as
-    | (Thread['hitl_context'] & {
+    | (Thread["hitl_context"] & {
         last_drafts?: string[];
         last_scores?: { overall?: number; feedback?: string | null }[];
       })
@@ -276,34 +274,38 @@ function HitlRow({
       : null;
 
   const previewDraft = topSuggestion?.draft ?? fallbackDraft;
-  const previewScore = topSuggestion
-    ? Math.round((topSuggestion.overall ?? 0) * 100)
-    : fallbackScore;
-  const previewLabel = topSuggestion ? 'top draft' : 'last attempt';
-  const scoreTone = evalScoreTone(previewScore);
-  const dimmed = variant === 'dismissed';
+  const previewScore =
+    topSuggestion && topSuggestion.overall != null
+      ? Math.round(topSuggestion.overall * 100)
+      : !topSuggestion
+        ? fallbackScore
+        : null;
+  const previewLabel = topSuggestion ? "top draft" : "last attempt";
+  const scoreTone =
+    previewScore != null ? evalScoreTone(previewScore) : "neutral";
+  const dimmed = variant === "dismissed";
   const reasonLabel = thread.hitl_reason
-    ? (HITL_LABEL[thread.hitl_reason] ?? 'Needs you')
-    : 'Needs you';
+    ? (HITL_LABEL[thread.hitl_reason] ?? "Needs you")
+    : "Needs you";
   const timestampLabel =
-    variant === 'dismissed' && thread.hitl_dismissed_at
+    variant === "dismissed" && thread.hitl_dismissed_at
       ? `dismissed ${relTime(thread.hitl_dismissed_at)}`
       : relTime(thread.last_message_at);
 
   return (
     <div
       className={`flex items-stretch group transition-colors hover:bg-paper-deep ${
-        dimmed ? 'opacity-75' : ''
+        dimmed ? "opacity-75" : ""
       }`}
     >
-      {variant === 'active' && (
+      {variant === "active" && (
         <label className="pl-5 pr-1 py-4 flex items-start cursor-pointer select-none">
           <input
             type="checkbox"
             checked={selected}
             onChange={onToggleSelect}
             className="mt-0.5 h-3.5 w-3.5 accent-ink cursor-pointer"
-            aria-label={`Select ${thread.lead_name ?? 'thread'}`}
+            aria-label={`Select ${thread.lead_name ?? "thread"}`}
           />
         </label>
       )}
@@ -311,20 +313,20 @@ function HitlRow({
       <Link
         to={`/threads/${thread.id}`}
         className={`flex-1 min-w-0 py-4 ${
-          variant === 'active' ? 'pl-2 pr-3' : 'px-5'
+          variant === "active" ? "pl-2 pr-3" : "px-5"
         }`}
       >
         <div className="flex items-baseline justify-between gap-4 mb-2">
           <div className="flex items-baseline gap-3 min-w-0">
             <span className="text-sm font-medium truncate">
-              {thread.lead_name ?? 'Unknown lead'}
+              {thread.lead_name ?? "Unknown lead"}
             </span>
             <span className="text-xs text-ink-muted truncate">
               {thread.campaign_name}
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <Badge tone={dimmed ? 'neutral' : 'rust'} uppercase={false}>
+            <Badge tone={dimmed ? "neutral" : "rust"} uppercase={false}>
               {reasonLabel}
             </Badge>
             <span className="text-xs text-ink-faint font-mono">
@@ -335,7 +337,7 @@ function HitlRow({
 
         {ctx?.incoming_message && (
           <p className="text-sm text-ink-muted mb-2 line-clamp-2">
-            <span className="text-ink-faint">they said:</span>{' '}
+            <span className="text-ink-faint">they said:</span>{" "}
             {ctx.incoming_message}
           </p>
         )}
@@ -344,7 +346,7 @@ function HitlRow({
           <div className="flex items-start gap-3 pt-2 mt-1 border-t border-rule">
             <Badge tone={scoreTone} uppercase={false} className="shrink-0">
               {previewLabel}
-              {previewScore != null ? ` · ${previewScore}` : ''}
+              {previewScore != null ? ` · ${previewScore}` : ""}
             </Badge>
             <p className="text-sm text-ink line-clamp-2 flex-1">
               {previewDraft}
@@ -358,13 +360,13 @@ function HitlRow({
 
         {!previewDraft && ctx?.intent && (
           <div className="text-xs text-ink-muted mt-1">
-            classified as{' '}
+            classified as{" "}
             <span className="text-rust">
               {INTENT_LABEL[ctx.intent] ?? ctx.intent}
             </span>
             {ctx.confidence != null && (
               <span className="text-ink-faint">
-                {' '}
+                {" "}
                 · {Math.round(ctx.confidence * 100)}% confidence
               </span>
             )}
@@ -373,7 +375,7 @@ function HitlRow({
       </Link>
 
       <div className="flex items-start py-4 pr-4 pl-2">
-        {variant === 'active' ? (
+        {variant === "active" ? (
           <button
             type="button"
             onClick={onDismiss}

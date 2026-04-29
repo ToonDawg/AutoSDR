@@ -116,6 +116,7 @@ except Exception:  # pragma: no cover - best effort
 from autosdr import killswitch
 from autosdr.config import get_settings
 from autosdr.db import session_scope
+from autosdr.llm.pricing import cost_for
 from autosdr.models import LlmCall, LlmCallPurpose
 
 logger = logging.getLogger(__name__)
@@ -192,7 +193,8 @@ class _Usage:
     total_calls: int = 0
     total_tokens_in: int = 0
     total_tokens_out: int = 0
-    per_model: dict[str, dict[str, int]] = field(default_factory=dict)
+    total_cost_usd: float = 0.0
+    per_model: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 _usage = _Usage()
@@ -200,16 +202,29 @@ _usage_lock = Lock()
 
 
 def _record_usage(model: str, tokens_in: int, tokens_out: int) -> None:
+    """Accumulate one successful LLM call into the in-memory counter.
+
+    Cost is computed at write-time *into the counter* (not into the
+    DB row) using the current pricing snapshot. Unknown models
+    contribute zero cost — see ``cost_for`` semantics — so the
+    aggregate stays summable, while per-call surfaces still get a
+    ``None`` from the same pricing module.
+    """
+
+    cost = cost_for(model, tokens_in, tokens_out) or 0.0
     with _usage_lock:
         _usage.total_calls += 1
         _usage.total_tokens_in += tokens_in
         _usage.total_tokens_out += tokens_out
+        _usage.total_cost_usd += cost
         bucket = _usage.per_model.setdefault(
-            model, {"calls": 0, "tokens_in": 0, "tokens_out": 0}
+            model,
+            {"calls": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0},
         )
         bucket["calls"] += 1
         bucket["tokens_in"] += tokens_in
         bucket["tokens_out"] += tokens_out
+        bucket["cost_usd"] += cost
 
 
 def get_usage_snapshot() -> dict[str, Any]:
@@ -218,6 +233,7 @@ def get_usage_snapshot() -> dict[str, Any]:
             "total_calls": _usage.total_calls,
             "total_tokens_in": _usage.total_tokens_in,
             "total_tokens_out": _usage.total_tokens_out,
+            "total_cost_usd": _usage.total_cost_usd,
             "per_model": {k: dict(v) for k, v in _usage.per_model.items()},
         }
 
@@ -227,6 +243,7 @@ def reset_usage() -> None:
         _usage.total_calls = 0
         _usage.total_tokens_in = 0
         _usage.total_tokens_out = 0
+        _usage.total_cost_usd = 0.0
         _usage.per_model.clear()
 
 

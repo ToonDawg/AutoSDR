@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { Button } from '@/components/ui/Button';
 import { BusinessStep } from './setup/BusinessStep';
@@ -13,18 +13,24 @@ import type { SetupPayload } from '@/lib/types';
 /**
  * First-run setup wizard coordinator.
  *
- * Gated in `App.tsx` via `GET /api/setup/required`: if no workspace row
- * exists yet, every other API call 409s and the fetch wrapper redirects
- * here. The user walks through three short steps — business, LLM, SMS
- * connector — and on submit we call `POST /api/setup` which creates the
- * workspace row, writes the initial settings blob, hot-applies the LLM
- * keys, and builds the chosen connector. Then we send them to `/`.
+ * If no workspace row exists yet, workspace-scoped API calls 409 and the
+ * fetch wrapper redirects to Settings, which embeds this wizard. The user
+ * walks through three short steps — business, LLM, SMS connector — and on
+ * submit we call `POST /api/setup` which creates the workspace row, writes
+ * the initial settings blob, hot-applies the LLM keys, and builds the chosen
+ * connector.
  *
  * Each step lives in its own file under `./setup/`; this component only
  * orchestrates state, navigation, payload shaping, and the submit call.
  */
-export function Setup() {
+interface SetupProps {
+  embedded?: boolean;
+  redirectTo?: string;
+}
+
+export function Setup({ embedded = false, redirectTo = '/' }: SetupProps = {}) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [step, setStep] = useState<Step>(0);
   const [state, setState] = useState<FormState>(INITIAL_STATE);
   const [error, setError] = useState<string | null>(null);
@@ -38,7 +44,12 @@ export function Setup() {
 
   const submit = useMutation({
     mutationFn: () => api.runSetup(payload),
-    onSuccess: () => navigate('/', { replace: true }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['workspace'] });
+      await queryClient.invalidateQueries({ queryKey: ['setup'] });
+      await queryClient.invalidateQueries({ queryKey: ['status'] });
+      navigate(redirectTo, { replace: true });
+    },
     onError: (err: unknown) => {
       setError(err instanceof Error ? err.message : 'Setup failed.');
     },
@@ -57,8 +68,8 @@ export function Setup() {
       state.smsgate_username.trim().length > 0 &&
       state.smsgate_password.trim().length > 0);
 
-  return (
-    <div className="min-h-screen bg-paper text-ink flex flex-col">
+  const body = (
+    <>
       <header className="border-b border-rule px-8 py-5 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="h-7 w-7 rounded-sm bg-ink text-paper flex items-center justify-center font-mono text-xs font-semibold">
@@ -81,7 +92,7 @@ export function Setup() {
           {step === 2 && <ConnectorStep state={state} set={set} />}
 
           {error && (
-            <div className="mt-6 border border-[color:var(--color-oxblood)]/30 bg-oxblood-soft text-oxblood px-4 py-3 text-sm">
+            <div className="mt-6 border border-oxblood/30 bg-oxblood-soft text-oxblood px-4 py-3 text-sm">
               {error}
             </div>
           )}
@@ -123,6 +134,16 @@ export function Setup() {
           </div>
         </div>
       </main>
+    </>
+  );
+
+  if (embedded) {
+    return <div className="bg-paper text-ink">{body}</div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-paper text-ink flex flex-col">
+      {body}
     </div>
   );
 }

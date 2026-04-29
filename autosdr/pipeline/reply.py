@@ -1,15 +1,21 @@
 """Reply pipeline: inbound webhook -> classify -> route.
 
-Routing strategy (first-message-only mode, the default):
+Routing strategy (first-message-only mode, the default — ``auto_reply_enabled=False``):
 
-- ``intent == "negative"``     → close lost.
-- ``intent == "goal_achieved"`` → close won.
-- anything else                → pause for human, stash N suggested replies.
+- *every* inbound → pause for human, stash N suggested replies.
 
-If ``workspace.settings.auto_reply_enabled`` is flipped to ``true`` the old
-classify → generate → evaluate → send loop is preserved for backwards
-compatibility, but the default posture is "send the first message, then
-hand the rest to a human".
+The classifier still runs and its verdict is captured in the HITL
+context (so the operator sees "LLM thinks this is negative /
+goal_achieved / unclear / …" alongside the suggestions), but it never
+auto-closes the thread. Close-won and close-lost are decisions the
+operator drives from the inbox — the system would otherwise silently
+swallow a reply the human has not yet seen.
+
+If ``workspace.settings.auto_reply_enabled`` is flipped to ``true`` the
+old classify → generate → evaluate → send loop is preserved for
+backwards compatibility, including a terminal-intent shortcut that
+auto-closes on ``negative`` / ``goal_achieved`` so the bot doesn't
+waste an LLM round-trip drafting a reply to "no thanks".
 
 Multi-campaign resolution:
 
@@ -168,10 +174,40 @@ async def process_incoming_message(
 ) -> ReplyResult:
     """Main entry point — called from the webhook background task or poller.
 
-    This is a thin coordinator: it owns the transaction and the "which
-    mode are we in" decision tree. The actual work is in the helpers
-    below so each mode can be understood (and eventually tested) on its
-    own.
+    Three-phase architecture:
+
+    1. **Persist inbound + early exits** (with DB transaction). Resolves
+       the thread, records the inbound :class:`Message`, captures the
+       message history snapshot, and runs the deterministic opt-out
+       shortcut. The transaction commits before returning, releasing the
+       SQLite write lock.
+    2. **Classify + generate** (no DB transaction). Runs LLM calls —
+       classifier, then either suggestion variants (HITL parking mode) or
+       generate-and-evaluate + connector send (auto-reply mode). Each LLM
+       call records its own ``LlmCall`` audit row in a short-lived inner
+       session that no longer contends with this outer flow.
+    3. **Persist results** (with DB transaction). Refetches the thread
+       state in a fresh session, applies status changes, writes the
+       parking record / outbound :class:`Message`, and commits.
+
+    Why this matters: the pre-refactor code held a single
+    ``session_scope`` open across all LLM calls. On SQLite, the inbound
+    Message ``flush()`` acquired the write lock, then 1–4 parallel LLM
+    calls each tried to insert their ``LlmCall`` audit row — every one
+    waited up to ``PRAGMA busy_timeout`` (2 min) for the outer txn that
+    couldn't commit until *they* returned. The deadlock blew through the
+    timeout and rolled back the entire pipeline, dropping the inbound on
+    the floor. The phased design keeps the outer txn write-window in the
+    millisecond range and decouples LLM I/O from DB locking.
+
+    Trade-off: per-thread ``SELECT FOR UPDATE`` locking now only protects
+    Phase 1; two concurrent inbounds for the same thread could both
+    classify + park in Phase 2/3. With the current single-worker poller
+    that's impossible in practice, and the Phase 3 refetch reads the
+    latest committed state so the second processor sees the first's
+    parking and falls into the ``PAUSED_FOR_HITL`` capture-only branch.
+    Multi-worker deployments will need a redis-backed mutex; the
+    Postgres v1 cutover is the right point to revisit.
     """
 
     logger.info(
@@ -181,6 +217,7 @@ async def process_incoming_message(
         len(incoming.content),
     )
 
+    # ===== Phase 1: persist inbound + capture context =====
     with session_scope() as session:
         workspace = session.get(Workspace, workspace_id)
         if workspace is None:
@@ -217,54 +254,75 @@ async def process_incoming_message(
         if opt_out is not None:
             return opt_out
 
+        # Snapshot history + IDs before the session closes. Helpers in
+        # Phase 2 read scalar attributes on the detached ORM instances
+        # below — ``sessionmaker(expire_on_commit=False)`` keeps those
+        # values cached after commit.
         history = thread_history(session, thread)
         settings_llm = settings_blob.get("llm") or {}
+        thread_id_snapshot = thread.id
+        campaign_lead_id_snapshot = campaign_lead.id
+        lead_id_snapshot = lead.id
+        session.expunge_all()
+    # session committed here — SQLite write lock released
 
-        cls = await _classify_reply(
+    # ===== Phase 2: classify (no DB transaction held) =====
+    cls = await _classify_reply(
+        workspace=workspace,
+        campaign=campaign,
+        lead=lead,
+        thread=thread,
+        history=history,
+        incoming=incoming,
+        settings_llm=settings_llm,
+    )
+
+    # First-message-only mode (default): every inbound parks for HITL with
+    # suggestions, regardless of classifier intent. The classifier verdict
+    # still flows through into ``hitl_context`` so the operator can see what
+    # the LLM thought, but close-won and close-lost are operator decisions —
+    # the pipeline must never silently swallow a reply the human hasn't seen.
+    if not bool(settings_blob.get("auto_reply_enabled", False)):
+        # Phase 2b + 3: generate suggestions then persist parking
+        return await _park_with_suggestions_v2(
             workspace=workspace,
             campaign=campaign,
-            lead=lead,
-            thread=thread,
-            history=history,
-            incoming=incoming,
-            settings_llm=settings_llm,
-        )
-
-        terminal = _route_terminal_intent(
-            thread=thread,
-            campaign_lead=campaign_lead,
-            lead=lead,
-            classification=cls,
-        )
-        if terminal is not None:
-            return terminal
-
-        if not bool(settings_blob.get("auto_reply_enabled", False)):
-            return await _park_with_suggestions(
-                session=session,
-                workspace=workspace,
-                campaign=campaign,
-                lead=lead,
-                thread=thread,
-                classification=cls,
-                incoming=incoming,
-                settings_blob=settings_blob,
-            )
-
-        return await _run_auto_reply(
-            session=session,
-            connector=connector,
-            workspace=workspace,
-            campaign=campaign,
-            campaign_lead=campaign_lead,
             lead=lead,
             thread=thread,
             history=history,
             classification=cls,
             incoming=incoming,
             settings_blob=settings_blob,
-            settings_llm=settings_llm,
+            thread_id=thread_id_snapshot,
         )
+
+    # Auto-reply mode only: terminal intents short-circuit the
+    # generate/evaluate loop. No suggestions get drafted because the bot
+    # is the one replying — there's no human in the loop to read them.
+    if cls.intent in ("negative", "goal_achieved"):
+        return _persist_terminal_close(
+            thread_id=thread_id_snapshot,
+            campaign_lead_id=campaign_lead_id_snapshot,
+            lead_id=lead_id_snapshot,
+            classification=cls,
+        )
+
+    # Auto-reply path — same phased design (LLM outside session, then commit)
+    return await _run_auto_reply_v2(
+        connector=connector,
+        workspace=workspace,
+        campaign=campaign,
+        lead=lead,
+        thread=thread,
+        history=history,
+        classification=cls,
+        incoming=incoming,
+        settings_blob=settings_blob,
+        settings_llm=settings_llm,
+        thread_id=thread_id_snapshot,
+        campaign_lead_id=campaign_lead_id_snapshot,
+        lead_id=lead_id_snapshot,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +380,40 @@ def _resolve_and_capture_inbound(
 
     thread = _lock_thread(session, thread.id) or thread
 
+    # Idempotency: a poller restart, a transient second worker, or even
+    # the SMSGate device server simply re-listing every undeleted SMS in
+    # the phone's inbox each tick will re-deliver the same
+    # ``IncomingMessage`` to this function. Without this check we'd
+    # append a duplicate ``Message`` row to the thread (and re-run the
+    # full classify + suggestion fan-out) every time the connector
+    # forgot it had seen the id — for example, after every API restart,
+    # because :attr:`SmsGateConnector._seen_ids` is per-process and
+    # empty on boot. The DB is the single source of truth for "have we
+    # ingested this before"; the in-memory set in the connector is now
+    # purely a fast-path that skips the network/DB roundtrip.
+    if incoming.provider_message_id:
+        already_ingested = session.execute(
+            select(Message.id).where(
+                Message.thread_id == thread.id,
+                Message.provider_message_id == incoming.provider_message_id,
+            )
+        ).scalar_one_or_none()
+        if already_ingested is not None:
+            logger.info(
+                "inbound duplicate skipped thread=%s provider_id=%s",
+                thread.id,
+                incoming.provider_message_id,
+            )
+            return ReplyResult(
+                action="ignored",
+                thread_id=thread.id,
+                detail="duplicate_inbound",
+            )
+
+    campaign_lead = session.get(CampaignLead, thread.campaign_lead_id)
+    campaign = session.get(Campaign, campaign_lead.campaign_id)
+    lead = session.get(Lead, campaign_lead.lead_id)
+
     if thread.status == ThreadStatus.PAUSED_FOR_HITL:
         # Someone already parked this thread. Capture the message so it
         # shows up in the transcript but don't run any AI on it — the
@@ -336,9 +428,16 @@ def _resolve_and_capture_inbound(
                 thread_id=thread.id,
                 role=MessageRole.LEAD,
                 content=incoming.content,
-                metadata_={"source": connector.connector_type, "paused_for_hitl": True},
+                provider_message_id=incoming.provider_message_id,
+                created_at=incoming.received_at,
+                metadata_={
+                    "source": connector.connector_type,
+                    "provider_message_id": incoming.provider_message_id,
+                    "paused_for_hitl": True,
+                },
             )
         )
+        _mark_replied(campaign_lead=campaign_lead, lead=lead)
         return ReplyResult(
             action="ignored",
             thread_id=thread.id,
@@ -350,18 +449,63 @@ def _resolve_and_capture_inbound(
             thread_id=thread.id,
             role=MessageRole.LEAD,
             content=incoming.content,
+            provider_message_id=incoming.provider_message_id,
+            # Use the connector-provided ``received_at`` as the canonical
+            # message timestamp so the transcript reflects when the SMS
+            # actually arrived on the device, not when the poller happened
+            # to scan the inbox. The DB default of ``utcnow()`` would
+            # otherwise compress every backlog message into a single
+            # post-restart minute and order them by poll-scan rather than
+            # by send time.
+            created_at=incoming.received_at,
             metadata_={
                 "source": connector.connector_type,
                 "provider_message_id": incoming.provider_message_id,
             },
         )
     )
+    # Mark the lead as having replied as soon as we capture the inbound,
+    # not when we eventually decide to send a draft. The first-message-only
+    # default never reaches the auto-reply send path, so without this bump
+    # the campaign list / detail "Replied" stat stayed at zero forever even
+    # for chatty threads. Downstream paths (opt-out closes lost, terminal
+    # auto-reply closes won) will overwrite to the correct terminal status
+    # before commit, so this is a floor, not a ceiling.
+    _mark_replied(campaign_lead=campaign_lead, lead=lead)
     session.flush()
 
-    campaign_lead = session.get(CampaignLead, thread.campaign_lead_id)
-    campaign = session.get(Campaign, campaign_lead.campaign_id)
-    lead = session.get(Lead, campaign_lead.lead_id)
     return thread, campaign_lead, campaign, lead
+
+
+# Status transitions from non-terminal pre-reply buckets onto REPLIED. We
+# never *demote* (e.g. WON / LOST stay terminal) and we don't promote SKIPPED
+# (the lead was deliberately bypassed). PAUSED_FOR_HITL and CONTACTED both
+# advance — a thread can be parked for a connector failure pre-reply, and
+# the lead's eventual reply is exactly the signal we want to surface.
+_REPLY_PROMOTABLE_CL_STATUSES: frozenset[str] = frozenset(
+    {
+        CampaignLeadStatus.QUEUED,
+        CampaignLeadStatus.SENDING,
+        CampaignLeadStatus.PAUSED_FOR_HITL,
+        CampaignLeadStatus.CONTACTED,
+    }
+)
+_REPLY_PROMOTABLE_LEAD_STATUSES: frozenset[str] = frozenset(
+    {LeadStatus.NEW, LeadStatus.CONTACTED}
+)
+
+
+def _mark_replied(*, campaign_lead: CampaignLead, lead: Lead) -> None:
+    """Advance ``campaign_lead`` and ``lead`` to the REPLIED bucket.
+
+    Idempotent and demote-safe — see ``_REPLY_PROMOTABLE_*`` for the
+    transition table. Caller is responsible for flushing.
+    """
+
+    if campaign_lead.status in _REPLY_PROMOTABLE_CL_STATUSES:
+        campaign_lead.status = CampaignLeadStatus.REPLIED
+    if lead.status in _REPLY_PROMOTABLE_LEAD_STATUSES:
+        lead.status = LeadStatus.REPLIED
 
 
 # ---------------------------------------------------------------------------
@@ -503,42 +647,55 @@ async def _classify_reply(
 
 
 # ---------------------------------------------------------------------------
-# Stage 3a: terminal intents (close won/lost)
+# Stage 3a: terminal intents (close won/lost) — Phase 3 DB write
 # ---------------------------------------------------------------------------
 
 
-def _route_terminal_intent(
+def _persist_terminal_close(
     *,
-    thread: Thread,
-    campaign_lead: CampaignLead,
-    lead: Lead,
+    thread_id: str,
+    campaign_lead_id: str,
+    lead_id: str,
     classification: _Classification,
-) -> ReplyResult | None:
-    """Close the thread on ``negative`` / ``goal_achieved``. Returns None otherwise."""
+) -> ReplyResult:
+    """Apply the close-won / close-lost status propagation in a fresh txn.
 
-    if classification.intent == "negative":
-        _close_thread(thread, campaign_lead, lead, won=False)
-        logger.info("reply route thread=%s action=closed_lost intent=negative", thread.id)
-        return ReplyResult(
-            action="closed_lost",
-            thread_id=thread.id,
-            intent=classification.intent,
-            confidence=classification.confidence,
-            detail=classification.reason,
-        )
+    Refetches the ORM rows so the writes happen against current state.
+    Idempotent against the rare race where another caller already closed
+    the thread: re-applying the same terminal status is a no-op.
+    """
 
-    if classification.intent == "goal_achieved":
-        _close_thread(thread, campaign_lead, lead, won=True)
-        logger.info("reply route thread=%s action=closed_won intent=goal_achieved", thread.id)
-        return ReplyResult(
-            action="closed_won",
-            thread_id=thread.id,
-            intent=classification.intent,
-            confidence=classification.confidence,
-            detail=classification.reason,
-        )
+    won = classification.intent == "goal_achieved"
+    with session_scope() as session:
+        thread = session.get(Thread, thread_id)
+        campaign_lead = session.get(CampaignLead, campaign_lead_id)
+        lead = session.get(Lead, lead_id)
+        if thread is None or campaign_lead is None or lead is None:
+            # Race: thread was deleted between Phase 1 and Phase 3. Caller
+            # can't recover, just emit a safe terminal result.
+            return ReplyResult(
+                action="ignored",
+                thread_id=thread_id,
+                detail="thread_disappeared",
+            )
 
-    return None
+        _close_thread(thread, campaign_lead, lead, won=won)
+        session.flush()
+
+    action = "closed_won" if won else "closed_lost"
+    logger.info(
+        "reply route thread=%s action=%s intent=%s",
+        thread_id,
+        action,
+        classification.intent,
+    )
+    return ReplyResult(
+        action=action,
+        thread_id=thread_id,
+        intent=classification.intent,
+        confidence=classification.confidence,
+        detail=classification.reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -546,27 +703,35 @@ def _route_terminal_intent(
 # ---------------------------------------------------------------------------
 
 
-async def _park_with_suggestions(
+async def _park_with_suggestions_v2(
     *,
-    session: Session,
     workspace: Workspace,
     campaign: Campaign,
     lead: Lead,
     thread: Thread,
+    history: list[dict[str, Any]],
     classification: _Classification,
     incoming: IncomingMessage,
     settings_blob: dict[str, Any],
+    thread_id: str,
 ) -> ReplyResult:
-    """Pause the thread for HITL review, stashing N drafted reply variants."""
+    """Pause the thread for HITL review, stashing N drafted reply variants.
+
+    Two-phase: generate suggestions outside any DB transaction, then open a
+    fresh short-lived txn to write the parking state. The detached
+    ``thread`` / ``workspace`` / etc. instances we receive are read-only
+    inputs to the LLM helpers; the actual mutation happens inside the
+    Phase 3 ``session_scope`` after the LLM calls return.
+    """
 
     suggestions_n = int(settings_blob.get("suggestions_count", 3))
     try:
         suggestions = await generate_reply_variants(
-            session=session,
             workspace=workspace,
             campaign=campaign,
             lead=lead,
             thread=thread,
+            history=history,
             n=suggestions_n,
         )
     except Exception:
@@ -575,33 +740,60 @@ async def _park_with_suggestions(
         # manually.
         logger.exception(
             "reply suggestions failed thread=%s — parking without drafts",
-            thread.id,
+            thread_id,
         )
         suggestions = []
 
-    pause_thread_for_hitl(
-        thread,
-        reason=HITL_AWAITING_HUMAN_REPLY,
-        context={
-            "intent": classification.intent,
-            "confidence": classification.confidence,
-            "reason": classification.reason,
-            "incoming_message": incoming.content,
-            "classification_llm_call_id": classification.llm_call_id,
-            "suggestions": suggestions,
-        },
-    )
-    session.flush()
+    with session_scope() as session:
+        live_thread = session.get(Thread, thread_id)
+        if live_thread is None:
+            return ReplyResult(
+                action="ignored",
+                thread_id=thread_id,
+                detail="thread_disappeared",
+            )
+
+        # Race-safety: if another concurrent processor already parked
+        # this thread, leave its parking state alone and just record that
+        # we observed the inbound. Phase 1 already wrote the message.
+        if live_thread.status == ThreadStatus.PAUSED_FOR_HITL:
+            logger.info(
+                "reply skip-park thread=%s already paused (race) reason=%s",
+                thread_id,
+                live_thread.hitl_reason,
+            )
+            return ReplyResult(
+                action="ignored",
+                thread_id=thread_id,
+                intent=classification.intent,
+                confidence=classification.confidence,
+                detail="thread_paused_for_hitl",
+            )
+
+        pause_thread_for_hitl(
+            live_thread,
+            reason=HITL_AWAITING_HUMAN_REPLY,
+            context={
+                "intent": classification.intent,
+                "confidence": classification.confidence,
+                "reason": classification.reason,
+                "incoming_message": incoming.content,
+                "classification_llm_call_id": classification.llm_call_id,
+                "suggestions": suggestions,
+            },
+        )
+        session.flush()
+
     logger.info(
         "reply parked thread=%s reason=%s intent=%s suggestions=%d",
-        thread.id,
+        thread_id,
         HITL_AWAITING_HUMAN_REPLY,
         classification.intent,
         len(suggestions),
     )
     return ReplyResult(
         action="escalated_hitl",
-        thread_id=thread.id,
+        thread_id=thread_id,
         intent=classification.intent,
         confidence=classification.confidence,
         detail=HITL_AWAITING_HUMAN_REPLY,
@@ -613,13 +805,11 @@ async def _park_with_suggestions(
 # ---------------------------------------------------------------------------
 
 
-async def _run_auto_reply(
+async def _run_auto_reply_v2(
     *,
-    session: Session,
     connector: BaseConnector,
     workspace: Workspace,
     campaign: Campaign,
-    campaign_lead: CampaignLead,
     lead: Lead,
     thread: Thread,
     history: list[dict[str, Any]],
@@ -627,8 +817,17 @@ async def _run_auto_reply(
     incoming: IncomingMessage,
     settings_blob: dict[str, Any],
     settings_llm: dict[str, Any],
+    thread_id: str,
+    campaign_lead_id: str,
+    lead_id: str,
 ) -> ReplyResult:
-    """Run the classify → generate → evaluate → send loop inline.
+    """Run the generate → evaluate → send loop with phased session use.
+
+    Phase 2 (this body up through ``connector.send``) does no DB writes
+    — all LLM calls and the SMS dispatch happen with no transaction
+    held. Phase 3 (the ``session_scope`` blocks below) refetches the
+    ORM rows and writes the outbound :class:`Message` and the thread /
+    campaign_lead / lead status updates.
 
     Only used when ``auto_reply_enabled`` is true. Short-circuits to
     HITL on the first of: classifier wanted a human, auto-reply ceiling
@@ -636,6 +835,27 @@ async def _run_auto_reply(
     """
 
     max_auto_replies = int(settings_blob.get("max_auto_replies", 5))
+
+    # ---- Phase 3 helper: pause for HITL with arbitrary context ----
+    def _persist_pause(reason: str, context: dict[str, Any]) -> ReplyResult:
+        with session_scope() as session:
+            live_thread = session.get(Thread, thread_id)
+            if live_thread is None:
+                return ReplyResult(
+                    action="ignored",
+                    thread_id=thread_id,
+                    detail="thread_disappeared",
+                )
+            pause_thread_for_hitl(live_thread, reason=reason, context=context)
+            session.flush()
+        return ReplyResult(
+            action="escalated_hitl",
+            thread_id=thread_id,
+            intent=classification.intent,
+            confidence=classification.confidence,
+            detail=reason,
+        )
+
     if classification.requires_human or thread.auto_reply_count >= max_auto_replies:
         hitl_reason = _hitl_reason_for(
             intent=classification.intent,
@@ -643,30 +863,21 @@ async def _run_auto_reply(
             auto_reply_count=thread.auto_reply_count,
             max_auto_replies=max_auto_replies,
         )
-        pause_thread_for_hitl(
-            thread,
-            reason=hitl_reason,
-            context={
+        logger.warning(
+            "reply escalated thread=%s reason=%s intent=%s confidence=%.2f",
+            thread_id,
+            hitl_reason,
+            classification.intent,
+            classification.confidence,
+        )
+        return _persist_pause(
+            hitl_reason,
+            {
                 "intent": classification.intent,
                 "confidence": classification.confidence,
                 "reason": classification.reason,
                 "incoming_message": incoming.content,
             },
-        )
-        session.flush()
-        logger.warning(
-            "reply escalated thread=%s reason=%s intent=%s confidence=%.2f",
-            thread.id,
-            hitl_reason,
-            classification.intent,
-            classification.confidence,
-        )
-        return ReplyResult(
-            action="escalated_hitl",
-            thread_id=thread.id,
-            intent=classification.intent,
-            confidence=classification.confidence,
-            detail=hitl_reason,
         )
 
     _, eval_threshold, eval_max_attempts = read_loop_settings(workspace)
@@ -684,28 +895,19 @@ async def _run_auto_reply(
     )
 
     if loop_result["status"] != "pass":
-        pause_thread_for_hitl(
-            thread,
-            reason="reply_eval_failed",
-            context=hitl_context_from_loop_failure(
+        logger.warning(
+            "reply escalated thread=%s reason=reply_eval_failed attempts=%d",
+            thread_id,
+            loop_result["attempts"],
+        )
+        return _persist_pause(
+            "reply_eval_failed",
+            hitl_context_from_loop_failure(
                 loop_result,
                 intent=classification.intent,
                 confidence=classification.confidence,
                 incoming_message=incoming.content,
             ),
-        )
-        session.flush()
-        logger.warning(
-            "reply escalated thread=%s reason=reply_eval_failed attempts=%d",
-            thread.id,
-            loop_result["attempts"],
-        )
-        return ReplyResult(
-            action="escalated_hitl",
-            thread_id=thread.id,
-            intent=classification.intent,
-            confidence=classification.confidence,
-            detail="reply_eval_failed",
         )
 
     draft = loop_result["draft"]
@@ -714,10 +916,12 @@ async def _run_auto_reply(
         OutgoingMessage(contact_uri=lead.contact_uri, content=draft)
     )
     if not send_result.success:
-        pause_thread_for_hitl(
-            thread,
-            reason="connector_send_failed",
-            context=hitl_context_from_send_failure(
+        logger.error(
+            "reply send failed thread=%s error=%s", thread_id, send_result.error
+        )
+        return _persist_pause(
+            "connector_send_failed",
+            hitl_context_from_send_failure(
                 draft=draft,
                 send_result=send_result,
                 loop_result=loop_result,
@@ -726,45 +930,46 @@ async def _run_auto_reply(
                 incoming_message=incoming.content,
             ),
         )
-        session.flush()
-        logger.error(
-            "reply send failed thread=%s error=%s", thread.id, send_result.error
-        )
-        return ReplyResult(
-            action="escalated_hitl",
-            thread_id=thread.id,
-            intent=classification.intent,
-            confidence=classification.confidence,
-            detail="connector_send_failed",
-        )
 
-    session.add(
-        Message(
-            thread_id=thread.id,
-            role=MessageRole.AI,
-            content=draft,
-            metadata_=build_send_metadata(
-                loop_result=loop_result,
-                settings_llm=settings_llm,
-                send_result=send_result,
-                intent=classification.intent,
-                confidence=classification.confidence,
-                classification_model=settings_llm.get(
-                    "model_classification", settings_llm["model_main"]
+    # ---- Phase 3: persist the successful outbound + status flips ----
+    with session_scope() as session:
+        live_thread = session.get(Thread, thread_id)
+        live_cl = session.get(CampaignLead, campaign_lead_id)
+        live_lead = session.get(Lead, lead_id)
+        if live_thread is None or live_cl is None or live_lead is None:
+            return ReplyResult(
+                action="ignored",
+                thread_id=thread_id,
+                detail="thread_disappeared",
+            )
+
+        session.add(
+            Message(
+                thread_id=thread_id,
+                role=MessageRole.AI,
+                content=draft,
+                metadata_=build_send_metadata(
+                    loop_result=loop_result,
+                    settings_llm=settings_llm,
+                    send_result=send_result,
+                    intent=classification.intent,
+                    confidence=classification.confidence,
+                    classification_model=settings_llm.get(
+                        "model_classification", settings_llm["model_main"]
+                    ),
+                    classification_llm_call_id=classification.llm_call_id,
                 ),
-                classification_llm_call_id=classification.llm_call_id,
-            ),
+            )
         )
-    )
-    thread.auto_reply_count += 1
-    thread.status = ThreadStatus.ACTIVE
-    campaign_lead.status = CampaignLeadStatus.REPLIED
-    lead.status = LeadStatus.REPLIED
+        live_thread.auto_reply_count += 1
+        live_thread.status = ThreadStatus.ACTIVE
+        live_cl.status = CampaignLeadStatus.REPLIED
+        live_lead.status = LeadStatus.REPLIED
+        session.flush()
 
-    session.flush()
     logger.info(
         "reply sent thread=%s intent=%s confidence=%.2f score=%.3f chars=%d",
-        thread.id,
+        thread_id,
         classification.intent,
         classification.confidence,
         loop_result["overall"],
@@ -772,7 +977,7 @@ async def _run_auto_reply(
     )
     return ReplyResult(
         action="sent",
-        thread_id=thread.id,
+        thread_id=thread_id,
         intent=classification.intent,
         confidence=classification.confidence,
     )

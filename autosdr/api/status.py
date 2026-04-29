@@ -24,7 +24,7 @@ from autosdr.models import (
     CampaignStatus,
     Workspace,
 )
-from autosdr.quota import count_ai_messages_last_24h_bulk
+from autosdr.quota import count_outreach_contacts_last_24h_bulk
 
 router = APIRouter(prefix="/api/status", tags=["status"])
 
@@ -64,7 +64,7 @@ def get_status() -> SystemStatusOut:
                 .filter(Campaign.status == CampaignStatus.ACTIVE)
                 .all()
             )
-            sent_24h_by_campaign = count_ai_messages_last_24h_bulk(
+            sent_24h_by_campaign = count_outreach_contacts_last_24h_bulk(
                 session, [c.id for c in active_campaigns]
             )
             for campaign in active_campaigns:
@@ -87,7 +87,7 @@ def get_status() -> SystemStatusOut:
             calls_today=int(usage.get("total_calls", 0)),
             tokens_in_today=int(usage.get("total_tokens_in", 0)),
             tokens_out_today=int(usage.get("total_tokens_out", 0)),
-            estimated_cost_today_usd=0.0,
+            estimated_cost_today_usd=float(usage.get("total_cost_usd", 0.0)),
         )
 
     return SystemStatusOut(

@@ -30,11 +30,11 @@ file-backed connector for dev.
 6. Persists every LLM call — prompts, response, tokens, latency, error — to
    the `llm_call` table and `data/logs/llm-YYYYMMDD.jsonl`, so you can audit
    and iterate on prompts after the fact.
-7. Honours a kill switch: pause from the UI, the CLI, or a flag file.
+7. Honours a kill switch: pause from the UI or a pause flag file (`PAUSE_FLAG_PATH`).
 
 Configuration lives in the database (`workspace.settings`), not in `.env`.
 The only environment variables the server reads are pure infrastructure:
-`DATABASE_URL`, `HOST`, `PORT`, `PAUSE_FLAG_PATH`. Everything else — LLM keys,
+`DATABASE_URL`, `HOST`, `PORT`, `PAUSE_FLAG_PATH`, `LOG_DIR`. Everything else — LLM keys,
 model slugs, connector credentials, scheduler intervals, evaluator thresholds,
 rehearsal mode — is set from the Settings page and hot-reloaded at runtime.
 
@@ -50,7 +50,8 @@ rehearsal mode — is set from the Settings page and hot-reloaded at runtime.
   [SMSGate](https://sms-gate.app). No tunnel / public URL — the scheduler
   polls the gateway's REST API.
 - For local testing: nothing extra. The file connector writes outbound SMS
-  to `data/outbox.jsonl` and lets you simulate inbound replies from the CLI.
+  to `data/outbox.jsonl`; use **Settings → Connector → Simulate inbound**
+  (after saving `connector.type=file`) to drive the reply pipeline.
 
 ---
 
@@ -62,7 +63,7 @@ git clone <this-repo> && cd AutoSDR
 cd frontend && npm install && npm run build && cd ..
 uv sync                          # or: pip install -e '.[dev]'
 
-uv run autosdr run               # defaults to http://localhost:8000
+uv run uvicorn autosdr.webhook:app --host 127.0.0.1 --port 8000
 ```
 
 Open <http://localhost:8000>. The app lands on `/setup` because no workspace
@@ -93,12 +94,9 @@ product is designed around keeping a human on every reply.
 
 ## Simulating a reply (file connector)
 
-With the file connector active, there's no real SMS going out. To exercise
-the reply pipeline:
-
-```bash
-uv run autosdr sim inbound --from "+61400000001" --content "tell me more"
-```
+With the file connector active (saved in **Settings**), there's no real SMS going out. To exercise
+the reply pipeline, open **Settings → Connector** and use **Simulate inbound** after saving
+connector type **File**, or call `POST /api/dev/sim-inbound` with `{ "contact_uri": "+614…", "content": "…" }`.
 
 AutoSDR classifies the intent, generates candidate drafts, parks the thread
 as "Needs you", and the UI's Inbox will surface it within a few seconds.
@@ -111,10 +109,10 @@ Three ways to halt everything immediately:
 
 | I want to…                          | Do this                               |
 | ----------------------------------- | ------------------------------------- |
-| Pause without stopping the process  | **Pause** button (top-right of the UI) or `autosdr pause` |
-| Resume                              | **Resume** button or `autosdr resume` |
-| Stop the process                    | `Ctrl+C` in the `autosdr run` terminal |
-| Check state                         | `autosdr status`                      |
+| Pause without stopping the process  | **Pause** button (top-right of the UI), or `POST /api/status/pause` |
+| Resume                              | **Resume** button, or `POST /api/status/resume` |
+| Stop the process                    | `Ctrl+C` in the uvicorn / `./scripts/dev.sh` terminal |
+| Check state                         | **Dashboard** pill, or `GET /api/status` / `GET /healthz` |
 
 Pause is checked before every LLM call, every connector send, and on every
 scheduler tick. Inbound webhooks still return 202 so gateways don't retry;
@@ -124,16 +122,14 @@ processing is skipped silently.
 
 ## Reviewing the AI loop
 
-Every LLM call is persisted. There are three ways to look at them:
+Every LLM call is persisted. There are two principal ways to look at them:
 
 - **UI** — the **Logs** route is a filterable table of every analysis,
   generation, evaluation and classification call. Deep-links from a thread
   show just that thread's calls.
-- **CLI** — `autosdr logs llm` (compact table) or
-  `autosdr logs llm --purpose generation --tail 5 --show-prompts` for
-  full system/user/response.
 - **Disk** — `data/logs/llm-YYYYMMDD.jsonl` (grep / jq -friendly) and the
-  rotating `data/logs/autosdr.log` which captures scheduler + pipeline INFO.
+  rotating `data/logs/autosdr.log` which captures scheduler + pipeline INFO from
+  uvicorn.
 
 ---
 
@@ -163,8 +159,7 @@ autosdr/
     reply.py        # classify → close / park / (if auto-reply on) respond
     suggestions.py  # generate_reply_variants(n=2-3) for the HITL card
   scheduler.py      # outreach tick + inbound poller; rolling-24h quota
-  webhook.py        # FastAPI app: mounts routers + serves frontend/dist
-  cli.py            # typer CLI (import / logs / sim / run / pause / resume / status)
+  webhook.py        # FastAPI app: mounts routers + serves frontend/dist + logging
 
 frontend/           # React 19 + Vite 8 + Tailwind v4 operator console
 tests/              # pytest suite; LLM calls are mocked
@@ -215,7 +210,7 @@ One process, one port. On the server:
 git pull
 cd frontend && npm install && npm run build && cd ..
 uv sync
-DATABASE_URL=sqlite:///data/autosdr.db HOST=0.0.0.0 PORT=8000 uv run autosdr run
+DATABASE_URL=sqlite:///data/autosdr.db HOST=0.0.0.0 PORT=8000 uv run uvicorn autosdr.webhook:app
 ```
 
 Put it behind nginx / Caddy / Tailscale as you prefer. There's no built-in

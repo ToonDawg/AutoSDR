@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 _MAX_DELAY_S = 600.0
 DEFAULT_FOLLOWUP_TEMPLATE = (
     "or more generally, if you have any issues with your website or need any help, "
-    "I can solve that for you. Cheers, Jaclyn"
+    "I can solve that for you. Cheers, Tunoa"
 )
 
 

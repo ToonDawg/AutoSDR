@@ -123,6 +123,17 @@ export interface WorkspaceSettings {
   max_batch_per_tick: number;
   inbound_poll_s: number;
 
+  // Working-hours pacing window applied to scheduler outreach sends.
+  // Replies, manual kickoff, and the follow-up beat are unaffected.
+  // Per-campaign override on ``Campaign.outreach_window``.
+  outreach_window: OutreachWindowConfig;
+
+  // Lead-website enrichment. Run inline at outreach-time before the
+  // analysis LLM call. Off-by-default at the schema level is wrong —
+  // the polite path (enabled, robots-respecting) is the default. See
+  // ``autosdr/api/schemas.py::EnrichmentConfig`` and ticket 0011.
+  enrichment: EnrichmentConfig;
+
   llm: {
     provider_api_keys: {
       gemini?: string | null;
@@ -205,6 +216,31 @@ export interface LeadList {
   counts_by_status: Record<string, number>;
 }
 
+/** ``POST /api/leads/enrich`` — warm-up enrichment cache. */
+export interface LeadEnrichCandidate {
+  lead_id: UUID;
+  name: string | null;
+  website: string | null;
+  last_fetched: string | null;
+}
+
+export type LeadEnrichResult = {
+  ok: number;
+  failed: number;
+  total: number;
+  dry_run: boolean;
+  candidates: LeadEnrichCandidate[] | null;
+};
+
+/** ``POST /api/dev/sim-inbound`` (file connector rehearsal). */
+export interface DevSimInboundResult {
+  action: string;
+  thread_id: string | null;
+  intent: string | null;
+  confidence: number | null;
+  detail: string | null;
+}
+
 /**
  * Per-campaign follow-up beat. When ``enabled``, a literal-template
  * second message is fired ``delay_s ± delay_jitter_s`` seconds after the
@@ -225,6 +261,203 @@ export interface FollowupConfig {
   delay_jitter_s: number;
 }
 
+/**
+ * Working-hours window the scheduler paces outreach across. ``start_hour``
+ * is inclusive, ``end_hour`` is exclusive — ``8..17`` means
+ * ``[08:00, 17:00)`` in server-local time. ``enabled=false`` is the
+ * escape hatch (no time gating). Replies, manual kickoff, and the
+ * follow-up beat are unaffected.
+ *
+ * Mirrors ``autosdr/api/schemas.py::OutreachWindowConfig``.
+ */
+export interface OutreachWindowConfig {
+  enabled: boolean;
+  start_hour: number;
+  end_hour: number;
+}
+
+/**
+ * Per-workspace knobs for the lead-website enrichment fetcher. See
+ * ``autosdr/api/schemas.py::EnrichmentConfig`` and ticket 0011.
+ *
+ * - ``enabled``: master switch. Off → outreach skips the fetch and
+ *   records ``enrichment_status: "disabled"`` on the analysis row.
+ * - ``budget_s``: total wall-clock budget per lead (1–15 s). The
+ *   fetcher caps each request at 1.5 s and stops after the budget,
+ *   so a hung site can never block the scheduler tick.
+ * - ``cache_ttl_days``: re-run outreach inside this window does NOT
+ *   re-fetch — the cached envelope is reused. ``0`` disables caching.
+ * - ``respect_robots``: polite-default true. Operator can flip it
+ *   for an aggressive scrape but the default is the polite path.
+ */
+export interface EnrichmentConfig {
+  enabled: boolean;
+  budget_s: number;
+  cache_ttl_days: number;
+  respect_robots: boolean;
+}
+
+/**
+ * Closed vocabulary for the per-lead enrichment outcome — mirrors
+ * ``autosdr/enrichment.py::EnrichmentStatus`` plus the pipeline-only
+ * ``"disabled"`` variant produced when the workspace toggle is off.
+ *
+ * The frontend uses this in two places:
+ * 1. The Lead-detail enrichment card renders a status badge.
+ * 2. The angle-funnel ``?enrichment=`` segmented control filters
+ *    threads by whether their first AI message carried ``"ok"``.
+ */
+export type EnrichmentStatus =
+  | 'ok'
+  | 'no_url'
+  | 'timeout'
+  | 'blocked'
+  | 'empty_shell'
+  | 'not_found'
+  | 'error'
+  | 'killswitch_aborted'
+  | 'disabled';
+
+/**
+ * Versioned envelope persisted under ``Lead.raw_data.enrichment``.
+ * Kept loose-typed on ``signals`` because the parser may grow new
+ * fields ahead of the frontend; the LeadDetail card reads only the
+ * fields it knows about and falls back to "—" for the rest.
+ *
+ * ``connector`` / ``connector_version`` are present on envelopes
+ * written by ``ENVELOPE_VERSION >= 2``. Older v1 blobs (none on
+ * fresh installs) won't carry them; the worker treats those as stale
+ * and re-scans automatically.
+ */
+export interface LeadEnrichment {
+  _meta: {
+    version: number;
+    status: EnrichmentStatus;
+    fetched_at: ISODate;
+    final_url?: string;
+    http_status?: number;
+    latency_ms?: number;
+    user_agent?: string;
+    robots_respected?: boolean;
+    connector?: string;
+    connector_version?: string;
+  };
+  signals: {
+    title?: string;
+    meta_description?: string;
+    h1?: string;
+    cms?: string;
+    cms_evidence?: string;
+    viewport_present?: boolean;
+    is_https?: boolean;
+    og_image_present?: boolean;
+    favicon_present?: boolean;
+    sitemap_count?: number;
+    sitemap_last_modified?: string;
+    robots_present?: boolean;
+    external_links_to_socials?: string[];
+    [key: string]: unknown;
+  };
+}
+
+export type ScanStatus = EnrichmentStatus | 'never_scanned' | 'disabled';
+
+/**
+ * One row of the ``/scans`` index page. Mirrors
+ * ``autosdr.api.schemas.ScanRowOut``.
+ *
+ * Lean by design: the table only shows status/cms/sitemap/latency.
+ * Audit-detail fields like ``http_status`` / ``final_url`` /
+ * ``connector`` live on ``ScanDetail`` (the per-lead detail route),
+ * which still exposes the full envelope.
+ */
+export interface ScanRow {
+  lead_id: UUID;
+  lead_name: string | null;
+  website: string | null;
+  status: ScanStatus;
+  fetched_at: ISODate | null;
+  latency_ms: number | null;
+  cms: string | null;
+  sitemap_count: number | null;
+}
+
+/**
+ * Paginated response for ``GET /api/scans``.
+ *
+ * ``counts_by_status`` carries every ``ScanStatus`` bucket the worker
+ * can produce plus the synthetic ``never_scanned`` bucket so the
+ * filter chips have honest tallies on first paint.
+ */
+export interface ScanList {
+  scans: ScanRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  counts_by_status: Record<string, number>;
+}
+
+/** Header strip on the Scans page. Mirrors ``ScanSummaryOut``. */
+export interface ScanSummary {
+  total_leads: number;
+  ok: number;
+  blocked: number;
+  timeout: number;
+  error: number;
+  not_found: number;
+  empty_shell: number;
+  no_url: number;
+  never_scanned: number;
+  last_run_at: ISODate | null;
+
+  runner_running: boolean;
+  runner_total: number;
+  runner_done: number;
+  runner_ok: number;
+  runner_failed: number;
+  runner_started_at: ISODate | null;
+}
+
+/** Body of ``POST /api/scans/run``. */
+export interface ScanRunRequest {
+  /** When set, scan that lead synchronously (detail \"Re-scan now\"). */
+  lead_id?: UUID;
+  /** Starts (true) or stops (false) the batch scan runner. */
+  enabled?: boolean;
+}
+
+/** Result of ``POST /api/scans/run`` — mirrors summary plus optional one-off sync fields. */
+export interface ScanRunResult extends ScanSummary {
+  started?: boolean | null;
+  lead_id?: UUID | null;
+  status?: EnrichmentStatus | string | null;
+}
+
+/**
+ * Full envelope + lead summary for ``GET /api/scans/{lead_id}``.
+ * ``enrichment`` is the same versioned blob the LeadDetail card
+ * reads, exposed verbatim so the operator can audit what we
+ * captured (including the raw ``_meta`` block).
+ */
+export interface ScanDetail {
+  lead_id: UUID;
+  lead_name: string | null;
+  website: string | null;
+  status: ScanStatus;
+  enrichment: LeadEnrichment | null;
+}
+
+/**
+ * One field per ``CampaignLeadStatus`` bucket. Each is a precise count
+ * — they don't roll up and don't double-count, so summing all eight
+ * equals ``lead_count``. Frontend rollups (e.g. "leads we ever
+ * messaged" = ``contacted_count + replied_count + won_count + lost_count``)
+ * are computed at the call site, not on the server.
+ *
+ * Mirrors ``autosdr/api/schemas.py::CampaignOut`` — see ticket 0003 for
+ * the rationale on replacing the previous rolled-up
+ * ``contacted_count`` / ``replied_count`` semantics.
+ */
 export interface Campaign {
   id: UUID;
   name: string;
@@ -233,12 +466,21 @@ export interface Campaign {
   connector_type: string;
   status: CampaignStatusT;
   followup: FollowupConfig;
+  /** Per-campaign override; ``null`` = inherit the workspace default. */
+  outreach_window: OutreachWindowConfig | null;
+  /** Resolved window the scheduler will actually use (override if set, otherwise workspace default). */
+  effective_outreach_window: OutreachWindowConfig;
   quota_reset_at: ISODate | null;
   created_at: ISODate;
   lead_count: number;
+  queued_count: number;
+  sending_count: number;
+  paused_for_hitl_count: number;
   contacted_count: number;
   replied_count: number;
   won_count: number;
+  lost_count: number;
+  skipped_count: number;
   sent_24h: number;
 }
 
@@ -258,6 +500,36 @@ export interface CampaignKickoffResult {
   failed: number;
   remaining_queued: number;
   campaign: Campaign;
+}
+
+/**
+ * One day of the per-campaign funnel — UTC ``YYYY-MM-DD`` and four
+ * independent counters. ``replied`` is the number of threads whose
+ * **first ever** lead reply landed on that day, so a chatty lead
+ * replying twice on Tuesday is still one ``replied``. ``won`` /
+ * ``lost`` use the terminal ``Thread.status`` and its ``updated_at``,
+ * so a thread that closes the same day it replied is counted in both
+ * ``replied`` and ``won`` / ``lost``.
+ *
+ * Mirrors ``autosdr/api/schemas.py::CampaignTimeseriesBucket``.
+ */
+export interface CampaignTimeseriesBucket {
+  date: string;
+  sent: number;
+  replied: number;
+  won: number;
+  lost: number;
+}
+
+/**
+ * Response for ``GET /api/campaigns/{id}/timeseries``. Always
+ * ``days`` rows, oldest first, padded with zero rows for days with no
+ * activity so the chart can render a stable window even on a fresh
+ * campaign.
+ */
+export interface CampaignTimeseries {
+  days: number;
+  buckets: CampaignTimeseriesBucket[];
 }
 
 /**
@@ -289,14 +561,17 @@ export interface EvalResult {
  */
 export interface Suggestion {
   draft: string;
-  overall: number;
+  /** ``null`` for follow-up suggestions that didn't run through the eval loop. */
+  overall: number | null;
   scores?: EvalScores | null;
   feedback?: string | null;
-  pass?: boolean;
+  pass?: boolean | null;
   attempts?: number;
   temperature?: number | null;
   gen_llm_call_id?: string | null;
   eval_llm_call_id?: string | null;
+  /** "outreach" = first-touch audit flow, "followup" = thread-aware single-call flow. */
+  source?: 'outreach' | 'followup';
 }
 
 export interface DraftAttempt {
@@ -397,6 +672,60 @@ export interface LlmCall {
   tokens_out: number;
   latency_ms: number;
   error: string | null;
+  /**
+   * Estimated USD cost computed from the row's
+   * ``model``/``tokens_in``/``tokens_out`` against
+   * ``autosdr/llm/pricing.py``. ``null`` for models we don't have a
+   * rate card for — render as ``—`` rather than ``$0.00`` to avoid
+   * lying. See ticket 0006.
+   */
+  cost_usd: number | null;
+}
+
+/**
+ * All-time aggregate response for ``GET /api/llm-calls/summary``.
+ *
+ * ``total_cost_usd`` is summed server-side across *every* LlmCall row
+ * (filtered by the same params the list endpoint accepts), so it
+ * stays accurate past the list endpoint's 500-row cap. ``unpriced_calls``
+ * counts rows we couldn't price — those contribute $0 to the total, so
+ * the UI should show "≥ $X" with a tooltip when this is non-zero.
+ */
+export interface LlmCallsSummary {
+  total_calls: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  total_cost_usd: number;
+  unpriced_calls: number;
+}
+
+/**
+ * One named blend the operator can apply with a single click in the
+ * Settings → LLM card. Mirrors
+ * ``autosdr/api/schemas.py::LlmPresetOut``.
+ */
+export interface LlmPreset {
+  id: string;
+  label: string;
+  description: string;
+  models: {
+    model_main: string;
+    model_analysis: string;
+    model_eval: string;
+    model_classification: string;
+  };
+}
+
+/**
+ * Response for ``GET /api/llm/presets``.
+ *
+ * ``pricing_verified_at`` is the snapshot date of the backend's
+ * pricing table — surface alongside the buttons so operators know
+ * how stale the cost numbers are.
+ */
+export interface LlmPresetCatalog {
+  pricing_verified_at: string;
+  presets: LlmPreset[];
 }
 
 export interface SystemStatus {
@@ -424,6 +753,37 @@ export interface SystemStatus {
   };
 }
 
+/**
+ * Canonical core fields a source column can map onto. Mirrors
+ * ``autosdr.api.schemas._CORE_FIELD_NAMES`` and the literal-tuple
+ * ``autosdr.importer._CORE_FIELDS``. If a new core field lands on
+ * the wire, this union must move with it.
+ */
+export type CoreFieldName = 'name' | 'category' | 'address' | 'website' | 'phone';
+
+/**
+ * Per-column suggestion-engine output surfaced in the preview. Used
+ * by the LeadsImport mapping table so the operator can see what the
+ * server *would* do and override before commit. Mirrors
+ * ``autosdr.api.schemas.ImportPreviewColumn``.
+ *
+ * - ``suggested_target`` is one of the core field names, ``"raw_only"``
+ *   (server saw the column but won't promote it), or ``null`` (no
+ *   confident pick — the operator decides).
+ * - ``suggestion_confidence`` is the tiered score from
+ *   ``autosdr.importer._suggest_column_target`` — ``"high"`` is an
+ *   exact / alias / strong-heuristic match, ``"medium"`` is a fuzzy
+ *   or substring lean, ``"low"`` is a weak signal, ``"none"`` is no
+ *   suggestion at all.
+ */
+export interface ImportPreviewColumn {
+  name: string;
+  sample_values: unknown[];
+  suggested_target: CoreFieldName | 'raw_only' | null;
+  suggestion_confidence: 'high' | 'medium' | 'low' | 'none';
+  suggestion_reason: string;
+}
+
 export interface ImportPreview {
   filename: string;
   file_type: 'csv' | 'json' | 'ndjson' | string;
@@ -440,6 +800,30 @@ export interface ImportPreview {
     contact_type: ContactTypeT | string;
     skip_reason: string | null;
   }[];
+  columns: ImportPreviewColumn[];
+}
+
+/**
+ * Operator-supplied override sent to ``/api/leads/import/preview`` and
+ * ``/api/leads/import/commit`` as a JSON-encoded string in the
+ * ``mapping_config`` multipart form field.
+ *
+ * Mirrors ``autosdr.api.schemas.MappingConfigIn`` — strict on the
+ * server (``extra=forbid``), so typos like ``drop_form_raw`` will 422.
+ *
+ * - ``mapping`` is canonical → source column. Empty entries (drop the
+ *   suggestion entirely) are omitted from this object before
+ *   serialising.
+ * - ``drop_from_raw`` is **commit-only**: it filters incoming
+ *   ``raw_data`` on this import only. It does **not** retroactively
+ *   prune existing rows.
+ * - ``include_in_raw_only`` keeps a source column in ``raw_data``
+ *   even when its name would alias-match a core field.
+ */
+export interface MappingConfig {
+  mapping: Partial<Record<CoreFieldName, string>>;
+  drop_from_raw: string[];
+  include_in_raw_only: string[];
 }
 
 export interface ImportCommit {
@@ -480,6 +864,49 @@ export interface SetupPayload {
 export interface SendsByDay {
   date: string;
   count: number;
+}
+
+/**
+ * One row of the angle-funnel aggregation. Mirrors
+ * ``autosdr/api/schemas.py::AngleFunnelRow``.
+ *
+ * ``angle`` is the discrete bucket from ``Thread.angle_type`` — one of
+ * the seven values the analysis prompt emits, plus ``"unknown"`` for
+ * legacy threads written before that column existed.
+ *
+ * ``replied`` counts threads with at least one ``role=lead`` message
+ * (the more honest signal than ``CampaignLead.status``, which can lag).
+ * ``won`` / ``lost`` reflect the terminal ``Thread.status`` and are
+ * independent of ``replied`` (a thread can be both replied AND won).
+ */
+export interface AngleFunnelRow {
+  angle: string;
+  threads: number;
+  replied: number;
+  won: number;
+  lost: number;
+}
+
+/**
+ * Stratifier for ``GET /api/stats/angle-funnel?enrichment=``. ``"all"``
+ * is the default and matches every thread. ``"enriched"`` keeps only
+ * threads whose first AI message has ``metadata.analysis.enrichment_status
+ * == "ok"``; ``"unenriched"`` is the strict complement (timeouts,
+ * blocked, no_url, disabled, AND legacy threads written before the
+ * column existed).
+ */
+export type EnrichmentFilter = 'all' | 'enriched' | 'unenriched';
+
+export interface AngleFunnel {
+  /** ISO 8601 string. ``null`` when scope is a campaign and no override
+   *  was supplied — implies "campaign lifetime". */
+  since: ISODate | null;
+  /** Echoed back when the request was campaign-scoped, otherwise null. */
+  campaign_id: UUID | null;
+  /** Resolved value of the ``?enrichment=`` filter — defaults to ``"all"``. */
+  enrichment: EnrichmentFilter;
+  /** Per-bucket counts, server-sorted by ``threads`` descending. */
+  rows: AngleFunnelRow[];
 }
 
 /**

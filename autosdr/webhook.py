@@ -10,6 +10,9 @@ Async tasks inside the app lifespan:
 2. ``run_inbound_poller`` — TextBee / file connector poll for inbound SMS.
 3. ``watch_flag_file`` — notices the pause flag appearing / disappearing.
 
+Lead-website enrichment runs only when the operator starts a batch from
+``POST /api/scans/run`` (or the Scans page); nothing crawls on boot.
+
 Startup order matters: we hot-apply the workspace's LLM provider keys into
 ``os.environ`` *before* the scheduler fires so the first outreach tick has
 valid credentials without needing a restart.
@@ -20,9 +23,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -39,6 +44,53 @@ from autosdr.db import create_all, session_scope
 from autosdr.llm import apply_llm_provider_keys, get_usage_snapshot
 from autosdr.models import Workspace
 from autosdr.scheduler import run_inbound_poller, run_scheduler
+
+# Make the scheduler/poller/reply pipeline visible by default.
+#
+# Uvicorn only configures its own loggers (``uvicorn`` / ``uvicorn.error`` /
+# ``uvicorn.access``); third-party loggers default to root WARNING, which
+# silently swallows the INFO logs that say things like "inbound poller
+# started", "smsgate polled N new", or "inbound received from=…". For an
+# operator-facing daemon those messages ARE the audit trail — so we wire up a
+# minimal stream handler with format-on-stderr and bump ``autosdr.*`` to INFO.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+logging.getLogger("autosdr").setLevel(logging.INFO)
+
+
+def _ensure_rotating_file_log() -> None:
+    """Mirror console logs to ``<log_dir>/autosdr.log`` (same as the old CLI)."""
+
+    root = logging.getLogger()
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        log_dir = get_settings().log_dir
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = (log_dir / "autosdr.log").resolve()
+        for h in root.handlers:
+            if isinstance(h, RotatingFileHandler):
+                base = getattr(h, "baseFilename", None)
+                if base is not None and Path(str(base)).resolve() == log_path:
+                    return
+
+        file_handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=5_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except Exception:
+        root.warning(
+            "failed to attach rotating file log handler", exc_info=True
+        )
+
+
+_ensure_rotating_file_log()
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +156,12 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
     pipeline directly without the scheduler or poller running.
     """
 
+    async def _defer_background_start(coro_factory):
+        """Let uvicorn finish startup before background workers do I/O."""
+
+        await asyncio.sleep(0.1)
+        await coro_factory()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         scheduler_task: asyncio.Task | None = None
@@ -122,6 +180,38 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
         except Exception:
             logger.exception("failed to initialise db schema on boot")
             raise
+
+        # Workspace-scoped enrichment HTTP client. One pool, shared
+        # across every outreach tick + the scan fan-out — connection
+        # re-use is the only reason this lives at the workspace
+        # level. The fetcher itself owns per-request timeouts and
+        # the total budget; we keep the client construction here so
+        # the lifespan owns its disposal. See ticket 0011 and
+        # ``autosdr.enrichment``.
+        #
+        # Pool sizing rule of thumb: each in-flight scan does up to
+        # 3 sequential HTTP requests (robots, root, sitemap), so
+        # peak concurrent outbound connections track the scan
+        # ``SCAN_CONCURRENCY`` setting almost 1:1. We size the pool
+        # at ~4× that to leave breathing room for the scheduler's
+        # outreach-time enrichment without ever queueing inside
+        # httpx (queueing eats into the per-lead 4s budget and
+        # produces ``status=timeout`` for free).
+        scan_conc = max(1, int(get_settings().scan_concurrency))
+        max_conn = max(64, scan_conc * 4)
+        max_keep = max(32, scan_conc * 2)
+        app.state.enrichment_http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_keepalive_connections=max_keep,
+                max_connections=max_conn,
+            ),
+        )
+        logger.info(
+            "enrichment http client: max_connections=%d max_keepalive=%d (scan_concurrency=%d)",
+            max_conn,
+            max_keep,
+            scan_conc,
+        )
 
         # Apply LLM provider keys from settings into os.environ before any
         # scheduler tick runs — LiteLLM reads them at call time.
@@ -149,10 +239,17 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
 
         if run_scheduler_task and app.state.connector is not None:
             scheduler_task = asyncio.create_task(
-                run_scheduler(app.state.connector), name="autosdr.scheduler"
+                _defer_background_start(
+                    lambda: run_scheduler(
+                        app.state.connector,
+                        enrichment_http_client=app.state.enrichment_http_client,
+                    )
+                ),
+                name="autosdr.scheduler",
             )
             poller_task = asyncio.create_task(
-                run_inbound_poller(app.state.connector), name="autosdr.inbound_poller"
+                _defer_background_start(lambda: run_inbound_poller(app.state.connector)),
+                name="autosdr.inbound_poller",
             )
         flag_watcher = asyncio.create_task(
             killswitch.watch_flag_file(), name="autosdr.flag_watcher"
@@ -171,6 +268,10 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
                     await task
                 except (asyncio.CancelledError, Exception):  # pragma: no cover
                     pass
+            try:
+                await app.state.enrichment_http_client.aclose()
+            except Exception:  # pragma: no cover - shutdown best-effort
+                logger.exception("failed to close enrichment http client")
 
     app = FastAPI(title="AutoSDR", lifespan=lifespan)
     install_exception_handlers(app)

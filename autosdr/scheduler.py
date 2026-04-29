@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
+import httpx
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
@@ -37,8 +39,13 @@ from autosdr.models import (
     Lead,
     Workspace,
 )
+from autosdr.pacing import (
+    count_sends_in_today_window,
+    resolve_window,
+    window_allowance,
+)
 from autosdr.pipeline import process_incoming_message, run_outreach_for_campaign_lead
-from autosdr.quota import count_ai_messages_last_24h
+from autosdr.quota import count_outreach_contacts_last_24h
 from autosdr.workspace_settings import load_workspace_settings_or_empty
 
 logger = logging.getLogger(__name__)
@@ -51,6 +58,11 @@ class OutreachBatchSummary:
     sent: int = 0
     failed: int = 0
     capped_by_quota: bool = False
+    # Distinct from ``capped_by_quota`` so the operator-facing "why
+    # didn't this campaign send?" surfaces ("daily cap hit" vs "outside
+    # business hours / paced for later in the day") can stay
+    # honest. Both can be true on the same tick.
+    capped_by_window: bool = False
 
 
 def _next_queued_leads(
@@ -105,11 +117,19 @@ async def run_campaign_outreach_batch(
     respect_quota: bool,
     min_delay_s: int = 0,
     prior_success_count: int = 0,
+    now_local: datetime | None = None,
+    enrichment_http_client: httpx.AsyncClient | None = None,
 ) -> OutreachBatchSummary:
     """Send up to ``max_count`` queued leads for one campaign.
 
     The scheduler uses ``respect_quota=True``; manual operator kick-offs use
     ``False`` so they can intentionally spend beyond the rolling cap.
+    ``respect_quota`` also gates the working-hours window — kickoff bypasses
+    both because the operator pressed the button on purpose.
+
+    ``now_local`` is injectable so tests can drive the window logic at a
+    deterministic clock; production callers leave it ``None`` and we read
+    the system clock with the OS timezone.
     """
 
     requested = max(0, int(max_count))
@@ -119,15 +139,48 @@ async def run_campaign_outreach_batch(
 
     batch_limit = requested
     if respect_quota:
-        sent_last_24h = count_ai_messages_last_24h(session, campaign.id)
-        remaining = max(0, campaign.outreach_per_day - sent_last_24h)
-        batch_limit = min(batch_limit, remaining)
-        summary.capped_by_quota = batch_limit < requested
+        sent_last_24h = count_outreach_contacts_last_24h(session, campaign.id)
+        remaining_quota = max(0, campaign.outreach_per_day - sent_last_24h)
+        if remaining_quota < batch_limit:
+            summary.capped_by_quota = True
+            batch_limit = remaining_quota
         if batch_limit == 0:
             logger.debug(
                 "campaign %s at daily cap (%d sent in last 24h)",
                 campaign.name,
                 sent_last_24h,
+            )
+            return summary
+
+        # Working-hours window pacing — stacks under the 24h cap. ``None``
+        # local clock means "use the OS clock with its current tz"; tests
+        # inject a fixed datetime to keep the gate deterministic.
+        clock = now_local or datetime.now().astimezone()
+        window = resolve_window(
+            campaign_window=campaign.outreach_window,
+            workspace_settings=workspace.settings,
+        )
+        sent_in_window = count_sends_in_today_window(
+            session, campaign.id, window=window, now_local=clock
+        )
+        pacing_allowance = window_allowance(
+            window=window,
+            daily_quota=campaign.outreach_per_day,
+            sent_in_window=sent_in_window,
+            now_local=clock,
+        )
+        if pacing_allowance < batch_limit:
+            summary.capped_by_window = True
+            batch_limit = pacing_allowance
+        if batch_limit == 0:
+            logger.debug(
+                "campaign %s outside or saturated by outreach window "
+                "(window=%s sent_in_window=%d quota=%d now=%s)",
+                campaign.name,
+                window,
+                sent_in_window,
+                campaign.outreach_per_day,
+                clock,
             )
             return summary
 
@@ -150,6 +203,7 @@ async def run_campaign_outreach_batch(
                 campaign=campaign,
                 campaign_lead=campaign_lead,
                 lead=lead,
+                http_client=enrichment_http_client,
             )
         except killswitch.KillSwitchTripped:
             raise
@@ -173,7 +227,11 @@ async def run_campaign_outreach_batch(
     return summary
 
 
-async def _run_campaign_tick(connector: BaseConnector) -> dict[str, int]:
+async def _run_campaign_tick(
+    connector: BaseConnector,
+    *,
+    enrichment_http_client: httpx.AsyncClient | None = None,
+) -> dict[str, int]:
     """One pass across all active campaigns; returns a send summary."""
 
     summary = {"campaigns": 0, "sent": 0, "failed": 0, "idle": 0}
@@ -210,6 +268,7 @@ async def _run_campaign_tick(connector: BaseConnector) -> dict[str, int]:
                     respect_quota=True,
                     min_delay_s=min_delay_s,
                     prior_success_count=summary["sent"],
+                    enrichment_http_client=enrichment_http_client,
                 )
             except killswitch.KillSwitchTripped:
                 logger.info("kill switch tripped mid-outreach; stopping tick")
@@ -279,6 +338,10 @@ async def run_inbound_poller(connector: BaseConnector) -> None:
         "inbound poller started; poll=%ds connector=%s", poll_s, connector.connector_type
     )
 
+    if await killswitch.await_shutdown_or_timeout(poll_s):
+        logger.info("inbound poller exiting on shutdown")
+        return
+
     while True:
         if killswitch.is_shutting_down():
             logger.info("inbound poller exiting on shutdown")
@@ -299,12 +362,27 @@ async def run_inbound_poller(connector: BaseConnector) -> None:
             return
 
 
-async def run_scheduler(connector: BaseConnector) -> None:
-    """Main scheduler loop. Exits when the kill-switch shutdown event fires."""
+async def run_scheduler(
+    connector: BaseConnector,
+    *,
+    enrichment_http_client: httpx.AsyncClient | None = None,
+) -> None:
+    """Main scheduler loop. Exits when the kill-switch shutdown event fires.
+
+    ``enrichment_http_client`` is the workspace-shared
+    :class:`httpx.AsyncClient` for lead-website enrichment (ticket 0011).
+    The webhook lifespan owns its construction/disposal so connection
+    pooling survives ticks. Tests omit this — outreach falls back to an
+    ephemeral client per campaign-lead.
+    """
 
     settings_blob = load_workspace_settings_or_empty()
     tick_s = int(settings_blob.get("scheduler_tick_s", 60))
     logger.info("scheduler started; tick=%ds connector=%s", tick_s, connector.connector_type)
+
+    if await killswitch.await_shutdown_or_timeout(tick_s):
+        logger.info("scheduler exiting on shutdown")
+        return
 
     while True:
         if killswitch.is_shutting_down():
@@ -315,7 +393,10 @@ async def run_scheduler(connector: BaseConnector) -> None:
             logger.debug("pause flag set — skipping tick")
         else:
             try:
-                summary = await _run_campaign_tick(connector=connector)
+                summary = await _run_campaign_tick(
+                    connector=connector,
+                    enrichment_http_client=enrichment_http_client,
+                )
                 if summary["sent"] or summary["failed"]:
                     logger.info("scheduler tick summary: %s", summary)
             except Exception:

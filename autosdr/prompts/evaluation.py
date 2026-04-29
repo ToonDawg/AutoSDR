@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PROMPT_VERSION = "evaluation-v4.2"
+PROMPT_VERSION = "evaluation-v4.3"
 
 SCORING_WEIGHTS = {
     "tone_match": 0.20,
@@ -204,6 +204,38 @@ least 0.3):
   same-day / 1 day for listing updates and small edits, ~1 week for
   a full site build. A draft with no turnaround at all is FINE —
   timings are optional.
+- FABRICATED NEGATIVE CLAIM about a recipient asset — the draft
+  asserts a problem with the recipient's website, mobile experience,
+  Google listing, design, photos, copy, page speed, layout, or
+  branding that is NOT supported by the angle. The recipient can
+  verify these claims instantly (open their own site, check their
+  own listing) — sending an unsupported negative is the single
+  fastest way to torch trust.
+  Test: read the draft. For every negative claim about an asset
+  ("your site doesn't [X]", "isn't mobile-friendly", "is hard to
+  read on a phone", "doesn't match your reputation", "your photos
+  are [X]", "your listing doesn't [X]"), check the supplied angle
+  text. Does the angle literally describe THAT problem on THAT
+  asset? If the angle is purely POSITIVE (good rating, lots of
+  reviews, signature amenity, brand voice) and the draft pivots
+  to a negative about a different asset, the negative is
+  fabricated. Likewise if the angle describes a problem on asset
+  A (e.g. the Google listing) but the draft pivots to a different
+  problem on asset B (the website's mobile UX) without the angle
+  saying anything about asset B, the new claim is fabricated.
+  -> Drop personalisation by 0.4+ AND naturalness by 0.2+.
+  Common fabricated-negative patterns to flag:
+    * Angle is "great reputation / good reviews" but draft says
+      "your site doesn't quite match that on a phone".
+    * Angle is "signature amenity (X)" but draft says "your site
+      doesn't show X" without the angle evidencing the absence.
+    * Angle is "brand voice" but draft says "your site is dated".
+    * Any "but..." pivot from a positive observation to a guessed
+      problem ("you've got great reviews, but your site...").
+  Correct alternative for these: an ADDITIVE offer ("happy to put
+  a page together that leads with that local trust" / "I can show
+  you a web page design that puts those reviews front and centre"),
+  not a corrective one.
 
 CATEGORY-AWARE CALIBRATION — when judging tone_match and naturalness,
 factor in the recipient's category (visible in the user prompt if
@@ -257,6 +289,14 @@ FEEDBACK RULES (IMPORTANT):
 - Good feedback (stacked CTAs): "Two CTAs ('want a mockup? Or shoot
   me a text?') — pick one clean ask. Keep the direct 'Shoot me a
   text and I'll take care of it' and drop the mockup question."
+- Good feedback (fabricated negative): "Draft claims 'the site
+  doesn't quite match that on a phone' but the signal is purely
+  positive (rating + review count) and there is no scraped web
+  content in the data — this is a fabricated problem the recipient
+  can disprove in 5 seconds. Pivot to an additive offer: 'I can
+  show you a web page design that leads with that local trust' or
+  'happy to put a quick page together that puts those reviews
+  front and centre'."
 - Bad feedback: "Tone could be improved." (too vague)
 - Bad feedback: "Weakest criterion is tone_match." (circular)
 

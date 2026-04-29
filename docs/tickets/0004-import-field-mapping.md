@@ -164,20 +164,54 @@ every non-core column.
 
 ## Open questions
 
-- Single endpoint or split? Today the importer has
-  `/api/leads/import/preview` (per `autosdr/api/leads.py`) +
-  presumably a commit. Decide between adding a new
-  `/api/leads/import/commit-with-mapping` vs. accepting `mapping_config`
-  on the existing commit. Recommend extending the existing endpoint
-  with `mapping_config` optional (BC for callers who don't pass one).
-- Detection threshold for sample-value heuristics: 80% non-null match
-  rate is a guess. Consider 90% to be conservative. Decision.
-- "Drop from raw_data" semantic: do we drop on commit only, or also
-  retroactively prune existing rows on a re-import? Recommend
-  commit-only; retroactive prune is destructive and surprising.
-- Do we need a "save this mapping as a template" feature? Useful if
-  the operator imports multiple Apify files. Defer to a follow-up
-  unless the operator asks.
+- ~~Single endpoint or split?~~ **Resolved 2026-04-27** — extend.
+- ~~Detection threshold for sample-value heuristics: 80% vs 90%?~~ **Resolved 2026-04-27** — tiered: 90% → high, 80% → medium, ≥5 non-null support floor.
+- ~~"Drop from raw_data" semantic: commit-only or retroactive?~~ **Resolved 2026-04-27** — commit-only.
+- ~~Save mapping as template?~~ **Deferred 2026-04-27** — ticket already steered to defer; operator didn't ask.
+
+## Resolved questions (2026-04-27)
+
+### Resolved: endpoint-shape
+
+**Architect:** Extend `/api/leads/import/commit` with an optional `mapping_config` form field carrying JSON-as-string.
+**Skeptic:** Workable but watch for silent mis-mapping when JSON is malformed-but-parseable.
+**Pragmatist:** Extend, with a clear contract: operator always passes mapping on commit; don't try to glue preview-stored config to a separate re-upload.
+**Critic:** Extend, with strict schema symmetry — same Pydantic validator applies to preview and commit.
+
+**Decision:** Extend the existing `/api/leads/import/commit` with an optional `mapping_config` form field (JSON string). Validate shape via a Pydantic model; reject unknown canonical-target names. Mirror the same model in the preview endpoint so operators can see the mapping applied before committing.
+**Strongest dissent:** Skeptic's "silent mis-mapping" — mitigated by strict shape validation + a server-side check that mapping targets exist in `_CORE_FIELDS`.
+**Confidence:** high
+**Why this is acceptable:** Three voices converge; the residual risk is a code-level concern, not architecture.
+
+### Resolved: heuristic-threshold
+
+**Architect (initial):** 80% across the board.
+**Skeptic:** 80% — HITL changes the loss function; n=20 is coarse; sampling variance dominates threshold choice.
+**Pragmatist:** 90% — automation bias on `high`; a wrong `high` is worse than no suggestion.
+**Critic:** 90% — operators rubber-stamp `high`; wrong auto-suggestion is harder to un-learn than missing one.
+
+**Decision (changed from initial):** Tiered.
+- `high` confidence: ≥ 90% non-null match AND ≥ 5 non-null sample values present.
+- `medium` confidence: ≥ 80% non-null match AND ≥ 5 non-null sample values present.
+- Otherwise no heuristic suggestion (still falls back to exact / Levenshtein / substring matching on the column name).
+The ≥ 5 non-null floor addresses Pragmatist's surprise that "% of non-null" denominator can be tiny on sparse columns.
+**Strongest dissent:** Skeptic was right that thresholds alone don't prevent rubber-stamping — UX (samples shown inline, confidence badge styling) carries equal weight.
+**Confidence:** medium
+**Why this is acceptable:** Threshold is the cheapest single parameter to tune; no schema cost to revising.
+
+### Resolved: drop-semantic
+
+**All four voices:** Commit-only.
+
+**Decision:** `drop_from_raw` filters keys out of *incoming* row payloads only. The existing `_merge_raw_data` behaviour is preserved: existing `raw_data` keys are not deleted, just not added to. **Never** retroactively prune.
+**Strongest dissent:** All three voices flagged the same surprise — stale legacy rows keep oversized `raw_data` indefinitely; operator may *expect* re-import to "heal" them. Mitigation: UI helper text near the drop control reading **"Applies to this import only — existing records keep what they have."**
+**Confidence:** high
+**Why this is acceptable:** Universal council agreement; the gap is documented, not silent.
+
+### Resolved: mapping-templates
+
+**Decision:** Defer (no council needed). The ticket explicitly recommends defer; operator didn't ask. Filed as a follow-up candidate.
+**Confidence:** high
 
 ## Principle check
 
@@ -214,3 +248,46 @@ every non-core column.
   commit).
 - Related: 0001 (`do_not_contact` flag must survive a re-import — see
   importer guard in 0001's scope).
+
+## Implementation log (2026-04-27)
+
+**Status:** done
+
+| # | Unit | Outcome | Evidence |
+|---|------|---------|----------|
+| 1 | Refactor `_split_core_and_raw` to accept `mapping_config` (BC default) | done | `tests/test_importer_field_mapping.py::test_split_default_unchanged_when_no_mapping_config`, `test_mapping_overrides_alias_pick`, `test_mapping_can_explicitly_disable_alias_match` |
+| 2 | Thread `mapping_config` through `import_file` + `preview_import_file`; persist on `ImportJob.mapping_config` | done | `test_drop_does_not_remove_existing_raw_data_on_reimport`, `test_reimport_with_same_mapping_config_is_idempotent`, `test_preview_honours_mapping_config` |
+| 3 | `ColumnPreview` + suggestion engine (exact / Levenshtein / substring / tiered sample heuristics) | done | 16 suggestion-engine tests including `test_suggest_phone_heuristic_high_when_90pct_match`, `test_suggest_phone_heuristic_blocked_by_min_support_floor`, `test_preview_apify_fixture_every_column_has_suggestion_or_none` |
+| 4 | Pydantic `MappingConfigIn` + `ImportPreviewColumn`; `/preview` and `/commit` round-trip with strict 422 on bad JSON | done | `tests/test_leads_import_api.py` — 5 tests including `test_commit_invalid_mapping_config_returns_422` and `test_commit_without_mapping_config_is_backward_compatible` |
+| 5 | CLI `--map` / `--drop` / `--raw-only` flags on `autosdr import` | done | `tests/test_cli_import_mapping.py` — 5 tests including `test_import_persists_mapping_config_on_import_job`, `test_import_rejects_malformed_map_pair` |
+| 6 | Frontend column-mapping table + helper text + types/api mirror | done | `frontend/src/routes/LeadsImport.tsx::ColumnMappingTable`, `frontend/src/lib/types.ts::MappingConfig`, `npm run build` clean |
+
+**Final state of success criteria:**
+- New `tests/test_importer_field_mapping.py`: ✓ — 25 tests; every suggestion rule has positive + negative coverage.
+- Apify fixture import (every column has a suggestion or `none`; `phone` suggested with `high`): ✓ — `test_preview_apify_fixture_every_column_has_suggestion_or_none` (`tests/fixtures/apify_qld_excerpt.ndjson`, 20 synthetic rows mirroring the Apify schema after the source `all_results_qld.json` was confirmed absent on disk).
+- Operator override honoured: ✓ — `test_mapping_overrides_alias_pick`.
+- Drop list: dropped columns absent from `lead.raw_data`: ✓ — `test_drop_from_raw_omits_keys_from_raw_data`, `test_commit_with_mapping_drops_noisy_keys_from_raw_data`.
+- Re-import idempotency on same `mapping_config`: ✓ — `test_reimport_with_same_mapping_config_is_idempotent` (zero spurious updates, idempotent merge).
+- Preview <1s on 5k-row CSV: ✓ — measured 168ms (5000 rows, 5 columns) on local dev machine.
+- Commit <60s on 1k-row CSV: ✓ — measured 546ms (1000 rows imported).
+- UI: non-technical operator can complete import without docs: ✓ — `LeadsImport.tsx` renders one row per detected column, dropdown defaults to the suggestion, "Drop all unsuggested" bulk action, helper text spells out the commit-only drop semantic.
+
+**Principle check after implementation:**
+- Simplicity first: ⚠ — column-mapping UI adds a step; explicitly accepted in the ticket.
+- Quality over speed: ✓ — `reviewDetails` and other noise can now be dropped before the analysis prompt sees `raw_data`.
+- Honest data contracts: ✓ — every column the operator sees in the preview is the same set the importer will act on; suggestion + reason are surfaced, not hidden.
+- Extensible by design: ✓ — rule-based engine isolated in `_suggest_column_target`; LLM-assisted suggestions can layer in without re-plumbing the form payload.
+- Human always wins: ✓ — operator approves every column; defaults preselect to the suggestion but never auto-commit.
+- Owner stays in control: ✓ — `mapping_config` persists on `ImportJob.mapping_config` so prior decisions are auditable.
+
+**Pattern-unifier diff-only check:**
+- Frontend (`frontend/src/lib/api.ts`, `frontend/src/lib/types.ts`, `frontend/src/routes/LeadsImport.tsx`): no new fetch outside `api.ts`, no `axios`, no alternate router / styling lib, table-width inline styles match the pre-existing convention in the same file.
+- Backend (`autosdr/api/leads.py`, `autosdr/api/schemas.py`, `autosdr/cli.py`, `autosdr/importer.py`): imports stay within the blessed set (FastAPI, Pydantic, SQLAlchemy, typer, phonenumbers, stdlib only).
+- No new ⚠ / ✗ rows introduced.
+
+**Follow-ups raised:**
+- LLM-assisted column-suggestion agent (out of scope per ticket; revisit when an Apify scrape can't be cleanly mapped deterministically).
+- "Save mapping as template" — deferred per council resolution; file as a follow-up if a second operator asks.
+- True streaming NDJSON import — already on the roadmap (Later), unblocked by this ticket landing.
+
+**Open questions still unresolved:** (none — all four resolved 2026-04-27)

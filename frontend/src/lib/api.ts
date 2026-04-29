@@ -6,26 +6,39 @@
  *   to the FastAPI process in dev and the backend serves the UI itself
  *   in prod (single-process boot).
  * - The backend returns `409 { setup_required: true }` when the workspace
- *   row is missing. `req()` intercepts that and redirects to `/setup` so
- *   callers don't need special-case handling — only the Setup route is
- *   allowed to see it, because it starts with `/setup` itself.
+ *   row is missing. `req()` intercepts that and redirects to `/settings`,
+ *   where the setup form is embedded without blocking the rest of the app.
  * - The one exception is `getSetupStatus`, which hits the setup endpoint
  *   directly and never triggers the redirect.
  */
 
 import type {
+  AngleFunnel,
   Campaign,
   CampaignAssignLeadsResult,
   CampaignKickoffResult,
+  CampaignTimeseries,
   ConnectorTestRequest,
   ConnectorTestResult,
+  EnrichmentFilter,
   FollowupConfig,
   ImportCommit,
   ImportPreview,
+  MappingConfig,
   Lead,
+  DevSimInboundResult,
+  LeadEnrichResult,
   LeadList,
   LlmCall,
+  LlmCallsSummary,
+  LlmPresetCatalog,
   Message,
+  OutreachWindowConfig,
+  ScanDetail,
+  ScanList,
+  ScanRunRequest,
+  ScanRunResult,
+  ScanSummary,
   SendsByDay,
   SetupPayload,
   SetupStatus,
@@ -91,8 +104,8 @@ async function req<T>(path: string, init: ReqInit = {}): Promise<T> {
       // non-JSON 409 — fall through as a normal error
     }
     if (body409 && typeof body409 === 'object' && (body409 as { setup_required?: boolean }).setup_required) {
-      if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/setup')) {
-        window.location.href = '/setup';
+      if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/settings')) {
+        window.location.href = '/settings';
       }
       throw new ApiError(409, 'setup_required', body409);
     }
@@ -190,6 +203,7 @@ export const api = {
     outreach_per_day?: number;
     connector_type?: string;
     followup?: FollowupConfig;
+    outreach_window?: OutreachWindowConfig | null;
   }): Promise<Campaign> {
     return req<Campaign>('/campaigns', { method: 'POST', body: payload });
   },
@@ -202,9 +216,26 @@ export const api = {
       outreach_per_day: number;
       status: Campaign['status'];
       followup: FollowupConfig;
+      /**
+       * ``null`` clears the per-campaign override (= inherit the
+       * workspace default). Omit the field entirely for "no change".
+       * The PATCH body type uses ``Partial<>`` so omission still works
+       * even with an explicit ``null`` allowed for the value.
+       */
+      outreach_window: OutreachWindowConfig | null;
     }>,
   ): Promise<Campaign> {
     return req<Campaign>(`/campaigns/${id}`, { method: 'PATCH', body: payload });
+  },
+
+  /**
+   * Hard-delete a campaign and every conversation hanging off it. Leads
+   * themselves are workspace-scoped and survive — only the assignment
+   * + its threads + messages + LLM-call audit rows go away. Returns
+   * ``undefined`` on success (HTTP 204).
+   */
+  async deleteCampaign(id: string): Promise<void> {
+    return req<void>(`/campaigns/${id}`, { method: 'DELETE' });
   },
 
   async resetCampaignSendCount(id: string): Promise<Campaign> {
@@ -240,10 +271,33 @@ export const api = {
     });
   },
 
+  /**
+   * Per-day funnel buckets for one campaign. The response is always
+   * ``days`` rows long, oldest first, padded with zeroes — the chart
+   * renders a stable window even on a brand-new campaign.
+   */
+  async getCampaignTimeseries(
+    id: string,
+    days: number = 14,
+  ): Promise<CampaignTimeseries> {
+    return req<CampaignTimeseries>(`/campaigns/${id}/timeseries`, {
+      query: { days },
+    });
+  },
+
   // ---------- leads ----------
 
+  /**
+   * Paginated browse of every lead in the workspace.
+   *
+   * ``assignment`` narrows by campaign membership:
+   *   - ``"in_campaign"`` — leads assigned to at least one campaign.
+   *   - ``"unassigned"`` — leads not yet assigned to any campaign.
+   *   - omitted / ``undefined`` — no membership filter.
+   */
   async listLeads(opts?: {
     status?: string;
+    assignment?: 'in_campaign' | 'unassigned';
     q?: string;
     limit?: number;
     offset?: number;
@@ -251,6 +305,7 @@ export const api = {
     return req<LeadList>('/leads', {
       query: {
         status_filter: opts?.status,
+        assignment: opts?.assignment,
         q: opts?.q,
         limit: opts?.limit,
         offset: opts?.offset,
@@ -262,18 +317,64 @@ export const api = {
     return req<Lead>(`/leads/${id}`);
   },
 
-  async previewImport(file: File): Promise<ImportPreview> {
+  async optOutLead(id: string, reason = 'manual'): Promise<Lead> {
+    return req<Lead>(`/leads/${id}/opt-out`, {
+      method: 'POST',
+      body: { reason },
+    });
+  },
+
+  async clearLeadOptOut(id: string): Promise<Lead> {
+    return req<Lead>(`/leads/${id}/opt-out`, {
+      method: 'DELETE',
+    });
+  },
+
+  async enrichLeads(opts: {
+    since_days?: number;
+    limit?: number;
+    dry_run?: boolean;
+  }): Promise<LeadEnrichResult> {
+    return req<LeadEnrichResult>('/leads/enrich', {
+      method: 'POST',
+      body: opts,
+    });
+  },
+
+  async devSimInbound(payload: {
+    contact_uri: string;
+    content: string;
+  }): Promise<DevSimInboundResult> {
+    return req<DevSimInboundResult>('/dev/sim-inbound', {
+      method: 'POST',
+      body: payload,
+    });
+  },
+
+  async previewImport(
+    file: File,
+    mappingConfig?: MappingConfig | null,
+  ): Promise<ImportPreview> {
     const form = new FormData();
     form.append('file', file);
+    if (mappingConfig) {
+      form.append('mapping_config', JSON.stringify(mappingConfig));
+    }
     return req<ImportPreview>('/leads/import/preview', {
       method: 'POST',
       body: form,
     });
   },
 
-  async commitImport(file: File): Promise<ImportCommit> {
+  async commitImport(
+    file: File,
+    mappingConfig?: MappingConfig | null,
+  ): Promise<ImportCommit> {
     const form = new FormData();
     form.append('file', file);
+    if (mappingConfig) {
+      form.append('mapping_config', JSON.stringify(mappingConfig));
+    }
     return req<ImportCommit>('/leads/import/commit', {
       method: 'POST',
       body: form,
@@ -374,11 +475,119 @@ export const api = {
     });
   },
 
+  async llmCallsSummary(opts?: {
+    threadId?: string;
+    campaignId?: string;
+    leadId?: string;
+    purpose?: string;
+    errorsOnly?: boolean;
+  }): Promise<LlmCallsSummary> {
+    return req<LlmCallsSummary>('/llm-calls/summary', {
+      query: {
+        thread_id: opts?.threadId,
+        campaign_id: opts?.campaignId,
+        lead_id: opts?.leadId,
+        purpose: opts?.purpose,
+        errors_only: opts?.errorsOnly,
+      },
+    });
+  },
+
+  /**
+   * Static catalog of Gemini-only model blends ("MAX / Balanced /
+   * Cheap"). The Settings → LLM card uses this to render one-click
+   * preset buttons. The server is the source of truth so a pricing or
+   * model change ships everywhere at once. See ticket 0006.
+   */
+  async getLlmPresets(): Promise<LlmPresetCatalog> {
+    return req<LlmPresetCatalog>('/llm/presets');
+  },
+
   // ---------- stats ----------
 
   async getSends14d(): Promise<SendsByDay[]> {
     const data = await req<{ days: SendsByDay[] }>('/stats/sends-14d');
     return data.days;
+  },
+
+  /**
+   * Reply-rate per personalisation angle. Drives the "By angle" panel
+   * on `/Logs` and the campaign-scoped variant on `CampaignDetail`.
+   *
+   * Defaults: workspace-wide queries get a 30-day window;
+   * campaign-scoped queries get the campaign's lifetime (no time filter)
+   * unless ``sinceDays`` is supplied. The server echoes the resolved
+   * ``since`` so the UI can label "(last N days)" honestly.
+   */
+  async getAngleFunnel(opts?: {
+    campaignId?: string;
+    sinceDays?: number;
+    enrichment?: EnrichmentFilter;
+  }): Promise<AngleFunnel> {
+    return req<AngleFunnel>('/stats/angle-funnel', {
+      query: {
+        campaign_id: opts?.campaignId,
+        since_days: opts?.sinceDays,
+        // Only forward the param when set to something other than the
+        // server default, so the URL stays cleaner for the common case.
+        enrichment:
+          opts?.enrichment && opts.enrichment !== 'all' ? opts.enrichment : undefined,
+      },
+    });
+  },
+
+  // ---------- scans ----------
+
+  /**
+   * Paginated browse of every lead's most recent website-enrichment
+   * scan. Mirrors the Leads list shape but with scan-specific
+   * filtering (status / search). Powers the ``/scans`` page.
+   *
+   * Defaults to leads currently assigned to at least one campaign —
+   * the only ones we'd actually outreach. Set
+   * ``includeUnassigned`` to surface every lead in the workspace
+   * (useful for auditing a fresh import before kick-off).
+   */
+  async listScans(opts?: {
+    status?: string;
+    q?: string;
+    includeUnassigned?: boolean;
+    limit?: number;
+    offset?: number;
+  }): Promise<ScanList> {
+    return req<ScanList>('/scans', {
+      query: {
+        status_filter: opts?.status,
+        q: opts?.q,
+        include_unassigned: opts?.includeUnassigned ? true : undefined,
+        limit: opts?.limit,
+        offset: opts?.offset,
+      },
+    });
+  },
+
+  async getScansSummary(opts?: {
+    includeUnassigned?: boolean;
+  }): Promise<ScanSummary> {
+    return req<ScanSummary>('/scans/summary', {
+      query: {
+        include_unassigned: opts?.includeUnassigned ? true : undefined,
+      },
+    });
+  },
+
+  /**
+   * Start/stop the enrichment worker or synchronously enrich one ``lead_id``.
+   *
+   * - ``{ enabled }`` toggles workspace enrichment (Scans page Start/Stop).
+   * - ``{ lead_id }`` runs a single synchronous scan (detail "Re-scan now").
+   */
+  async runScans(payload: ScanRunRequest): Promise<ScanRunResult> {
+    return req<ScanRunResult>('/scans/run', { method: 'POST', body: payload });
+  },
+
+  async getScan(leadId: string): Promise<ScanDetail> {
+    return req<ScanDetail>(`/scans/${leadId}`);
   },
 };
 

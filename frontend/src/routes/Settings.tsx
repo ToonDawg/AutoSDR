@@ -1,11 +1,12 @@
 import { useQuery } from '@tanstack/react-query';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { WorkspaceCard } from './settings/WorkspaceCard';
 import { LlmCard } from './settings/LlmCard';
 import { ConnectorCard } from './settings/ConnectorCard';
 import { BehaviourCard } from './settings/BehaviourCard';
 import { RehearsalCard } from './settings/RehearsalCard';
+import { Setup } from './Setup';
 
 /**
  * Settings is just a thin editor on top of the two endpoints that matter:
@@ -20,10 +21,25 @@ import { RehearsalCard } from './settings/RehearsalCard';
  * LLM changes hot-reload server-side — no restart required.
  */
 export function Settings() {
-  const { data: workspace } = useQuery({
+  const { data: workspace, error, isError } = useQuery({
     queryKey: ['workspace'],
     queryFn: () => api.getWorkspace(),
   });
+
+  if (isSetupRequired(error)) {
+    return <Setup embedded redirectTo="/settings" />;
+  }
+
+  if (isError) {
+    return (
+      <div className="px-8 py-10 max-w-3xl mx-auto">
+        <PageHeader
+          title="Settings unavailable"
+          description="AutoSDR could not load the workspace settings. Check that the backend is running, then refresh."
+        />
+      </div>
+    );
+  }
 
   if (!workspace) {
     return (
@@ -53,5 +69,14 @@ export function Settings() {
       <BehaviourCard workspace={workspace} />
       <RehearsalCard workspace={workspace} />
     </div>
+  );
+}
+
+function isSetupRequired(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 409) return false;
+  return Boolean(
+    error.payload &&
+      typeof error.payload === 'object' &&
+      (error.payload as { setup_required?: boolean }).setup_required,
   );
 }

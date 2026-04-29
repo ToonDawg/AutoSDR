@@ -1,4 +1,4 @@
-"""Rolling-24h send-quota accounting.
+"""Rolling-24h outreach-quota accounting.
 
 ``outreach_per_day`` is enforced as a rolling window, not a calendar day, to
 avoid midnight-burst behaviour and keep the limit predictable regardless of
@@ -6,6 +6,13 @@ when an owner activates the campaign. The scheduler, the status endpoint,
 the campaigns endpoint, and the CLI all need the same count — previously
 each had its own identical private helper, which made it too easy for them
 to drift (different cutoff, different role filter, etc.).
+
+Semantics: one **outreach contact** is one *new conversation started*, i.e.
+the first AI message on a thread. Follow-up beats and auto-reply messages
+are extra texts on a thread that's already been contacted, so they don't
+consume a second quota slot. Pre-1.x revisions of this module counted every
+outbound AI message — which silently halved the effective daily cap as soon
+as the operator turned the follow-up beat on.
 
 Keep this module stateless and import-light so it can be used from both
 request handlers and the scheduler tick without pulling in heavy deps.
@@ -22,26 +29,34 @@ from sqlalchemy.orm import Session
 from autosdr.models import Campaign, CampaignLead, Message, MessageRole, Thread
 
 
-def count_ai_messages_last_24h(session: Session, campaign_id: str) -> int:
-    """Return how many AI messages the given campaign has sent in the last 24h.
+def count_outreach_contacts_last_24h(session: Session, campaign_id: str) -> int:
+    """Return how many *new outreach contacts* the campaign opened in the last 24h.
 
-    Only ``MessageRole.AI`` rows count — inbound replies are free and should
-    not consume quota.
+    A contact is one thread whose first AI message landed inside the
+    rolling window — so a follow-up beat that fires 10s after the
+    initial send still only counts as one contact, and an auto-reply
+    sent days later doesn't re-charge the lead's quota slot.
     """
 
-    counts = count_ai_messages_last_24h_bulk(session, [campaign_id])
+    counts = count_outreach_contacts_last_24h_bulk(session, [campaign_id])
     return counts.get(campaign_id, 0)
 
 
-def count_ai_messages_last_24h_bulk(
+def count_outreach_contacts_last_24h_bulk(
     session: Session, campaign_ids: Iterable[str]
 ) -> dict[str, int]:
-    """Batched variant of ``count_ai_messages_last_24h``.
+    """Batched variant of :func:`count_outreach_contacts_last_24h`.
 
     Returns ``{campaign_id: count}`` for every id asked for — including
-    zero entries for campaigns that have sent nothing in the window. The
-    status endpoint and campaign list previously ran one query per
+    zero entries for campaigns that opened no new threads in the window.
+    The status endpoint and campaign list previously ran one query per
     active campaign, which scales linearly with the workspace.
+
+    Implementation: per thread, take the timestamp of the first AI
+    message (``MIN(message.created_at) WHERE role='ai'``); the thread
+    counts iff that timestamp is inside the window. Follow-up sends and
+    auto-replies sit later in the thread by definition, so they're
+    naturally excluded.
     """
 
     ids = list(dict.fromkeys(campaign_ids))
@@ -49,21 +64,34 @@ def count_ai_messages_last_24h_bulk(
         return {}
 
     cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
-    stmt = (
-        select(CampaignLead.campaign_id, func.count(Message.id))
+
+    # Per-thread first-AI timestamp, scoped to campaigns we care about.
+    first_ai = (
+        select(
+            Thread.id.label("thread_id"),
+            CampaignLead.campaign_id.label("campaign_id"),
+            func.min(Message.created_at).label("first_ai_at"),
+        )
         .join(Thread, Thread.id == Message.thread_id)
         .join(CampaignLead, CampaignLead.id == Thread.campaign_lead_id)
-        .join(Campaign, Campaign.id == CampaignLead.campaign_id)
         .where(
             CampaignLead.campaign_id.in_(ids),
             Message.role == MessageRole.AI,
-            Message.created_at >= cutoff,
+        )
+        .group_by(Thread.id, CampaignLead.campaign_id)
+    ).subquery()
+
+    stmt = (
+        select(first_ai.c.campaign_id, func.count(first_ai.c.thread_id))
+        .join(Campaign, Campaign.id == first_ai.c.campaign_id)
+        .where(
+            first_ai.c.first_ai_at >= cutoff,
             or_(
                 Campaign.quota_reset_at.is_(None),
-                Message.created_at >= Campaign.quota_reset_at,
+                first_ai.c.first_ai_at >= Campaign.quota_reset_at,
             ),
         )
-        .group_by(CampaignLead.campaign_id)
+        .group_by(first_ai.c.campaign_id)
     )
     counts: dict[str, int] = {cid: 0 for cid in ids}
     for campaign_id, count in session.execute(stmt).all():
@@ -71,4 +99,17 @@ def count_ai_messages_last_24h_bulk(
     return counts
 
 
-__all__ = ["count_ai_messages_last_24h", "count_ai_messages_last_24h_bulk"]
+# Back-compat aliases — the previous public names referenced "ai_messages"
+# but the semantics changed to "outreach contacts" (one per thread, not one
+# per AI send). Callers can migrate at their leisure; both names point at
+# the same implementation.
+count_ai_messages_last_24h = count_outreach_contacts_last_24h
+count_ai_messages_last_24h_bulk = count_outreach_contacts_last_24h_bulk
+
+
+__all__ = [
+    "count_ai_messages_last_24h",
+    "count_ai_messages_last_24h_bulk",
+    "count_outreach_contacts_last_24h",
+    "count_outreach_contacts_last_24h_bulk",
+]

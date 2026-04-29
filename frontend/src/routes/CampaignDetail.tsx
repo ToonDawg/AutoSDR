@@ -1,25 +1,29 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useVirtualizer } from '@tanstack/react-virtual';
-import { Link, useParams, useNavigate } from 'react-router-dom';
-import { ChevronDown, Pause, Play, Plus, RotateCcw } from 'lucide-react';
-import { type ReactNode, useRef, useState } from 'react';
-import { api } from '@/lib/api';
-import { BackLink } from '@/components/ui/BackLink';
-import { QuotaMeter } from '@/components/domain/QuotaMeter';
-import { ThreadStatusBadge } from '@/components/domain/ThreadStatusBadge';
-import { Badge } from '@/components/ui/Badge';
-import { Button } from '@/components/ui/Button';
-import { Stat } from '@/components/ui/Stat';
-import { Input, Textarea } from '@/components/ui/Input';
-import { Field } from '@/components/ui/Field';
-import { SaveRow, Toggle } from '@/routes/settings/primitives';
-import { CAMPAIGN_STATUS_LABEL, relTime } from '@/lib/format';
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { Link, useParams, useNavigate } from "react-router-dom";
+import { ChevronDown, Pause, Play, Plus, RotateCcw } from "lucide-react";
+import { type ReactNode, useRef, useState } from "react";
+import { api } from "@/lib/api";
+import { AngleFunnelPanel } from "@/components/domain/AngleFunnelPanel";
+import { CampaignTimeseriesPanel } from "@/components/domain/CampaignTimeseriesPanel";
+import { BackLink } from "@/components/ui/BackLink";
+import { QuotaMeter } from "@/components/domain/QuotaMeter";
+import { ThreadStatusBadge } from "@/components/domain/ThreadStatusBadge";
+import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { Stat } from "@/components/ui/Stat";
+import { Input, Textarea } from "@/components/ui/Input";
+import { Field } from "@/components/ui/Field";
+import { SaveRow, Toggle } from "@/routes/settings/primitives";
+import { CAMPAIGN_STATUS_LABEL, relTime } from "@/lib/format";
 import {
   CampaignStatus,
   type Campaign,
   type CampaignKickoffResult,
+  type EnrichmentFilter,
   type FollowupConfig,
-} from '@/lib/types';
+  type OutreachWindowConfig,
+} from "@/lib/types";
 
 /**
  * Per-campaign detail. Header summarises + exposes the activate / pause
@@ -27,34 +31,35 @@ import {
  * is every thread that belongs to this campaign.
  */
 export function CampaignDetail() {
-  const { id = '' } = useParams();
+  const { id = "" } = useParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const [enrichmentFilter, setEnrichmentFilter] = useState<EnrichmentFilter>("all");
 
   const { data: campaign } = useQuery({
-    queryKey: ['campaign', id],
+    queryKey: ["campaign", id],
     queryFn: () => api.getCampaign(id),
     enabled: !!id,
   });
 
   const toggle = useMutation({
     mutationFn: () => {
-      if (!campaign) throw new Error('no campaign');
+      if (!campaign) throw new Error("no campaign");
       return campaign.status === CampaignStatus.ACTIVE
         ? api.pauseCampaign(id)
         : api.activateCampaign(id);
     },
     onSuccess: (data: Campaign) => {
-      qc.setQueryData(['campaign', id], data);
-      qc.invalidateQueries({ queryKey: ['campaigns'] });
+      qc.setQueryData(["campaign", id], data);
+      qc.invalidateQueries({ queryKey: ["campaigns"] });
     },
   });
 
   const assignAll = useMutation({
     mutationFn: () => api.assignLeads(id, { all_eligible: true }),
     onSuccess: (data: Campaign) => {
-      qc.setQueryData(['campaign', id], data);
-      qc.invalidateQueries({ queryKey: ['leads'] });
+      qc.setQueryData(["campaign", id], data);
+      qc.invalidateQueries({ queryKey: ["leads"] });
     },
   });
 
@@ -71,25 +76,32 @@ export function CampaignDetail() {
   const isDraft = campaign.status === CampaignStatus.DRAFT;
   const isCompleted = campaign.status === CampaignStatus.COMPLETED;
   const scheduleActionLabel = isActive
-    ? 'Pause scheduled sends'
+    ? "Pause scheduled sends"
     : isDraft
-      ? 'Start scheduled sends'
-      : 'Resume scheduled sends';
+      ? "Start scheduled sends"
+      : "Resume scheduled sends";
   const settingsKey = [
-    'settings',
+    "settings",
     campaign.id,
     campaign.name,
     campaign.goal,
     campaign.outreach_per_day,
-  ].join(':');
+  ].join(":");
   const followupKey = [
-    'followup',
+    "followup",
     campaign.id,
     campaign.followup.enabled,
     campaign.followup.template,
     campaign.followup.delay_s,
     campaign.followup.delay_jitter_s,
-  ].join(':');
+  ].join(":");
+  const windowKey = [
+    "window",
+    campaign.id,
+    campaign.outreach_window?.enabled ?? "inherit",
+    campaign.outreach_window?.start_hour ?? "inherit",
+    campaign.outreach_window?.end_hour ?? "inherit",
+  ].join(":");
 
   return (
     <div className="page gap-6">
@@ -99,7 +111,15 @@ export function CampaignDetail() {
         <div className="min-w-0">
           <div className="flex items-center gap-3 mb-2">
             <Badge
-              tone={isActive ? 'forest' : isPaused ? 'mustard' : isDraft ? 'neutral' : 'ink'}
+              tone={
+                isActive
+                  ? "forest"
+                  : isPaused
+                    ? "mustard"
+                    : isDraft
+                      ? "neutral"
+                      : "ink"
+              }
               dot
             >
               {CAMPAIGN_STATUS_LABEL[campaign.status]}
@@ -108,12 +128,14 @@ export function CampaignDetail() {
               started {relTime(campaign.created_at)}
             </span>
           </div>
-          <h1 className="text-2xl font-medium text-ink mb-2 truncate">{campaign.name}</h1>
+          <h1 className="text-2xl font-medium text-ink mb-2 truncate">
+            {campaign.name}
+          </h1>
           <p className="text-sm text-ink-muted max-w-prose">{campaign.goal}</p>
         </div>
         <div className="flex flex-col gap-2 shrink-0">
           <Button
-            variant={isActive ? 'secondary' : 'primary'}
+            variant={isActive ? "secondary" : "primary"}
             iconLeft={
               isActive ? (
                 <Pause className="h-3.5 w-3.5" strokeWidth={1.5} />
@@ -132,21 +154,51 @@ export function CampaignDetail() {
             onClick={() => assignAll.mutate()}
             disabled={assignAll.isPending}
           >
-            {assignAll.isPending ? 'Assigning…' : 'Assign all eligible leads'}
+            {assignAll.isPending ? "Assigning…" : "Assign all eligible leads"}
           </Button>
         </div>
       </header>
 
       <div className="grid grid-cols-5 border border-rule divide-x divide-rule">
         <Stat size="lg" label="Leads assigned" value={campaign.lead_count} />
-        <Stat size="lg" label="Contacted" value={campaign.contacted_count} />
-        <Stat size="lg" label="Replied" value={campaign.replied_count} />
+        {/* "Contacted" is the rollup of anyone we ever messaged — see
+            ticket 0003: the API exposes per-bucket precise fields, so
+            we sum on demand. */}
+        <Stat
+          size="lg"
+          label="Contacted"
+          value={
+            campaign.contacted_count +
+            campaign.replied_count +
+            campaign.won_count +
+            campaign.lost_count
+          }
+        />
+        <Stat
+          size="lg"
+          label="Replied"
+          value={
+            campaign.replied_count + campaign.won_count + campaign.lost_count
+          }
+        />
         <Stat size="lg" label="Won" value={campaign.won_count} tone="forest" />
         <div className="p-4 flex flex-col gap-2">
           <div className="label">Daily capacity</div>
-          <QuotaMeter sent={campaign.sent_24h} quota={campaign.outreach_per_day} label="24H" />
+          <QuotaMeter
+            sent={campaign.sent_24h}
+            quota={campaign.outreach_per_day}
+            label="24H"
+          />
         </div>
       </div>
+
+      <CampaignTimeseriesPanel campaign={campaign} />
+
+      <AngleFunnelPanel
+        campaignId={id}
+        enrichment={enrichmentFilter}
+        onEnrichmentChange={setEnrichmentFilter}
+      />
 
       <ManualKickoffSection campaign={campaign} />
 
@@ -154,13 +206,14 @@ export function CampaignDetail() {
 
       <FollowupSection key={followupKey} campaign={campaign} />
 
+      <OutreachWindowSection key={windowKey} campaign={campaign} />
+
       <ConversationsSection campaignId={id} />
     </div>
   );
 }
 
-const CONVERSATIONS_GRID =
-  'grid grid-cols-[32%_24%_14%_15%_15%] items-start';
+const CONVERSATIONS_GRID = "grid grid-cols-[32%_24%_14%_15%_15%] items-start";
 const CONVERSATIONS_ROW_HEIGHT = 60;
 
 /**
@@ -173,7 +226,7 @@ const CONVERSATIONS_ROW_HEIGHT = 60;
 function ConversationsSection({ campaignId }: { campaignId: string }) {
   const [open, setOpen] = useState(false);
   const { data: threads, isFetching } = useQuery({
-    queryKey: ['threads', 'campaign', campaignId],
+    queryKey: ["threads", "campaign", campaignId],
     queryFn: () => api.listThreads({ campaignId, limit: 500 }),
     enabled: open,
   });
@@ -187,9 +240,9 @@ function ConversationsSection({ campaignId }: { campaignId: string }) {
   });
 
   const meta = !open
-    ? 'open to load'
+    ? "open to load"
     : isFetching && !threads
-      ? 'loading…'
+      ? "loading…"
       : `${threads?.length ?? 0} shown`;
 
   const isEmpty = open && !isFetching && (!threads || threads.length === 0);
@@ -220,7 +273,7 @@ function ConversationsSection({ campaignId }: { campaignId: string }) {
           <div
             ref={scrollRef}
             className="overflow-auto"
-            style={{ maxHeight: 'min(60vh, 32rem)' }}
+            style={{ maxHeight: "min(60vh, 32rem)" }}
           >
             <div
               className="relative"
@@ -241,15 +294,15 @@ function ConversationsSection({ campaignId }: { campaignId: string }) {
                     <div className="min-w-0 pr-3">
                       <Link to={`/threads/${t.id}`} className="group block">
                         <div className="text-sm font-medium text-ink group-hover:text-rust truncate">
-                          {t.lead_name ?? 'Unknown'}
+                          {t.lead_name ?? "Unknown"}
                         </div>
                         <div className="text-[11px] text-ink-faint font-mono mt-0.5 truncate">
-                          {t.lead_category ?? '—'}
+                          {t.lead_category ?? "—"}
                         </div>
                       </Link>
                     </div>
                     <div className="text-xs text-ink-muted truncate pr-3">
-                      {t.angle ?? '—'}
+                      {t.angle ?? "—"}
                     </div>
                     <div className="font-mono text-xs text-ink-muted">
                       {t.auto_reply_count ?? 0} replies
@@ -274,17 +327,20 @@ function ConversationsSection({ campaignId }: { campaignId: string }) {
 function ManualKickoffSection({ campaign }: { campaign: Campaign }) {
   const qc = useQueryClient();
   const [count, setCount] = useState(5);
-  const [lastResult, setLastResult] = useState<CampaignKickoffResult | null>(null);
+  const [lastResult, setLastResult] = useState<CampaignKickoffResult | null>(
+    null,
+  );
   const isCompleted = campaign.status === CampaignStatus.COMPLETED;
 
   const kickoff = useMutation({
-    mutationFn: () => api.kickoffCampaign(campaign.id, clampInt(count, 1, 100, 1)),
+    mutationFn: () =>
+      api.kickoffCampaign(campaign.id, clampInt(count, 1, 100, 1)),
     onSuccess: (data: CampaignKickoffResult) => {
       setLastResult(data);
-      qc.setQueryData(['campaign', campaign.id], data.campaign);
-      qc.invalidateQueries({ queryKey: ['campaigns'] });
-      qc.invalidateQueries({ queryKey: ['status'] });
-      qc.invalidateQueries({ queryKey: ['threads', 'campaign', campaign.id] });
+      qc.setQueryData(["campaign", campaign.id], data.campaign);
+      qc.invalidateQueries({ queryKey: ["campaigns"] });
+      qc.invalidateQueries({ queryKey: ["status"] });
+      qc.invalidateQueries({ queryKey: ["threads", "campaign", campaign.id] });
     },
   });
 
@@ -294,7 +350,10 @@ function ManualKickoffSection({ campaign }: { campaign: Campaign }) {
       description="Send the next queued leads now. This bypasses the 24-hour cap, but every send still counts afterward."
     >
       <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-        <Field label="Send next N" hint="Pulls from this campaign's queue in order.">
+        <Field
+          label="Send next N"
+          hint="Pulls from this campaign's queue in order."
+        >
           <Input
             type="number"
             min={1}
@@ -310,16 +369,16 @@ function ManualKickoffSection({ campaign }: { campaign: Campaign }) {
           onClick={() => kickoff.mutate()}
           disabled={kickoff.isPending || isCompleted}
         >
-          {kickoff.isPending ? 'Sending…' : 'Send now'}
+          {kickoff.isPending ? "Sending…" : "Send now"}
         </Button>
       </div>
 
       {lastResult && (
         <div className="border border-rule bg-paper px-4 py-3 text-xs text-ink-muted">
-          Sent {lastResult.sent} of {lastResult.requested}.{' '}
-          {lastResult.failed > 0 ? `${lastResult.failed} failed. ` : ''}
+          Sent {lastResult.sent} of {lastResult.requested}.{" "}
+          {lastResult.failed > 0 ? `${lastResult.failed} failed. ` : ""}
           {lastResult.remaining_queued} queued lead
-          {lastResult.remaining_queued === 1 ? '' : 's'} remain.
+          {lastResult.remaining_queued === 1 ? "" : "s"} remain.
         </div>
       )}
 
@@ -348,18 +407,18 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
         outreach_per_day: clampInt(draft.outreach_per_day, 1, 5000, 50),
       }),
     onSuccess: (data: Campaign) => {
-      qc.setQueryData(['campaign', campaign.id], data);
-      qc.invalidateQueries({ queryKey: ['campaigns'] });
-      qc.invalidateQueries({ queryKey: ['status'] });
+      qc.setQueryData(["campaign", campaign.id], data);
+      qc.invalidateQueries({ queryKey: ["campaigns"] });
+      qc.invalidateQueries({ queryKey: ["status"] });
     },
   });
 
   const resetSendCount = useMutation({
     mutationFn: () => api.resetCampaignSendCount(campaign.id),
     onSuccess: (data: Campaign) => {
-      qc.setQueryData(['campaign', campaign.id], data);
-      qc.invalidateQueries({ queryKey: ['campaigns'] });
-      qc.invalidateQueries({ queryKey: ['status'] });
+      qc.setQueryData(["campaign", campaign.id], data);
+      qc.invalidateQueries({ queryKey: ["campaigns"] });
+      qc.invalidateQueries({ queryKey: ["status"] });
     },
   });
 
@@ -372,7 +431,13 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
     <CollapsibleCard
       title="Campaign settings"
       description="Edit the campaign brief and daily send capacity. Resetting the send count starts a fresh 24-hour quota window for this campaign."
-      footer={<SaveRow dirty={dirty} pending={save.isPending} onSave={() => save.mutate()} />}
+      footer={
+        <SaveRow
+          dirty={dirty}
+          pending={save.isPending}
+          onSave={() => save.mutate()}
+        />
+      }
     >
       <div className="grid grid-cols-2 gap-4">
         <Field label="Campaign name">
@@ -381,14 +446,20 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
             onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
           />
         </Field>
-        <Field label="Daily send capacity" hint="Rolling 24-hour limit for first-contact and follow-up sends.">
+        <Field
+          label="Daily send capacity"
+          hint="Rolling 24-hour limit on new outreach contacts. Follow-up beats and inbound replies don't consume quota."
+        >
           <Input
             type="number"
             min={1}
             max={5000}
             value={String(draft.outreach_per_day)}
             onChange={(e) =>
-              setDraft((d) => ({ ...d, outreach_per_day: Number(e.target.value) || 1 }))
+              setDraft((d) => ({
+                ...d,
+                outreach_per_day: Number(e.target.value) || 1,
+              }))
             }
             className="font-mono"
           />
@@ -408,20 +479,24 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
           <div className="text-sm font-medium text-ink">24-hour send count</div>
           <p className="text-xs text-ink-muted mt-1">
             Current count is {campaign.sent_24h}/{campaign.outreach_per_day}.
-            {campaign.quota_reset_at ? ` Last reset ${relTime(campaign.quota_reset_at)}.` : ''}
+            {campaign.quota_reset_at
+              ? ` Last reset ${relTime(campaign.quota_reset_at)}.`
+              : ""}
           </p>
         </div>
         <Button
           variant="ghost"
           iconLeft={<RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />}
           onClick={() => {
-            if (window.confirm('Reset the 24-hour send count for this campaign?')) {
+            if (
+              window.confirm("Reset the 24-hour send count for this campaign?")
+            ) {
               resetSendCount.mutate();
             }
           }}
           disabled={resetSendCount.isPending || campaign.sent_24h === 0}
         >
-          {resetSendCount.isPending ? 'Resetting…' : 'Reset send count'}
+          {resetSendCount.isPending ? "Resetting…" : "Reset send count"}
         </Button>
       </div>
     </CollapsibleCard>
@@ -437,7 +512,9 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
  */
 function FollowupSection({ campaign }: { campaign: Campaign }) {
   const qc = useQueryClient();
-  const [draft, setDraft] = useState<FollowupConfig>(() => ({ ...campaign.followup }));
+  const [draft, setDraft] = useState<FollowupConfig>(() => ({
+    ...campaign.followup,
+  }));
 
   const save = useMutation({
     mutationFn: () =>
@@ -450,8 +527,8 @@ function FollowupSection({ campaign }: { campaign: Campaign }) {
         },
       }),
     onSuccess: (data: Campaign) => {
-      qc.setQueryData(['campaign', campaign.id], data);
-      qc.invalidateQueries({ queryKey: ['campaigns'] });
+      qc.setQueryData(["campaign", campaign.id], data);
+      qc.invalidateQueries({ queryKey: ["campaigns"] });
     },
   });
 
@@ -465,14 +542,20 @@ function FollowupSection({ campaign }: { campaign: Campaign }) {
     <CollapsibleCard
       title="Follow-up beat"
       description="Optional second message, fired a few seconds after the first outbound on every thread in this campaign. Literal template — no LLM. Skipped automatically if the lead replies first."
-      footer={<SaveRow dirty={dirty} pending={save.isPending} onSave={() => save.mutate()} />}
+      footer={
+        <SaveRow
+          dirty={dirty}
+          pending={save.isPending}
+          onSave={() => save.mutate()}
+        />
+      }
     >
       <Toggle
         label="Send a follow-up after first contact"
         description={
           draft.enabled
             ? `On. Fires ~${draft.delay_s}s (± ${draft.delay_jitter_s}s) after the first message sends.`
-            : 'Off. Leads receive the single first-contact message only.'
+            : "Off. Leads receive the single first-contact message only."
         }
         checked={draft.enabled}
         onToggle={() => setDraft((d) => ({ ...d, enabled: !d.enabled }))}
@@ -485,15 +568,20 @@ function FollowupSection({ campaign }: { campaign: Campaign }) {
         <Textarea
           rows={4}
           value={draft.template}
-          onChange={(e) => setDraft((d) => ({ ...d, template: e.target.value }))}
+          onChange={(e) =>
+            setDraft((d) => ({ ...d, template: e.target.value }))
+          }
           placeholder={
-            "or more generally, if you have any issues with your website or need any help, I can solve that for you. Cheers, Jaclyn"
+            "or more generally, if you have any issues with your website or need any help, I can solve that for you. Cheers, Tunoa"
           }
         />
       </Field>
 
       <div className="grid grid-cols-2 gap-4">
-        <Field label="Delay (seconds)" hint="Target gap between the two messages.">
+        <Field
+          label="Delay (seconds)"
+          hint="Target gap between the two messages."
+        >
           <Input
             type="number"
             min={0}
@@ -505,19 +593,152 @@ function FollowupSection({ campaign }: { campaign: Campaign }) {
             className="font-mono"
           />
         </Field>
-        <Field label="Jitter (± seconds)" hint="Randomness on top of the delay. Texture.">
+        <Field
+          label="Jitter (± seconds)"
+          hint="Randomness on top of the delay. Texture."
+        >
           <Input
             type="number"
             min={0}
             max={120}
             value={String(draft.delay_jitter_s)}
             onChange={(e) =>
-              setDraft((d) => ({ ...d, delay_jitter_s: Number(e.target.value) || 0 }))
+              setDraft((d) => ({
+                ...d,
+                delay_jitter_s: Number(e.target.value) || 0,
+              }))
             }
             className="font-mono"
           />
         </Field>
       </div>
+    </CollapsibleCard>
+  );
+}
+
+/**
+ * Per-campaign override for the outreach window. ``null`` means
+ * "inherit the workspace default" — the operator can flip a toggle to
+ * set per-campaign hours that override Settings → Behaviour for this
+ * campaign only. The effective window the scheduler will actually use
+ * is rendered as a hint so the operator can see the inheritance.
+ */
+function OutreachWindowSection({ campaign }: { campaign: Campaign }) {
+  const qc = useQueryClient();
+  const hasOverride = campaign.outreach_window !== null;
+  const initial: OutreachWindowConfig =
+    campaign.outreach_window ?? campaign.effective_outreach_window;
+  const [overrideOn, setOverrideOn] = useState(hasOverride);
+  const [draft, setDraft] = useState<OutreachWindowConfig>(() => ({
+    ...initial,
+  }));
+
+  const save = useMutation({
+    mutationFn: () => {
+      let next: OutreachWindowConfig | null;
+      if (!overrideOn) {
+        next = null;
+      } else {
+        const start = clampInt(draft.start_hour, 0, 23, 8);
+        let end = clampInt(draft.end_hour, 1, 24, 17);
+        if (end <= start) end = Math.min(24, start + 1);
+        next = { enabled: draft.enabled, start_hour: start, end_hour: end };
+      }
+      return api.patchCampaign(campaign.id, { outreach_window: next });
+    },
+    onSuccess: (data: Campaign) => {
+      qc.setQueryData(["campaign", campaign.id], data);
+      qc.invalidateQueries({ queryKey: ["campaigns"] });
+    },
+  });
+
+  const dirty =
+    overrideOn !== hasOverride ||
+    (overrideOn &&
+      (draft.enabled !== initial.enabled ||
+        Number(draft.start_hour) !== initial.start_hour ||
+        Number(draft.end_hour) !== initial.end_hour));
+
+  const eff = campaign.effective_outreach_window;
+
+  return (
+    <CollapsibleCard
+      title="Outreach window"
+      description={
+        hasOverride
+          ? `Per-campaign override on. Scheduler paces sends across ${eff.start_hour}:00–${eff.end_hour}:00 server-local for this campaign.`
+          : eff.enabled
+            ? `Inheriting workspace default — paces sends across ${eff.start_hour}:00–${eff.end_hour}:00 server-local. Manual kickoff bypasses.`
+            : "Workspace default has the window disabled — no time gating."
+      }
+      footer={
+        <SaveRow
+          dirty={dirty}
+          pending={save.isPending}
+          onSave={() => save.mutate()}
+        />
+      }
+    >
+      <Toggle
+        label="Override the workspace window for this campaign"
+        description={
+          overrideOn
+            ? "On. The fields below apply to this campaign only; the workspace default is ignored."
+            : "Off. This campaign uses the workspace default from Settings → Behaviour."
+        }
+        checked={overrideOn}
+        onToggle={() => setOverrideOn((v) => !v)}
+      />
+
+      {overrideOn && (
+        <>
+          <Toggle
+            label="Pace this campaign across business hours"
+            description={
+              draft.enabled
+                ? `Spreads this campaign's daily quota evenly between ${draft.start_hour}:00 and ${draft.end_hour}:00 (server local).`
+                : "Disabled for this campaign — scheduler will burst then quota-cap, regardless of the time of day."
+            }
+            checked={draft.enabled}
+            onToggle={() => setDraft((d) => ({ ...d, enabled: !d.enabled }))}
+          />
+
+          {draft.enabled && (
+            <div className="grid grid-cols-2 gap-4">
+              <Field label="Start hour" hint="0-23, server-local.">
+                <Input
+                  type="number"
+                  min={0}
+                  max={23}
+                  value={String(draft.start_hour)}
+                  onChange={(e) =>
+                    setDraft((d) => ({
+                      ...d,
+                      start_hour: Number(e.target.value) || 0,
+                    }))
+                  }
+                  className="font-mono"
+                />
+              </Field>
+              <Field label="End hour" hint="1-24, server-local. Exclusive.">
+                <Input
+                  type="number"
+                  min={1}
+                  max={24}
+                  value={String(draft.end_hour)}
+                  onChange={(e) =>
+                    setDraft((d) => ({
+                      ...d,
+                      end_hour: Number(e.target.value) || 0,
+                    }))
+                  }
+                  className="font-mono"
+                />
+              </Field>
+            </div>
+          )}
+        </>
+      )}
     </CollapsibleCard>
   );
 }
@@ -567,21 +788,29 @@ function CollapsibleCard({
       >
         <span>
           <span className="block text-base font-medium text-ink">{title}</span>
-          {description && <span className="block mt-1 text-xs text-ink-muted">{description}</span>}
+          {description && (
+            <span className="block mt-1 text-xs text-ink-muted">
+              {description}
+            </span>
+          )}
         </span>
         <span className="flex items-center gap-3 text-xs text-ink-faint font-mono">
           {meta}
           <ChevronDown
             aria-hidden="true"
-            className={`h-4 w-4 transition-transform ${open ? 'rotate-180' : ''}`}
+            className={`h-4 w-4 transition-transform ${open ? "rotate-180" : ""}`}
             strokeWidth={1.5}
           />
         </span>
       </button>
       {open && (
-        <div className="mt-4 pt-4 border-t border-rule flex flex-col gap-5">{children}</div>
+        <div className="mt-4 pt-4 border-t border-rule flex flex-col gap-5">
+          {children}
+        </div>
       )}
-      {open && footer && <div className="mt-5 pt-4 border-t border-rule">{footer}</div>}
+      {open && footer && (
+        <div className="mt-5 pt-4 border-t border-rule">{footer}</div>
+      )}
     </section>
   );
 }

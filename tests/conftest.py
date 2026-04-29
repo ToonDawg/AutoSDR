@@ -30,13 +30,11 @@ def _isolate_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db_path = tmp_path / "autosdr.db"
     outbox_path = tmp_path / "outbox.jsonl"
     pause_flag = tmp_path / ".autosdr-pause"
-    pid_path = tmp_path / "autosdr.pid"
     log_dir = tmp_path / "logs"
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
     monkeypatch.setenv("OUTBOX_PATH", str(outbox_path))
     monkeypatch.setenv("PAUSE_FLAG_PATH", str(pause_flag))
-    monkeypatch.setenv("PID_FILE_PATH", str(pid_path))
     monkeypatch.setenv("LOG_DIR", str(log_dir))
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
 

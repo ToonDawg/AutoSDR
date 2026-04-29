@@ -1,9 +1,12 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useParams } from 'react-router-dom';
+import { useState } from 'react';
 import { Activity, ExternalLink, Globe, MapPin, MessageSquare, Phone, Star } from 'lucide-react';
 import { api } from '@/lib/api';
 import { Badge } from '@/components/ui/Badge';
 import { BackLink } from '@/components/ui/BackLink';
+import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
 import {
   CONTACT_TYPE_LABEL,
   LEAD_STATUS_LABEL,
@@ -13,7 +16,12 @@ import {
   formatSkipReason,
   relTime,
 } from '@/lib/format';
-import type { LeadStatusT, Thread } from '@/lib/types';
+import type {
+  EnrichmentStatus,
+  LeadEnrichment,
+  LeadStatusT,
+  Thread,
+} from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 const STATUS_TONE: Record<LeadStatusT, Parameters<typeof Badge>[0]['tone']> = {
@@ -36,19 +44,40 @@ const STATUS_TONE: Record<LeadStatusT, Parameters<typeof Badge>[0]['tone']> = {
  */
 export function LeadDetail() {
   const { id = '' } = useParams();
+  const qc = useQueryClient();
+  const [optOutOpen, setOptOutOpen] = useState(false);
+  const [optOutReason, setOptOutReason] = useState('manual');
 
-  const { data: lead, isLoading, isError, error } = useQuery({
+  const leadQuery = useQuery({
     queryKey: ['lead', id],
     queryFn: () => api.getLead(id),
     enabled: !!id,
   });
-  const { data: threads } = useQuery({
+
+  const threadsQuery = useQuery({
     queryKey: ['threads', 'lead', id],
     queryFn: () => api.listThreads({ leadId: id, limit: 20 }),
     enabled: !!id,
   });
 
-  if (isLoading) {
+  const optOutMut = useMutation({
+    mutationFn: () => api.optOutLead(id, optOutReason.trim() || 'manual'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['lead', id] });
+      qc.invalidateQueries({ queryKey: ['leads'] });
+      setOptOutOpen(false);
+    },
+  });
+
+  const clearDncMut = useMutation({
+    mutationFn: () => api.clearLeadOptOut(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['lead', id] });
+      qc.invalidateQueries({ queryKey: ['leads'] });
+    },
+  });
+
+  if (leadQuery.isLoading) {
     return (
       <div className="page-narrow gap-6">
         <div className="h-4 bg-paper-deep animate-pulse w-48" />
@@ -58,7 +87,9 @@ export function LeadDetail() {
     );
   }
 
-  if (isError || !lead) {
+  const error = leadQuery.error;
+
+  if (leadQuery.isError || !leadQuery.data) {
     return (
       <div className="page-narrow gap-6">
         <BackLink to="/leads">All leads</BackLink>
@@ -69,6 +100,9 @@ export function LeadDetail() {
     );
   }
 
+  const lead = leadQuery.data;
+  const threads = threadsQuery.data;
+
   const raw = lead.raw_data ?? {};
   const rating = asNumber(raw.rating);
   const reviewsCount = asNumber(raw.reviews);
@@ -76,6 +110,8 @@ export function LeadDetail() {
   const searchQuery = asString(raw.searchQuery);
   const scrapedAt = asString(raw.scrapedAt);
   const plusCode = asString(raw.plusCode);
+
+  const enrichment = asEnrichment(raw.enrichment);
 
   const knownKeys = new Set([
     'name',
@@ -90,6 +126,7 @@ export function LeadDetail() {
     'scrapedAt',
     'plusCode',
     'webResults',
+    'enrichment',
   ]);
   const extras = Object.entries(raw).filter(
     ([k, v]) => !knownKeys.has(k) && v !== null && v !== '',
@@ -102,23 +139,54 @@ export function LeadDetail() {
       <BackLink to="/leads">All leads</BackLink>
 
       <header className="border-b border-rule pb-5">
-        <div className="flex items-center gap-3 mb-2">
-          <Badge tone={STATUS_TONE[lead.status]} dot>
-            {LEAD_STATUS_LABEL[lead.status]}
-          </Badge>
-          {lead.do_not_contact_at && (
-            <Badge tone="oxblood" dot>
-              Opted out
+        <div className="flex flex-wrap items-start justify-between gap-3 mb-2">
+          <div className="flex flex-wrap items-center gap-3">
+            <Badge tone={STATUS_TONE[lead.status]} dot>
+              {LEAD_STATUS_LABEL[lead.status]}
             </Badge>
-          )}
-          {lead.contact_type && (
-            <Badge tone="outline">
-              {CONTACT_TYPE_LABEL[lead.contact_type] ?? lead.contact_type}
-            </Badge>
-          )}
-          <span className="font-mono text-[11px] text-ink-faint">
-            #{String(lead.import_order).padStart(3, '0')}
-          </span>
+            {lead.do_not_contact_at && (
+              <Badge tone="oxblood" dot>
+                Opted out
+              </Badge>
+            )}
+            {lead.contact_type && (
+              <Badge tone="outline">
+                {CONTACT_TYPE_LABEL[lead.contact_type] ?? lead.contact_type}
+              </Badge>
+            )}
+            <span className="font-mono text-[11px] text-ink-faint">
+              #{String(lead.import_order).padStart(3, '0')}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {!lead.do_not_contact_at ? (
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  setOptOutReason('manual');
+                  setOptOutOpen(true);
+                }}
+              >
+                Mark do-not-contact
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  if (window.confirm('Clear do-not-contact for this lead?')) {
+                    clearDncMut.mutate();
+                  }
+                }}
+                disabled={clearDncMut.isPending}
+              >
+                Clear do-not-contact
+              </Button>
+            )}
+          </div>
         </div>
         <h1 className="text-2xl font-medium mb-1">{lead.name ?? 'Unnamed lead'}</h1>
         {lead.category && (
@@ -279,6 +347,8 @@ export function LeadDetail() {
         )}
       </section>
 
+      {enrichment && <EnrichmentCard enrichment={enrichment} leadId={lead.id} />}
+
       {reviewDetails.length > 0 && (
         <section className="flex flex-col gap-3">
           <div className="flex items-end justify-between pb-2 border-b border-rule">
@@ -376,6 +446,54 @@ export function LeadDetail() {
           </dl>
         </section>
       )}
+      {optOutOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4"
+          onClick={() => !optOutMut.isPending && setOptOutOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="paper-card w-full max-w-md p-5 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div>
+              <h2 className="text-base font-medium text-ink">
+                Mark as do-not-contact
+              </h2>
+              <p className="text-xs text-ink-muted mt-1 leading-relaxed">
+                Future outbound to this phone will be blocked — same outcome as an
+                inbound STOP keyword.
+              </p>
+            </div>
+            <label className="flex flex-col gap-1.5">
+              <span className="label">Reason</span>
+              <Input
+                value={optOutReason}
+                onChange={(e) => setOptOutReason(e.target.value)}
+                disabled={optOutMut.isPending}
+                placeholder="manual"
+              />
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                onClick={() => setOptOutOpen(false)}
+                disabled={optOutMut.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                onClick={() => optOutMut.mutate()}
+                disabled={optOutMut.isPending}
+              >
+                {optOutMut.isPending ? 'Saving…' : 'Confirm'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -402,6 +520,159 @@ function asString(v: unknown): string | null {
 function asReviewList(v: unknown): ReviewDetail[] {
   if (!Array.isArray(v)) return [];
   return v.filter((r): r is ReviewDetail => typeof r === 'object' && r !== null);
+}
+
+function asEnrichment(v: unknown): LeadEnrichment | null {
+  if (!v || typeof v !== 'object') return null;
+  const blob = v as { _meta?: unknown; signals?: unknown };
+  if (!blob._meta || typeof blob._meta !== 'object') return null;
+  const meta = blob._meta as { status?: unknown; fetched_at?: unknown };
+  if (typeof meta.status !== 'string' || typeof meta.fetched_at !== 'string') {
+    return null;
+  }
+  return blob as LeadEnrichment;
+}
+
+const ENRICHMENT_TONE: Record<EnrichmentStatus, Parameters<typeof Badge>[0]['tone']> = {
+  ok: 'forest',
+  no_url: 'neutral',
+  timeout: 'mustard',
+  blocked: 'oxblood',
+  empty_shell: 'neutral',
+  not_found: 'oxblood',
+  error: 'oxblood',
+  killswitch_aborted: 'oxblood',
+  disabled: 'neutral',
+};
+
+function EnrichmentCard({
+  enrichment,
+  leadId,
+}: {
+  enrichment: LeadEnrichment;
+  leadId: string;
+}) {
+  const status = enrichment._meta.status;
+  const tone = ENRICHMENT_TONE[status] ?? 'neutral';
+  const signals = enrichment.signals ?? {};
+  const summary = formatEnrichmentSummary(enrichment);
+  const socials = Array.isArray(signals.external_links_to_socials)
+    ? signals.external_links_to_socials
+    : [];
+
+  return (
+    <section className="paper-card px-5 py-4">
+      <div className="flex items-baseline justify-between gap-3 mb-3">
+        <div className="flex items-center gap-2">
+          <span className="label">Website enrichment</span>
+          <Badge tone={tone} dot>
+            {status}
+          </Badge>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <span className="font-mono text-[11px] text-ink-faint">
+            {absTime(enrichment._meta.fetched_at)}
+          </span>
+          <Link
+            to={`/scans/${leadId}`}
+            className="font-mono text-[11px] tracking-[0.14em] uppercase text-ink-muted hover:text-ink"
+          >
+            View full scan →
+          </Link>
+        </div>
+      </div>
+      {summary && (
+        <p className="text-sm text-ink-muted mb-3">{summary}</p>
+      )}
+      <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
+        {typeof signals.title === 'string' && signals.title && (
+          <>
+            <dt className="text-ink-muted">Title</dt>
+            <dd className="text-ink wrap-break-word">{signals.title}</dd>
+          </>
+        )}
+        {typeof signals.h1 === 'string' && signals.h1 && (
+          <>
+            <dt className="text-ink-muted">H1</dt>
+            <dd className="text-ink wrap-break-word">{signals.h1}</dd>
+          </>
+        )}
+        {typeof signals.cms === 'string' && signals.cms && (
+          <>
+            <dt className="text-ink-muted">CMS</dt>
+            <dd className="font-mono text-xs text-ink">{signals.cms}</dd>
+          </>
+        )}
+        {typeof signals.sitemap_count === 'number' && (
+          <>
+            <dt className="text-ink-muted">Sitemap</dt>
+            <dd className="font-mono text-xs text-ink tabular-nums">
+              {signals.sitemap_count} pages
+              {typeof signals.sitemap_last_modified === 'string' &&
+              signals.sitemap_last_modified
+                ? `, last edit ${signals.sitemap_last_modified}`
+                : ''}
+            </dd>
+          </>
+        )}
+        {socials.length > 0 && (
+          <>
+            <dt className="text-ink-muted">Socials</dt>
+            <dd className="text-xs text-ink wrap-break-word">
+              {socials.map((url, i) => (
+                <span key={url} className="font-mono">
+                  {url}
+                  {i < socials.length - 1 ? ', ' : ''}
+                </span>
+              ))}
+            </dd>
+          </>
+        )}
+      </dl>
+    </section>
+  );
+}
+
+function formatEnrichmentSummary(enrichment: LeadEnrichment): string {
+  const status = enrichment._meta.status;
+  if (status !== 'ok') {
+    switch (status) {
+      case 'no_url':
+        return 'No website URL on the lead — enrichment skipped.';
+      case 'timeout':
+        return 'Website did not respond inside the wall-clock budget.';
+      case 'blocked':
+        return "Website's robots.txt disallows AutoSDR's user-agent.";
+      case 'empty_shell':
+        return 'Static HTML returned no useful structural content (likely an SPA).';
+      case 'not_found':
+        return 'Website returned 404 / 410.';
+      case 'error':
+        return 'Website returned a 5xx or other unrecoverable error.';
+      case 'killswitch_aborted':
+        return 'Killswitch tripped during the fetch.';
+      case 'disabled':
+        return 'Enrichment is disabled in workspace settings.';
+      default:
+        return '';
+    }
+  }
+  const signals = enrichment.signals ?? {};
+  const cms =
+    typeof signals.cms === 'string' && signals.cms && signals.cms !== 'unknown'
+      ? signals.cms.charAt(0).toUpperCase() + signals.cms.slice(1)
+      : null;
+  const pageCount =
+    typeof signals.sitemap_count === 'number'
+      ? `${signals.sitemap_count} pages`
+      : null;
+  const lastEdit =
+    typeof signals.sitemap_last_modified === 'string' &&
+    signals.sitemap_last_modified
+      ? `last edit ${signals.sitemap_last_modified}`
+      : null;
+  const parts = [cms, pageCount, lastEdit].filter(Boolean);
+  return parts.length > 0 ? parts.join(', ') : '';
 }
 
 function normaliseUrl(url: string): string {

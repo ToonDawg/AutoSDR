@@ -1,4 +1,13 @@
-"""First-contact outreach pipeline: analyse -> generate -> evaluate -> send."""
+"""First-contact outreach pipeline: analyse -> generate -> evaluate -> send.
+
+Lead-website enrichment is **not** run on the outreach hot path. The
+background scan worker (:mod:`autosdr.pipeline.scans`) keeps
+``Lead.raw_data['enrichment']`` warm; this pipeline reads whatever is
+already there and reports its status onto ``analysis_meta`` so the
+angle-funnel and audit log stay honest. If a lead has never been
+scanned, the analysis call still runs and the recorded status is
+``"missing"``.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -38,6 +48,39 @@ from autosdr.pipeline.followup import schedule_followup_send
 from autosdr.prompts import analysis
 
 logger = logging.getLogger(__name__)
+
+
+def _read_cached_enrichment_status(lead: Lead, workspace: Workspace) -> str:
+    """Read the cached enrichment status off ``Lead.raw_data['enrichment']``.
+
+    Returns one of:
+
+    * ``"disabled"`` — workspace setting flips enrichment off entirely.
+    * ``"missing"`` — workspace enabled but no blob present (the scan
+      worker has not yet reached this lead).
+    * any value from :data:`autosdr.enrichment.EnrichmentStatus` — the
+      status persisted by the most recent scan pass.
+
+    No HTTP, no DB writes. The scan worker owns persistence; this
+    helper is read-only so the outreach pipeline can never block on
+    network I/O.
+    """
+
+    cfg = (workspace.settings or {}).get("enrichment") or {}
+    if not bool(cfg.get("enabled", True)):
+        return "disabled"
+
+    raw = lead.raw_data or {}
+    blob = raw.get("enrichment")
+    if not isinstance(blob, dict):
+        return "missing"
+    meta = blob.get("_meta")
+    if not isinstance(meta, dict):
+        return "missing"
+    status = meta.get("status")
+    if not isinstance(status, str) or not status:
+        return "missing"
+    return status
 
 
 @dataclass
@@ -185,6 +228,7 @@ async def _run_analysis(
         ),
     )
     parsed.setdefault("angle", "")
+    parsed.setdefault("angle_type", "")
     parsed.setdefault("signal", "")
     parsed.setdefault("owner_first_name", "")
     parsed.setdefault("owner_evidence", "")
@@ -216,8 +260,17 @@ async def run_outreach_for_campaign_lead(
     campaign: Campaign,
     campaign_lead: CampaignLead,
     lead: Lead,
+    http_client: httpx.AsyncClient | None = None,
 ) -> OutreachResult:
-    """Execute the outreach pipeline for a single campaign-lead assignment."""
+    """Execute the outreach pipeline for a single campaign-lead assignment.
+
+    ``http_client`` is accepted for signature compatibility with the
+    scheduler, but is unused by this pipeline now that enrichment runs
+    in the background scan worker. Keeping the parameter avoids
+    churning the scheduler call site; a follow-up can drop it.
+    """
+
+    del http_client  # enrichment is no longer on this path
 
     settings_blob = workspace.settings or {}
     settings_llm, eval_threshold, eval_max_attempts = read_loop_settings(workspace)
@@ -302,6 +355,17 @@ async def run_outreach_for_campaign_lead(
     message_history = thread_history(session, thread)
     analysis_meta: dict[str, Any] = {}
     if created or not thread.angle:
+        # Enrichment is owned by the background scan worker — read the
+        # latest cached status off ``raw_data.enrichment`` so the audit
+        # trail stays honest, but never block the outreach loop on a
+        # network fetch.
+        enrichment_status = _read_cached_enrichment_status(lead, workspace)
+        logger.info(
+            "outreach reading cached enrichment thread=%s lead=%s status=%s",
+            thread.id,
+            lead.id,
+            enrichment_status,
+        )
         try:
             analysis_result, truncated = await _run_analysis(
                 settings_llm=settings_llm,
@@ -322,6 +386,14 @@ async def run_outreach_for_campaign_lead(
             angle = f"Recipient owner's first name: {owner_first_name}\n\n{angle}"
         lead_short_name = str(analysis_result.get("lead_short_name") or "").strip() or None
         thread.angle = angle
+        # Discrete bucket for the angle-funnel aggregation. Single
+        # write site — keeping ``angle`` and ``angle_type`` in lockstep
+        # is the invariant the funnel depends on. Unknown / blank LLM
+        # output bucketed as ``"fallback"`` so the funnel never sees a
+        # mid-vocabulary NULL on rows we just wrote.
+        thread.angle_type = (
+            str(analysis_result.get("angle_type") or "").strip() or "fallback"
+        )
         analysis_meta = {
             "model": analysis_result["_meta"]["model"],
             "tokens_in": analysis_result["_meta"]["tokens_in"],
@@ -333,6 +405,12 @@ async def run_outreach_for_campaign_lead(
             "confidence": analysis_result.get("confidence"),
             "raw_data_truncated": truncated,
             "llm_call_id": analysis_result["_meta"].get("llm_call_id"),
+            # The angle-funnel ``?enrichment=`` stratifier reads this
+            # column straight off ``Message.metadata->>"$.analysis.enrichment_status"``,
+            # so the value MUST come from the closed
+            # :data:`autosdr.enrichment.EnrichmentStatus` vocabulary
+            # (or ``"disabled"`` when the workspace toggle is off).
+            "enrichment_status": enrichment_status,
         }
         logger.info(
             "analysis thread=%s angle=%r owner=%r short_name=%r confidence=%s signal=%r truncated=%s",

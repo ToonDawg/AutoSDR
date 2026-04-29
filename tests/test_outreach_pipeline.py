@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 import pytest
 
 from autosdr.connectors.base import SendResult
@@ -16,6 +19,7 @@ from autosdr.models import (
     CampaignStatus,
     Lead,
     LeadStatus,
+    LlmCall,
     Message,
     MessageRole,
     Thread,
@@ -105,6 +109,7 @@ def _install_mock_llm(monkeypatch: pytest.MonkeyPatch, *, responses: dict[str, A
                 "prompt_version": prompt_version,
                 "model": model,
                 "context": context,
+                "user": user,
             }
         )
         payload = responses.get(prompt_version)
@@ -140,6 +145,7 @@ def _install_mock_llm(monkeypatch: pytest.MonkeyPatch, *, responses: dict[str, A
                 "prompt_version": prompt_version,
                 "model": model,
                 "context": context,
+                "user": user,
             }
         )
         payload = responses.get(prompt_version)
@@ -179,13 +185,14 @@ async def test_outreach_happy_path(prepared_campaign, fresh_db, monkeypatch):
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.3": {
+            "analysis-v3.5": {
                 "angle": "Rating of 3 from 10 reviews suggests room to improve service perception.",
+                "angle_type": "review_theme",
                 "signal": "rating=3, reviews=10",
                 "confidence": 0.7,
             },
-            "generation-v6": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
-            "evaluation-v4.2": {
+            "generation-v7": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
+            "evaluation-v4.3": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -237,6 +244,7 @@ async def test_outreach_happy_path(prepared_campaign, fresh_db, monkeypatch):
         assert cl.status == CampaignLeadStatus.CONTACTED
         assert thread.status == ThreadStatus.ACTIVE
         assert thread.angle  # analysis wrote it
+        assert thread.angle_type == "review_theme"  # discrete bucket persisted in lockstep with angle
         assert thread.tone_snapshot  # snapshot at creation
         assert message.role == MessageRole.AI
         assert "saw your rating" in message.content.lower()
@@ -257,16 +265,16 @@ async def test_outreach_retries_then_passes(prepared_campaign, fresh_db, monkeyp
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.3": {
+            "analysis-v3.5": {
                 "angle": "Rating 3 — opportunity to stand out",
                 "signal": "rating",
                 "confidence": 0.6,
             },
-            "generation-v6": [
+            "generation-v7": [
                 "Hello valued customer! Let's discuss synergies.",  # bad
                 "Hey — noticed your ratings slipped recently. Quick chat about it?",  # good
             ],
-            "evaluation-v4.2": [
+            "evaluation-v4.3": [
                 {
                     "scores": {
                         "tone_match": 0.3,
@@ -314,15 +322,66 @@ async def test_outreach_retries_then_passes(prepared_campaign, fresh_db, monkeyp
         assert "noticed your ratings" in messages[0].content.lower()
 
 
+async def test_outreach_persists_fallback_angle_type_when_llm_omits_it(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """If the LLM returns no ``angle_type``, ``thread.angle_type`` MUST still
+    be populated — the funnel aggregation buckets NULL as ``"unknown"`` only
+    for legacy rows that pre-date this column. New rows always carry a
+    bucket so the lockstep invariant with ``thread.angle`` holds."""
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.5": {
+                "angle": "Rating 3 — opportunity",
+                # angle_type intentionally omitted to exercise the fallback.
+                "signal": "rating",
+                "confidence": 0.6,
+            },
+            "generation-v7": "Hey — quick chat about your reviews?",
+            "evaluation-v4.3": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+
+    with fresh_db() as session:
+        result = await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+
+    assert result.sent
+
+    with fresh_db() as session:
+        thread = session.query(Thread).one()
+        assert thread.angle  # freeform written
+        assert thread.angle_type == "fallback"  # bucket guaranteed non-NULL on new rows
+
+
 async def test_outreach_escalates_after_max_attempts(
     prepared_campaign, fresh_db, monkeypatch
 ):
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.3": {"angle": "x", "signal": "y", "confidence": 0.5},
-            "generation-v6": "Hi hi hi hi hi hi hi hi.",
-            "evaluation-v4.2": {
+            "analysis-v3.5": {"angle": "x", "signal": "y", "confidence": 0.5},
+            "generation-v7": "Hi hi hi hi hi hi hi hi.",
+            "evaluation-v4.3": {
                 "scores": {
                     "tone_match": 0.3,
                     "personalisation": 0.3,
@@ -374,9 +433,9 @@ async def test_outreach_rejects_message_over_max_length(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.3": {"angle": "y", "signal": "z", "confidence": 0.6},
-            "generation-v6": long_draft,
-            "evaluation-v4.2": {
+            "analysis-v3.5": {"angle": "y", "signal": "z", "confidence": 0.6},
+            "generation-v7": long_draft,
+            "evaluation-v4.3": {
                 "scores": {
                     "tone_match": 1.0,
                     "personalisation": 1.0,
@@ -585,9 +644,9 @@ async def test_outreach_pauses_campaign_lead_when_connector_send_fails(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.3": {"angle": "x", "signal": "y", "confidence": 0.7},
-            "generation-v6": "hey, quick chat?",
-            "evaluation-v4.2": {
+            "analysis-v3.5": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v7": "hey, quick chat?",
+            "evaluation-v4.3": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -636,9 +695,9 @@ async def test_outreach_skips_if_contact_uri_changes_before_send(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.3": {"angle": "x", "signal": "y", "confidence": 0.7},
-            "generation-v6": "unused",
-            "evaluation-v4.2": {
+            "analysis-v3.5": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v7": "unused",
+            "evaluation-v4.3": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -752,13 +811,13 @@ async def test_outreach_aborts_when_lead_opts_out_during_pipeline(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.3": {
+            "analysis-v3.5": {
                 "angle": "Rating 3 — opportunity",
                 "signal": "rating",
                 "confidence": 0.7,
             },
-            "generation-v6": "hey, quick one?",
-            "evaluation-v4.2": {
+            "generation-v7": "hey, quick one?",
+            "evaluation-v4.3": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -814,3 +873,402 @@ async def test_outreach_aborts_when_lead_opts_out_during_pipeline(
         assert cl.status == CampaignLeadStatus.SKIPPED
         # Thread was created during the analysis stage (before the race) — that's fine.
         assert session.query(Message).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Lead enrichment integration (ticket 0011)
+# ---------------------------------------------------------------------------
+
+
+_ENRICHMENT_HOMEPAGE = (
+    '<!doctype html><html><head>'
+    '<title>Hanley Browne Plumbing — Brisbane</title>'
+    '<meta name="generator" content="WordPress 6.5">'
+    '<meta name="viewport" content="width=device-width">'
+    '</head><body><h1>24/7 Brisbane plumbers</h1>'
+    '<a href="https://www.facebook.com/hanleybrowne">FB</a>'
+    '<script src="/wp-content/themes/hanley.js"></script>'
+    '</body></html>'
+).encode("utf-8")
+
+
+def _make_enrichment_handler(*, slow_root: bool = False, slow_sitemap: bool = False):
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/robots.txt":
+            return httpx.Response(404)
+        if path == "/":
+            if slow_root:
+                await asyncio.sleep(5.0)
+            return httpx.Response(
+                200,
+                content=_ENRICHMENT_HOMEPAGE,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        if path == "/sitemap.xml":
+            if slow_sitemap:
+                await asyncio.sleep(5.0)
+            return httpx.Response(
+                200,
+                content=(
+                    b'<?xml version="1.0"?><urlset>'
+                    b"<url><loc>https://example.com.au/p1</loc>"
+                    b"<lastmod>2024-08-12</lastmod></url>"
+                    b"<url><loc>https://example.com.au/p2</loc></url>"
+                    b"</urlset>"
+                ),
+            )
+        return httpx.Response(404)
+
+    return _handler
+
+
+def _give_lead_a_website(fresh_db, prepared_campaign, *, website: str = "https://example.com.au") -> None:
+    with fresh_db() as session:
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        lead.website = website
+        session.flush()
+
+
+async def test_outreach_reads_cached_enrichment(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """Outreach reads the cached enrichment envelope without running an
+    HTTP fetch — the background scan worker (separate process loop)
+    owns persistence. The analysis prompt sees the cached title / H1
+    and the audit row carries ``enrichment_status="ok"``."""
+
+    _give_lead_a_website(fresh_db, prepared_campaign)
+    fetched_at = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+    with fresh_db() as session:
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        lead.raw_data = {
+            **(lead.raw_data or {}),
+            "enrichment": {
+                "_meta": {
+                    "version": 2,
+                    "connector": "website_static",
+                    "connector_version": "1.0",
+                    "status": "ok",
+                    "fetched_at": fetched_at.isoformat(),
+                    "user_agent": "AutoSDR/test",
+                    "robots_respected": True,
+                },
+                "signals": {
+                    "title": "Hanley Browne Plumbing — Stafford Heights",
+                    "h1": "24/7 Brisbane plumbers",
+                    "cms": "wordpress",
+                },
+            },
+        }
+        from sqlalchemy.orm.attributes import flag_modified as _fm
+        _fm(lead, "raw_data")
+        session.flush()
+
+    captured_calls = _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.5": {
+                "angle": "WordPress site, 24/7 callouts hook.",
+                "angle_type": "signature_detail",
+                "signal": "wordpress generator + h1",
+                "confidence": 0.7,
+            },
+            "generation-v7": "Hey — quick chat?",
+            "evaluation-v4.3": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+
+    fetch_count = 0
+
+    def _refuse_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal fetch_count
+        fetch_count += 1
+        raise AssertionError(
+            "outreach must NOT issue HTTP fetches; the scan worker owns enrichment "
+            f"(got {request.method} {request.url})"
+        )
+
+    transport = httpx.MockTransport(_refuse_handler)
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        with fresh_db() as session:
+            result = await run_outreach_for_campaign_lead(
+                session=session,
+                connector=connector,
+                workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+                campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+                campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
+                lead=session.get(Lead, prepared_campaign["lead_id"]),
+                http_client=http_client,
+            )
+
+    assert result.sent
+    assert fetch_count == 0, "outreach must never call HTTP for enrichment"
+
+    with fresh_db() as session:
+        # The cached blob is unchanged — outreach is read-only on it.
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        envelope = lead.raw_data.get("enrichment")
+        assert envelope is not None
+        assert envelope["_meta"]["status"] == "ok"
+        assert envelope["_meta"]["connector"] == "website_static"
+
+        # The analysis user_prompt carries the cached signal — the LLM
+        # has the title/H1 to ground its angle on, just via the worker
+        # path instead of an inline pre-fetch.
+        analysis_calls = [
+            c for c in captured_calls
+            if c["kind"] == "json" and c["prompt_version"].startswith("analysis-")
+        ]
+        assert analysis_calls, "expected an analysis call to have run"
+        prompt = analysis_calls[0]["user"]
+        assert "Hanley Browne Plumbing" in prompt
+        assert "24/7 Brisbane plumbers" in prompt
+        assert "wordpress" in prompt.lower()
+
+        # Message metadata carries the enrichment_status so the
+        # angle-funnel ?enrichment= filter has a single source of truth.
+        message = session.query(Message).filter(Message.role == MessageRole.AI).one()
+        assert message.metadata_["analysis"]["enrichment_status"] == "ok"
+
+
+async def test_outreach_surfaces_cached_failure_status(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """A cached failure status (timeout / blocked / not_found / error /
+    killswitch_aborted) flows through the audit row unchanged. Outreach
+    does not retry the fetch — that is the worker's job — and the
+    analysis LLM call still runs on whatever signal is present."""
+
+    _give_lead_a_website(fresh_db, prepared_campaign)
+    fetched_at = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+    with fresh_db() as session:
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        lead.raw_data = {
+            **(lead.raw_data or {}),
+            "enrichment": {
+                "_meta": {
+                    "version": 2,
+                    "connector": "website_static",
+                    "connector_version": "1.0",
+                    "status": "timeout",
+                    "fetched_at": fetched_at.isoformat(),
+                    "user_agent": "AutoSDR/test",
+                    "robots_respected": True,
+                    "latency_ms": 1499,
+                },
+                "signals": {},
+            },
+        }
+        from sqlalchemy.orm.attributes import flag_modified as _fm
+        _fm(lead, "raw_data")
+        session.flush()
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.5": {
+                "angle": "Fallback, site did not respond in time.",
+                "angle_type": "fallback",
+                "signal": "no website signal",
+                "confidence": 0.4,
+            },
+            "generation-v7": "Hey there, quick question.",
+            "evaluation-v4.3": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+
+    fetch_count = 0
+
+    def _refuse_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal fetch_count
+        fetch_count += 1
+        raise AssertionError("outreach must never re-fetch a cached failure")
+
+    transport = httpx.MockTransport(_refuse_handler)
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        with fresh_db() as session:
+            result = await run_outreach_for_campaign_lead(
+                session=session,
+                connector=connector,
+                workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+                campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+                campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
+                lead=session.get(Lead, prepared_campaign["lead_id"]),
+                http_client=http_client,
+            )
+
+    assert result.sent
+    assert fetch_count == 0
+
+    with fresh_db() as session:
+        message = session.query(Message).filter(Message.role == MessageRole.AI).one()
+        assert message.metadata_["analysis"]["enrichment_status"] == "timeout"
+
+
+async def test_outreach_with_no_enrichment_blob_records_missing_status(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """Lead with a website but no enrichment blob yet (the scan worker
+    has not reached it) → outreach proceeds and the audit row records
+    ``enrichment_status="missing"`` so the angle-funnel can stratify
+    pre-warmed vs not-yet-warmed cohorts honestly."""
+
+    _give_lead_a_website(fresh_db, prepared_campaign)
+    # Workspace setting is enabled, but no blob has been written yet.
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.5": {
+                "angle": "Fallback while we wait for the scan worker.",
+                "angle_type": "fallback",
+                "signal": "no enrichment yet",
+                "confidence": 0.5,
+            },
+            "generation-v7": "Hey, quick chat?",
+            "evaluation-v4.3": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+
+    fetch_count = 0
+
+    def _refuse_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal fetch_count
+        fetch_count += 1
+        raise AssertionError("outreach must never fetch on missing enrichment")
+
+    transport = httpx.MockTransport(_refuse_handler)
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        with fresh_db() as session:
+            result = await run_outreach_for_campaign_lead(
+                session=session,
+                connector=connector,
+                workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+                campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+                campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
+                lead=session.get(Lead, prepared_campaign["lead_id"]),
+                http_client=http_client,
+            )
+
+    assert result.sent
+    assert fetch_count == 0
+
+    with fresh_db() as session:
+        message = session.query(Message).filter(Message.role == MessageRole.AI).one()
+        assert message.metadata_["analysis"]["enrichment_status"] == "missing"
+        # Lead row is left clean — no envelope manufactured by outreach.
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        assert "enrichment" not in (lead.raw_data or {})
+
+
+async def test_enrichment_disabled_short_circuits(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """``workspace.settings.enrichment.enabled = false`` produces no
+    fetch and the audit row records ``enrichment_status="disabled"``."""
+
+    _give_lead_a_website(fresh_db, prepared_campaign)
+    with fresh_db() as session:
+        ws = session.get(Workspace, prepared_campaign["workspace_id"])
+        settings = dict(ws.settings or {})
+        settings["enrichment"] = {
+            "enabled": False,
+            "budget_s": 4.0,
+            "cache_ttl_days": 30,
+            "respect_robots": True,
+        }
+        ws.settings = settings
+        session.flush()
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.5": {
+                "angle": "Disabled — fallback hook.",
+                "angle_type": "fallback",
+                "signal": "no enrichment",
+                "confidence": 0.4,
+            },
+            "generation-v7": "Hey, brief intro.",
+            "evaluation-v4.3": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+
+    fetch_count = 0
+
+    def _refuse_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal fetch_count
+        fetch_count += 1
+        raise AssertionError("disabled enrichment must not fetch")
+
+    transport = httpx.MockTransport(_refuse_handler)
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        with fresh_db() as session:
+            await run_outreach_for_campaign_lead(
+                session=session,
+                connector=connector,
+                workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+                campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+                campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
+                lead=session.get(Lead, prepared_campaign["lead_id"]),
+                http_client=http_client,
+            )
+
+    assert fetch_count == 0
+    with fresh_db() as session:
+        message = session.query(Message).filter(Message.role == MessageRole.AI).one()
+        assert message.metadata_["analysis"]["enrichment_status"] == "disabled"
+        # Lead row stays untouched — the principle is that disabling
+        # the feature does not silently rewrite previously-clean data.
+        lead = session.get(Lead, prepared_campaign["lead_id"])
+        assert "enrichment" not in (lead.raw_data or {})
+

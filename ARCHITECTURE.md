@@ -3,7 +3,7 @@
 This doc describes **what the code actually does** and **how the pieces fit
 together**. It is the as-built companion to the four `autosdr-doc*` spec docs,
 which describe the intended system; where this document and those disagree,
-this one is the source of truth for the POC. For setup and CLI usage, see
+this one is the source of truth for the POC. For setup instructions, see
 `README.md`.
 
 ## 1. What AutoSDR is
@@ -20,8 +20,9 @@ auto-responding when it's confident — while handing conversations back to the
 owner when it isn't.
 
 The POC is a single Python process: one FastAPI app with an async scheduler,
-one SQLite database, a Google Gemini backend (LiteLLM), and a CLI. The design
-is deliberately simple so the **AI loop** (the hard part) can be validated
+one SQLite database, a Google Gemini backend (LiteLLM), and a React operator
+console served from the same uvicorn process. The design is deliberately
+simple so the **AI loop** (the hard part) can be validated
 before any distributed infrastructure is built.
 
 ## 2. The big picture
@@ -72,8 +73,11 @@ One-liner per module so you can navigate the code:
 | `autosdr/db.py` | SQLAlchemy engine/session factory (SQLite today, Postgres-ready). |
 | `autosdr/models.py` | ORM models plus centralised status vocabularies. |
 | `autosdr/killswitch.py` | Three-layer pause/stop mechanism shared by every hot path. |
-| `autosdr/importer.py` | CSV / NDJSON import with phone normalisation and contact-type detection. |
+| `autosdr/importer.py` | CSV / NDJSON import with phone normalisation, contact-type detection, and the rule-based column-mapping suggestion engine (`_suggest_column_target` + `_build_columns_preview`). |
 | `autosdr/llm/client.py` | LiteLLM wrapper: retries, kill-switch, usage counters, persistent call log. |
+| `autosdr/llm/pricing.py` | Gemini pricing snapshot, alias resolver (`-latest` → stable slug), `cost_for(model, tokens_in, tokens_out)`, and the MAX / BALANCED / CHEAP preset blends. Single source of truth for every "estimated cost" surface (status pill, Logs row). |
+| `autosdr/pacing.py` | Outreach-window resolution + pacing maths (workspace default, per-campaign override, `ceil(quota * elapsed_fraction)` allowance). Pure functions plus a single SQL helper for "contacts opened since today's window start". |
+| `autosdr/enrichment.py` | Polite per-lead website fetcher. Async pure-function `enrich_lead(...)` issuing ≤3 HTTP calls (root + robots.txt + sitemap) under a hard wall-clock budget; closed `EnrichmentStatus` vocabulary; killswitch-aware. Output is folded into `Lead.raw_data['enrichment']` by the outreach pipeline before the analysis LLM call. The shared `httpx.AsyncClient` is owned by the FastAPI lifespan in `webhook.py`. See ticket 0011. |
 | `autosdr/compliance.py` | Deterministic STOP / opt-out keyword matcher (Spam Act / TCPA shortcut). Pure function — no I/O, no LLM. |
 | `autosdr/prompts/` | Versioned system + user prompts for analysis, generation, evaluation, classification. |
 | `autosdr/connectors/` | Pluggable SMS connectors plus a file-backed dev stub and an override wrapper. |
@@ -81,7 +85,6 @@ One-liner per module so you can navigate the code:
 | `autosdr/pipeline/reply.py` | The classify → route pipeline for inbound messages. |
 | `autosdr/scheduler.py` | The two async loops (outreach tick and inbound poll). |
 | `autosdr/webhook.py` | FastAPI app, lifespan task wiring, and inbound HTTP endpoints. |
-| `autosdr/cli.py` | Typer CLI: `init`, `import`, `campaign`, `run`, `logs`, etc. |
 | `scripts/dryrun_prompts.py` | Offline prompt exerciser for iterating on prompt changes without the full pipeline. |
 | `tests/` | Pytest suite; LLM and connector HTTP calls are mocked. |
 
@@ -125,6 +128,26 @@ Two decisions happen up-front so bad data never costs tokens:
 Re-importing the same file is safe: core fields are only filled where
 they're currently empty, and the raw-data blob is merged at the key level.
 
+### Field-mapping helper
+
+For lead sources that don't match the alias map (e.g. an Apify Google-Maps
+scrape with `reviewDetails`, `webResults`, `plusCode`), the preview surfaces
+one row per detected source column with a rule-based suggestion:
+
+- Exact / alias match → `high` confidence.
+- Levenshtein ≤ 2 against a core field → `medium`.
+- Substring (`phone_e164` contains `phone`) → `medium`.
+- Sample-value heuristics: ≥ 90 % E.164-able / http-URL / street-keyword
+  match → `high`, ≥ 80 % → `medium` (both gated by ≥ 5 non-null support).
+
+The owner approves or overrides each column from `LeadsImport.tsx`. The selection is encoded as
+`mapping_config` (`mapping`, `drop_from_raw`, `include_in_raw_only`),
+posted as a JSON-encoded form field on `/api/leads/import/{preview,commit}`,
+validated strictly (Pydantic `extra=forbid`) and persisted on
+`ImportJob.mapping_config`. `drop_from_raw` is **commit-only**: it filters
+incoming row payloads on this import, never retroactively prunes existing
+`raw_data`.
+
 ## 6. The messaging abstraction
 
 All outbound and inbound SMS goes through a thin `BaseConnector`
@@ -136,10 +159,16 @@ Three real connectors ship today:
 
 - **TextBee** — a commercial Android SMS gateway. POC uses its polling API
   so no public URL / tunnel is needed.
-- **SMSGate** — an open-source Android gateway that pushes inbound via
-  webhook to a LAN-reachable endpoint.
+- **SMSGate** — an open-source Android gateway. Supports both inbound
+  paths: polling (default; `GET {api_url}/messages/inbox`, requires
+  SMSGate v1.60.0+) and webhook push (`POST /api/webhooks/sms`).
+  Polling is the default for the same reason TextBee picked it — no
+  public URL, no LAN binding, no firewall hole, no manual webhook
+  registration. Push is still available for ops who want lower latency
+  and have configured their device to POST to AutoSDR's LAN address.
 - **FileConnector** — dev-only: outbound is appended to a JSONL file,
-  inbound is driven from the CLI or a simulator endpoint.
+  inbound is driven from **Settings → Connector → Simulate inbound** (saved
+  workspace must use `connector.type=file`).
 
 Two wrappers compose on top of those:
 
@@ -189,7 +218,13 @@ shown to the model, longest strings first, so a single verbose lead can't
 blow the context window.
 
 The resulting angle is stashed on the thread so subsequent reply turns use
-the same personalisation thread without re-analysing.
+the same personalisation thread without re-analysing. Two columns persist:
+`thread.angle` (the freeform 2-3 sentence text the generator consumes) and
+`thread.angle_type` (the discrete bucket from the fixed menu — `stale_info`,
+`weak_presence`, `signature_detail`, `differentiator`, `review_theme`,
+`brand_voice`, `fallback`). The discrete bucket is what
+`GET /api/stats/angle-funnel` aggregates over to answer "which kind of
+opener actually gets replies?" — see § 13 Observability.
 
 ### 7.2 Generation
 
@@ -294,11 +329,11 @@ an SMSGate webhook), the reply pipeline:
   with `do_not_contact_at` + `do_not_contact_reason="opt_out:<KEYWORD>"`,
   closes the thread lost, writes a sentinel `LlmCall` audit row
   (`model="(deterministic-opt-out)"`, `purpose=other`,
-  `tokens=latency=0`) so the timeline in `autosdr logs thread` stays
+  `tokens=latency=0`) so the Logs / thread timeline stays
   intact, and exits with `action=closed_opt_out`. The classifier never
   runs. The flag is permanent: outreach, scheduler, importer, and
-  `assign_leads` all honour it; clearing requires manual DB intervention
-  or a future Settings → Compliance card.
+  `assign_leads` all honour it; clearing can be done from **Lead detail →
+  Clear do-not-contact** alongside manual SQL if needed.
 - Runs the classification prompt and routes by intent:
   - **Negative** and **goal_achieved** close the thread (lost/won
     respectively) and propagate the status down to `campaign_lead` and
@@ -326,6 +361,18 @@ it loops over every active campaign and:
 - Computes a **rolling 24-hour send count** for the campaign by counting
   AI messages on its threads in the last 24 hours. This is the campaign's
   quota budget for this tick.
+- Resolves the **outreach window** (per-campaign override on
+  `campaign.outreach_window`, falling back to
+  `workspace.settings.outreach_window`, default `{enabled, 8..17}` in
+  server-local time). Outside the window the tick is a no-op for sends.
+  Inside, `pacing.window_allowance(...)` returns
+  `ceil(outreach_per_day * elapsed_fraction) - sent_in_window` so a
+  50-lead/day campaign trickles out at roughly one send every 11
+  minutes instead of bursting in the first 25 minutes. Both the 24h
+  cap and the pacing allowance apply — `min(allowance, remaining_24h,
+  max_batch_per_tick)` is the per-tick budget. Manual kickoff
+  (`respect_quota=False`) bypasses both. Reply pipeline, follow-up
+  beat, and inbound poll are unaffected.
 - Takes the next N queued campaign-leads in queue order, capped by the
   remaining quota and a per-tick batch size so no single campaign starves
   the others.
@@ -352,7 +399,7 @@ of LiteLLM's HTTP plumbing, the wrapper provides:
 - **Retries with exponential backoff** for transient HTTP failures (5xx,
   429, timeouts). Non-retryable errors raise a domain-specific exception.
 - **In-memory usage counters** (per-model call count and token totals)
-  exposed via `autosdr status` for a quick cost pulse.
+  exposed via `/api/status` and the Dashboard for a quick cost pulse.
 - **JSON-with-self-heal helper.** Structured prompts return through a
   helper that tries to parse the model's response as JSON and, on
   failure, runs a one-shot retry that feeds the broken response back with
@@ -382,8 +429,9 @@ processing in-flight matters more than elegance:
    within about a second. Webhooks keep returning 202 so the gateway
    doesn't retry; the scheduler tick idles; LLM and connector hot paths
    raise a kill-switch exception and unwind the current pipeline.
-3. **CLI wrappers.** `autosdr pause` / `resume` / `stop` manipulate the
-   flag file or send a signal to the PID recorded at startup.
+3. **HTTP control plane.** `POST /api/status/pause` and `POST /api/status/resume`
+   touch or remove the pause flag without restarting uvicorn — the same pause
+   the top-right UI buttons use.
 
 Two orthogonal test modes let the owner rehearse safely:
 
@@ -401,25 +449,36 @@ Three artefacts are written for every run so the owner can review what
 happened:
 
 - **`llm_call` rows + `data/logs/llm-YYYYMMDD.jsonl`.** One record per
-  LLM attempt. Two CLI commands browse them: `autosdr logs llm` (tabular
-  with filters) and `autosdr logs thread <id>` (all messages and LLM
-  calls for a single thread, stitched in chronological order).
+  LLM attempt. Browse and filter these from **Logs** in the UI, or hit
+  `GET /api/llm-calls` programmatically.
 - **`data/outbox.jsonl`.** Every file-connector send; mostly for
   dev/testing.
-- **`data/logs/autosdr.log`.** Rotating file handler capturing the
-  scheduler + pipeline INFO stream. Useful for post-mortem on a run that
+- **`data/logs/autosdr.log`.** Rotating file handler attached at FastAPI startup;
+  mirrors the scheduler + pipeline INFO stream. Useful for post-mortem on a run that
   already scrolled off the terminal.
 
-`autosdr status` summarises the live state: paused or not, process PID,
-active connector, in-memory LLM usage, and a per-campaign 24-hour send
-count with remaining quota.
+For per-angle reply-rate ("which opener actually gets replies?"),
+`GET /api/stats/angle-funnel?campaign_id=…&since_days=…` returns one row
+per `thread.angle_type` bucket with `{threads, replied, won, lost}`
+counts (replies counted from `Message.role = 'lead'` existence, not
+`CampaignLead.status` — the former is the more honest signal). For per-campaign funnel health ("is this campaign actually working?"),
+`CampaignOut` exposes one count per `CampaignLeadStatus` bucket
+(`queued_count`, `sending_count`, `paused_for_hitl_count`,
+`contacted_count`, `replied_count`, `won_count`, `lost_count`,
+`skipped_count`) — bucket-precise rather than rolled up, so the eight
+counts sum exactly to `lead_count`. Rollups (e.g. "anyone we ever
+messaged") are computed at the call site so the contract can't lie.
+`GET /api/campaigns/{id}/timeseries?days=14` complements that with daily
+`{sent, replied, won, lost}` rows for the last N UTC days; the same
+query backs the `CampaignTimeseriesPanel` viz on `/CampaignDetail` —
+the FastAPI handler is the single source of truth for the funnel maths.
 
 ## 14. What's out of scope for the POC
 
 The POC intentionally defers these pieces to v1, on the assumption that
 the AI loop is the risky part and the rest is well-understood work:
 
-- Any frontend or PWA. HITL surfaces via the CLI.
+- A dedicated mobile app (the operator console is a laptop-first SPA).
 - Swipe-based tone calibration (tone is provided verbatim at `init`
   time).
 - A business-data extraction agent (the raw business description is used

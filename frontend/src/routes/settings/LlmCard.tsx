@@ -1,7 +1,8 @@
+import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { Input } from '@/components/ui/Input';
 import { usePatchForm } from '@/lib/usePatchForm';
-import type { Workspace, WorkspaceSettings } from '@/lib/types';
+import type { LlmPreset, Workspace, WorkspaceSettings } from '@/lib/types';
 import { Field } from '@/components/ui/Field';
 import { Card, SaveRow } from './primitives';
 
@@ -33,6 +34,15 @@ export function LlmCard({ workspace }: { workspace: Workspace }) {
           model_classification: s.model_classification,
         },
       } as Partial<WorkspaceSettings>),
+  });
+
+  // Presets are static catalog data — fetch once and let the cache
+  // hold them for the page lifetime. Failure is non-blocking: the
+  // four free-text fields still work without buttons.
+  const { data: presetCatalog } = useQuery({
+    queryKey: ['llm-presets'],
+    queryFn: () => api.getLlmPresets(),
+    staleTime: Infinity,
   });
 
   return (
@@ -72,6 +82,34 @@ export function LlmCard({ workspace }: { workspace: Workspace }) {
         </Field>
       </div>
 
+      {presetCatalog && presetCatalog.presets.length > 0 && (
+        <div className="mt-6 pt-5 border-t border-rule">
+          <div className="flex items-baseline justify-between mb-3">
+            <div className="label">Presets</div>
+            <div className="text-[11px] text-ink-muted font-mono">
+              Pricing as of {presetCatalog.pricing_verified_at}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {presetCatalog.presets.map((preset) => (
+              <PresetButton
+                key={preset.id}
+                preset={preset}
+                active={isPresetActive(preset, form.state)}
+                onApply={() =>
+                  form.patch({
+                    model_main: preset.models.model_main,
+                    model_analysis: preset.models.model_analysis,
+                    model_eval: preset.models.model_eval,
+                    model_classification: preset.models.model_classification,
+                  })
+                }
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="mt-6 pt-5 border-t border-rule grid grid-cols-2 gap-4">
         <Field
           label="Outreach (main)"
@@ -106,5 +144,58 @@ export function LlmCard({ workspace }: { workspace: Workspace }) {
         </Field>
       </div>
     </Card>
+  );
+}
+
+interface ModelState {
+  model_main: string;
+  model_analysis: string;
+  model_eval: string;
+  model_classification: string;
+}
+
+function isPresetActive(preset: LlmPreset, state: ModelState): boolean {
+  return (
+    preset.models.model_main === state.model_main &&
+    preset.models.model_analysis === state.model_analysis &&
+    preset.models.model_eval === state.model_eval &&
+    preset.models.model_classification === state.model_classification
+  );
+}
+
+function PresetButton({
+  preset,
+  active,
+  onApply,
+}: {
+  preset: LlmPreset;
+  active: boolean;
+  onApply: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onApply}
+      title={preset.description}
+      aria-pressed={active}
+      className={
+        'inline-flex flex-col items-start gap-0.5 px-3 py-2 border text-left transition-colors ' +
+        (active
+          ? 'border-ink bg-ink text-paper'
+          : 'border-rule bg-paper text-ink hover:bg-paper-deep')
+      }
+    >
+      <span className="text-xs tracking-[0.14em] uppercase font-mono">
+        {preset.label}
+      </span>
+      <span
+        className={
+          'text-[11px] leading-snug max-w-[18rem] ' +
+          (active ? 'text-paper' : 'text-ink-muted')
+        }
+      >
+        {preset.description}
+      </span>
+    </button>
   );
 }

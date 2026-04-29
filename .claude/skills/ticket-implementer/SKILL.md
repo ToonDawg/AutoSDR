@@ -23,6 +23,7 @@ Run these in order every invocation. Don't skip steps even if the ticket looks s
    - Walk **Dependencies → Blocked by**. If any blocker is unfinished, stop and report.
    - Run `git status` and `git log -10 --oneline`. If the working tree is dirty, ask before continuing.
    - Re-read [`.claude/skills/project-manager/references/product-context.md § 3 + § 7`](../project-manager/references/product-context.md) so the principle check has teeth.
+   - Read [`docs/PATTERNS.md`](../../../docs/PATTERNS.md). For every Scope bullet that touches a cross-cutting concern (HTTP, routing, fetching, styling, state, ORM, validation, LLM, CLI, settings, logging, connectors), note the blessed choice you must use. If a Scope bullet implies introducing a new dependency or a new concern not listed in the doc, **stop and call the [`pattern-unifier`](../pattern-unifier/SKILL.md) skill** in pre-pick mode before planning. Don't decide a sticky lib choice solo.
 3. **Resolve open questions (council mini-round).** See [Council usage](#council-usage). Required if the ticket has any unresolved Open Questions. Skip individual questions only when they are pure user-preference calls — surface those for the user, don't decide them yourself.
 4. **Mini planning session.** See [Mini planning session](#mini-planning-session). Output an ordered, risk-first work-unit list that maps 1-1 to the Scope bullets and references the resolved questions.
 5. **Implement, one unit at a time.**
@@ -30,7 +31,7 @@ Run these in order every invocation. Don't skip steps even if the ticket looks s
    - Run the tests that cover unit `i` (prefer the user's preferred test invocation from [user rules](#user-test-invocation)).
    - Tick the corresponding Success Criterion when it becomes observable.
    - **Do not start unit `i+1` until unit `i` is green.**
-6. **Verify done.** Walk every Scope bullet, every Success Criterion, every Principle Check row. Each must be ticked with a one-line piece of evidence (file:line, log line, test name, UI screenshot reference).
+6. **Verify done.** Walk every Scope bullet, every Success Criterion, every Principle Check row. Each must be ticked with a one-line piece of evidence (file:line, log line, test name, UI screenshot reference). Then run the [`pattern-unifier`](../pattern-unifier/SKILL.md) skill in **diff-only mode** (see its `references/scan-recipes.md § 6`) against the changed files. The bar: **no new ⚠ or ✗ introduced by this ticket**. Pre-existing drift is fine — that's a separate clean-up. New drift either gets fixed in the same diff or filed as a follow-up ticket and called out in the implementation log.
 7. **Wrap.**
    - Append an `## Implementation log` section to the ticket.
    - Update `docs/ROADMAP.md`: move the row from **Next** (or **Now**) to **Done — last 90 days** with today's date and a one-line release note.
@@ -153,6 +154,7 @@ After questions are resolved, produce the work-unit list. Format:
 - The plan covers every Scope bullet (1-1 map shown above).
 - The plan ticks every Success Criterion (1-1 map shown above).
 - No principle in [product-context.md § 3](../project-manager/references/product-context.md) drops to ⚠ / ✗ unless the ticket already justified it.
+- Every unit names the **blessed pattern** it conforms to (per [`docs/PATTERNS.md`](../../../docs/PATTERNS.md)). If a unit needs a non-blessed lib or a not-yet-blessed concern, the [`pattern-unifier`](../pattern-unifier/SKILL.md) skill must have run and the row in `docs/PATTERNS.md` must be updated **before** that unit ships.
 - The first unit is genuinely the riskiest one — not the easiest.
 
 ---
@@ -301,6 +303,8 @@ When you bump into one of those, stop, surface the blocker, then continue with w
 - [`.claude/skills/project-manager/SKILL.md`](../project-manager/SKILL.md) — the upstream PM skill that produces the tickets you implement.
 - [`.claude/skills/project-manager/references/ticket-template.md`](../project-manager/references/ticket-template.md) — the ticket schema you're consuming.
 - [`.claude/skills/project-manager/references/product-context.md`](../project-manager/references/product-context.md) — principles, personas, success metrics. **Read every session.**
+- [`.claude/skills/pattern-unifier/SKILL.md`](../pattern-unifier/SKILL.md) — the architectural-coherence keeper. Consulted in pre-flight and verify-done.
 - [`.claude/skills/council/SKILL.md`](../council/SKILL.md) — the canonical council workflow. Don't paraphrase — use it.
+- `docs/PATTERNS.md` — the cross-cutting library/convention contract. Read every session.
 - `docs/ROADMAP.md` — where Done rows land.
 - `ARCHITECTURE.md`, `autosdr-doc{1..4}-*.md` — update only on structural change.

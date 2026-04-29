@@ -48,3 +48,33 @@ def test_app_boots_with_workspace_and_file_connector(
         assert body["setup_required"] is False
         assert body["active_connector"] == "file"
         assert body["scheduler"] == {"tick_s": 7, "poll_s": 3}
+        # Cost is 0.0 on a fresh boot; the field exists and is a float.
+        assert body["llm_usage"]["estimated_cost_today_usd"] == 0.0
+
+
+def test_status_estimated_cost_reflects_in_memory_counter(
+    fresh_db, workspace_factory
+) -> None:
+    """One real token-bearing call → status surfaces non-zero cost.
+
+    Verifies the wiring from ``_record_usage`` → ``get_usage_snapshot()``
+    → ``LlmUsage.estimated_cost_today_usd`` end-to-end without going
+    through LiteLLM.
+    """
+
+    from autosdr.llm.client import _record_usage, reset_usage
+
+    workspace_factory()
+    reset_usage()
+    try:
+        # 1M in + 1M out on Flash-Lite = $0.10 + $0.40 = $0.50
+        _record_usage("gemini/gemini-2.5-flash-lite", 1_000_000, 1_000_000)
+
+        with _client() as client:
+            body = client.get("/api/status").json()
+            assert body["llm_usage"]["calls_today"] == 1
+            assert body["llm_usage"]["tokens_in_today"] == 1_000_000
+            assert body["llm_usage"]["tokens_out_today"] == 1_000_000
+            assert body["llm_usage"]["estimated_cost_today_usd"] == 0.50
+    finally:
+        reset_usage()

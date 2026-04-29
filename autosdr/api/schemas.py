@@ -190,7 +190,83 @@ class FollowupConfig(BaseModel):
     delay_jitter_s: int = 5
 
 
+class EnrichmentConfig(BaseModel):
+    """Per-workspace knobs for the lead-website enrichment fetcher.
+
+    Mirrors the shape stored on ``workspace.settings.enrichment``. The
+    enrichment fetcher (:mod:`autosdr.enrichment`) is consulted at
+    outreach-time to fold a small structural-signal blob into
+    ``Lead.raw_data['enrichment']`` before the analysis LLM call. See
+    ticket 0011.
+
+    All fields are deliberately conservative defaults: enabled, polite
+    (respect robots.txt), 4-second wall-clock budget, 30-day cache. The
+    operator can flip ``respect_robots`` for an aggressive scrape but
+    the default is the polite path.
+
+    Bounds:
+    * ``budget_s`` is clamped to ``[1.0, 15.0]`` so a stuck mock can't
+      hold a scheduler tick hostage and a 0-second budget can't stall
+      the pipeline forever waiting on a fetch the function will skip.
+    * ``cache_ttl_days`` is clamped to ``[0, 365]``. ``0`` means "never
+      cache, always re-enrich"; ``365`` is the upper bound so an
+      operator can't accidentally pin a stale blob forever.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    budget_s: float = Field(default=4.0, ge=1.0, le=15.0)
+    cache_ttl_days: int = Field(default=30, ge=0, le=365)
+    respect_robots: bool = True
+
+
+class OutreachWindowConfig(BaseModel):
+    """Working-hours window the scheduler paces outreach across.
+
+    Mirrors the shape stored on ``workspace.settings.outreach_window``
+    (the workspace default) and ``campaign.outreach_window`` (per-campaign
+    override; ``None`` means inherit). Both ``start_hour`` and
+    ``end_hour`` are server-local 24h integers; the window is inclusive
+    on the start and exclusive on the end, so ``8..17`` means
+    ``[08:00, 17:00)`` in local time.
+
+    See :mod:`autosdr.pacing` for how this is consumed; the gate only
+    affects the outreach scheduler tick — replies, follow-ups, manual
+    kickoff and the inbound poller are unaffected.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    start_hour: int = Field(default=8, ge=0, le=23)
+    end_hour: int = Field(default=17, ge=1, le=24)
+
+
 class CampaignOut(BaseModel):
+    """Public shape of a campaign on the REST API.
+
+    The eight ``*_count`` fields are **bucket-precise** mirrors of
+    :class:`autosdr.models.CampaignLeadStatus`. Each one is the count of
+    leads currently parked in exactly that bucket — they do not roll
+    over and do not double-count, so:
+
+        lead_count
+          == queued_count
+          + sending_count
+          + paused_for_hitl_count
+          + contacted_count
+          + replied_count
+          + won_count
+          + lost_count
+          + skipped_count
+
+    Frontend rollups ("how many leads did we actually message?") sum
+    these on demand. This deliberately replaces the pre-0003 rolled-up
+    ``contacted_count`` / ``replied_count`` semantics — the names lied,
+    so the names changed meaning. See ticket 0003.
+    """
+
     id: str
     name: str
     goal: str
@@ -198,12 +274,26 @@ class CampaignOut(BaseModel):
     connector_type: str
     status: str
     followup: FollowupConfig
+    # Per-campaign override of the workspace's outreach window. ``None``
+    # means "inherit the workspace default" — the resolved window the
+    # scheduler will actually use is exposed on
+    # ``effective_outreach_window``.
+    outreach_window: OutreachWindowConfig | None = None
+    # The window the scheduler will actually use after resolving the
+    # campaign override against the workspace default. Always populated
+    # so frontend consumers don't have to merge themselves.
+    effective_outreach_window: OutreachWindowConfig
     quota_reset_at: datetime | None = None
     created_at: datetime
     lead_count: int = 0
+    queued_count: int = 0
+    sending_count: int = 0
+    paused_for_hitl_count: int = 0
     contacted_count: int = 0
     replied_count: int = 0
     won_count: int = 0
+    lost_count: int = 0
+    skipped_count: int = 0
     sent_24h: int = 0
 
 
@@ -222,6 +312,38 @@ class CampaignKickoffResult(BaseModel):
     campaign: CampaignOut
 
 
+class CampaignTimeseriesBucket(BaseModel):
+    """One day of campaign activity in UTC.
+
+    Counts are independent slices of the funnel, not stages. ``replied``
+    counts the number of threads whose **first ever** lead-message
+    landed on this day — so a chatty lead that replies twice on Tuesday
+    is still one ``replied``, and a thread that first replied on Monday
+    and again on Tuesday is only counted on Monday. ``won`` / ``lost``
+    use the terminal :class:`Thread.status` and ``Thread.updated_at``;
+    a thread that closes after replying on the same day is counted in
+    both ``replied`` and ``won`` / ``lost``.
+    """
+
+    date: str  # YYYY-MM-DD UTC
+    sent: int = 0
+    replied: int = 0
+    won: int = 0
+    lost: int = 0
+
+
+class CampaignTimeseriesOut(BaseModel):
+    """Response for ``GET /api/campaigns/{id}/timeseries``.
+
+    ``buckets`` always has ``days`` entries, oldest first, padded with
+    zero rows for days with no activity so the chart can render a stable
+    14-day window even on a fresh campaign.
+    """
+
+    days: int
+    buckets: list[CampaignTimeseriesBucket]
+
+
 class CampaignCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -230,6 +352,7 @@ class CampaignCreate(BaseModel):
     outreach_per_day: int = 50
     connector_type: str | None = None
     followup: FollowupConfig | None = None
+    outreach_window: OutreachWindowConfig | None = None
 
 
 class CampaignPatch(BaseModel):
@@ -240,6 +363,11 @@ class CampaignPatch(BaseModel):
     outreach_per_day: int | None = None
     status: Literal["draft", "active", "paused", "completed"] | None = None
     followup: FollowupConfig | None = None
+    # Patch semantics (relies on FastAPI's ``exclude_unset`` handling
+    # downstream): omit the field for "no change", send ``null`` to clear
+    # the per-campaign override and fall back to the workspace default,
+    # send a populated object to set the override.
+    outreach_window: OutreachWindowConfig | None = None
 
 
 class CampaignAssignLeads(BaseModel):
@@ -285,6 +413,51 @@ class LeadOut(BaseModel):
     created_at: datetime
 
 
+class LeadOptOutIn(BaseModel):
+    """Body for marking a lead as do-not-contact (manual opt-off SMS channel)."""
+
+    reason: str = "manual"
+
+
+class LeadEnrichIn(BaseModel):
+    """Warm up website enrichment for leads with stale or missing cache."""
+
+    since_days: int = Field(default=30, ge=1, le=365)
+    limit: int = Field(default=50, ge=1, le=200)
+    dry_run: bool = False
+
+
+class LeadEnrichCandidateOut(BaseModel):
+    lead_id: str
+    name: str | None = None
+    website: str | None = None
+    # ISO8601 from enrichment ``_meta.fetched_at``, or null if never enriched.
+    last_fetched: str | None = None
+
+
+class LeadEnrichOut(BaseModel):
+    ok: int
+    failed: int
+    total: int
+    dry_run: bool
+    candidates: list[LeadEnrichCandidateOut] | None = None
+
+
+class DevSimInboundIn(BaseModel):
+    contact_uri: str
+    content: str
+
+
+class DevSimInboundOut(BaseModel):
+    """Result from POST /api/dev/sim-inbound (file connector rehearsal)."""
+
+    action: str
+    thread_id: str | None = None
+    intent: str | None = None
+    confidence: float | None = None
+    detail: str | None = None
+
+
 class LeadListOut(BaseModel):
     """Paginated leads response.
 
@@ -314,6 +487,18 @@ class ImportPreviewSkipReason(BaseModel):
     count: int
 
 
+class ImportPreviewColumn(BaseModel):
+    """One distinct source column observed in the preview sample, plus the
+    suggestion-engine's recommendation. Shape mirrored on the frontend in
+    ``ImportPreview['columns']`` (``frontend/src/lib/types.ts``)."""
+
+    name: str
+    sample_values: list[Any]
+    suggested_target: str | None
+    suggestion_confidence: Literal["high", "medium", "low", "none"]
+    suggestion_reason: str
+
+
 class ImportPreviewOut(BaseModel):
     filename: str
     file_type: str
@@ -321,6 +506,31 @@ class ImportPreviewOut(BaseModel):
     would_import: int
     would_skip: list[ImportPreviewSkipReason]
     sample: list[ImportPreviewRow]
+    columns: list[ImportPreviewColumn] = Field(default_factory=list)
+
+
+# The four canonical core fields the operator can map a source column to.
+# Mirrors ``autosdr.importer._CORE_FIELDS`` — kept in sync deliberately so
+# the shape contract on the wire is explicit; if a new core field lands,
+# both lists must move together.
+_CORE_FIELD_NAMES = Literal["name", "category", "address", "website", "phone"]
+
+
+class MappingConfigIn(BaseModel):
+    """Operator-supplied import override (ticket 0004).
+
+    Posted as a JSON-encoded string in the multipart form field
+    ``mapping_config`` on both ``/api/leads/import/preview`` and
+    ``/api/leads/import/commit``. Validation is strict — unknown keys at the
+    top level are rejected so we don't silently swallow a typo
+    (``drop_form_raw``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mapping: dict[_CORE_FIELD_NAMES, str] = Field(default_factory=dict)
+    drop_from_raw: list[str] = Field(default_factory=list)
+    include_in_raw_only: list[str] = Field(default_factory=list)
 
 
 class ImportCommitOut(BaseModel):
@@ -437,6 +647,31 @@ class LlmCallOut(BaseModel):
     tokens_out: int
     latency_ms: int
     error: str | None
+    # Estimated USD cost at current pricing (autosdr/llm/pricing.py).
+    # ``null`` for models we don't have a rate card for so the UI shows
+    # ``—`` rather than a misleading $0.00. See ticket 0006.
+    cost_usd: float | None = None
+
+
+class LlmCallsSummaryOut(BaseModel):
+    """All-time aggregate of every LLM call in the workspace.
+
+    The list endpoint caps at 500 rows for UI virtualisation, so summing
+    the visible rows on the client would silently underreport spend on
+    any non-trivial workspace. This response is the source of truth for
+    the "total spend" stat above the Logs table.
+
+    ``unpriced_calls`` is the count of rows whose model has no entry in
+    the pricing map — those rows contribute zero to ``total_cost_usd``,
+    so the UI can show "≥ $X" with a tooltip when this number is
+    non-zero rather than implying a precise figure.
+    """
+
+    total_calls: int = 0
+    total_tokens_in: int = 0
+    total_tokens_out: int = 0
+    total_cost_usd: float = 0.0
+    unpriced_calls: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -453,33 +688,243 @@ class Sends14dOut(BaseModel):
     days: list[SendsByDay]
 
 
+class AngleFunnelRow(BaseModel):
+    """Per-angle funnel counts for one bucket of `Thread.angle_type`.
+
+    Buckets are the seven values the analysis prompt emits, plus
+    ``"unknown"`` for legacy threads that pre-date the column. The four
+    counters always satisfy ``replied <= threads`` and
+    ``won + lost <= threads`` (a thread can be both replied and
+    won/lost; these are independent slices of the funnel, not stages).
+    """
+
+    angle: str
+    threads: int
+    replied: int
+    won: int
+    lost: int
+
+
+EnrichmentFilter = Literal["all", "enriched", "unenriched"]
+
+
+class AngleFunnelOut(BaseModel):
+    """Response for ``GET /api/stats/angle-funnel``.
+
+    ``since`` is echoed back as the effective time window the server
+    applied (server-resolved, never trusted from the query string for
+    rendering). ``campaign_id`` is echoed when scoped to a campaign;
+    when scoped to a workspace and a campaign filter wasn't supplied,
+    it is ``None``. ``rows`` is the per-bucket aggregation, ordered by
+    ``threads`` descending so the dominant angle renders first.
+
+    ``enrichment`` is the resolved value of the ``?enrichment=`` filter
+    (default ``"all"``); the API echoes it back so the frontend can
+    render the segmented control without re-parsing the query string.
+    """
+
+    since: datetime | None
+    campaign_id: str | None
+    enrichment: EnrichmentFilter = "all"
+    rows: list[AngleFunnelRow]
+
+
+# ---------------------------------------------------------------------------
+# LLM presets (Gemini-only for now — see ticket 0006)
+# ---------------------------------------------------------------------------
+
+
+class LlmPresetModels(BaseModel):
+    """Four-role model blend for an :class:`LlmPresetOut`.
+
+    Keys mirror ``WorkspaceSettings.llm.model_*`` so the frontend can
+    spread this object straight into a settings PATCH.
+    """
+
+    model_main: str
+    model_analysis: str
+    model_eval: str
+    model_classification: str
+
+
+class LlmPresetOut(BaseModel):
+    """One named blend the operator can apply with one click.
+
+    Surfaces alongside enough pricing information that the UI can show
+    "MAX is ~Nx more than CHEAP" without re-deriving it on the
+    frontend.
+    """
+
+    id: str
+    label: str
+    description: str
+    models: LlmPresetModels
+
+
+class LlmPresetsOut(BaseModel):
+    """Response for ``GET /api/llm/presets``.
+
+    ``pricing_verified_at`` is the snapshot date of
+    :data:`autosdr.llm.pricing.PRICING_VERIFIED_AT` — surfaced so the
+    UI can render "Pricing as of YYYY-MM-DD" alongside the buttons.
+    """
+
+    pricing_verified_at: str  # ISO date YYYY-MM-DD
+    presets: list[LlmPresetOut]
+
+
+# ---------------------------------------------------------------------------
+# Scans (lead-website enrichment)
+# ---------------------------------------------------------------------------
+
+
+# Pseudo-status when ``Lead.enrichment_status IS NULL`` — no scan attempt yet.
+SCAN_STATUS_NEVER = "never_scanned"
+
+
+class ScanRowOut(_ApiModel):
+    """One row of the ``/scans`` index page.
+
+    Deliberately lean: the list view only renders the columns below.
+    Audit-detail fields like ``http_status`` / ``final_url`` /
+    ``connector`` live on :class:`ScanDetailOut` (which exposes the
+    full envelope) so the list payload stays small and the row query
+    can avoid hydrating ``raw_data``.
+    """
+
+    lead_id: str
+    lead_name: str | None
+    website: str | None
+    status: str
+    fetched_at: datetime | None = None
+    latency_ms: int | None = None
+    cms: str | None = None
+    sitemap_count: int | None = None
+
+
+class ScanListOut(_ApiModel):
+    """Paginated response for ``GET /api/scans``.
+
+    ``counts_by_status`` includes both the real enrichment statuses and
+    the synthetic ``never_scanned`` bucket so the filter tabs render
+    without an extra round-trip.
+    """
+
+    scans: list[ScanRowOut]
+    total: int
+    limit: int
+    offset: int
+    counts_by_status: dict[str, int] = Field(default_factory=dict)
+
+
+class ScanDetailOut(_ApiModel):
+    """Full envelope + lead summary for ``GET /api/scans/{lead_id}``."""
+
+    lead_id: str
+    lead_name: str | None
+    website: str | None
+    status: str
+    enrichment: dict[str, Any] | None = None
+
+
+class ScanSummaryOut(_ApiModel):
+    """Header strip on the Scans page — breakdown + optional batch runner."""
+
+    total_leads: int
+    ok: int
+    blocked: int
+    timeout: int
+    error: int
+    not_found: int
+    empty_shell: int
+    no_url: int
+    never_scanned: int
+    last_run_at: datetime | None = None
+
+    runner_running: bool = False
+    runner_total: int = 0
+    runner_done: int = 0
+    runner_ok: int = 0
+    runner_failed: int = 0
+    runner_started_at: datetime | None = None
+
+
+class ScanRunRequest(BaseModel):
+    """Body of ``POST /api/scans/run``.
+
+    ``enabled`` starts (``True``) or stops (``False``) the in-process
+    scan fan-out. ``lead_id`` triggers one synchronous re-scan — ``enabled``
+    is ignored in that branch.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    lead_id: str | None = None
+    enabled: bool | None = None
+
+
+class ScanRunResult(ScanSummaryOut):
+    """Response of ``POST /api/scans/run``.
+
+    Mirrors :class:`ScanSummaryOut` plus optional fields describing a
+    one-off synchronous re-scan.
+    """
+
+    started: bool | None = None
+    lead_id: str | None = None
+    status: str | None = None
+
+
 __all__ = [
+    "AngleFunnelOut",
+    "AngleFunnelRow",
+    "EnrichmentFilter",
     "CampaignAssignLeads",
     "CampaignCreate",
     "CampaignOut",
     "CampaignPatch",
     "CampaignQuota",
+    "CampaignTimeseriesBucket",
+    "CampaignTimeseriesOut",
     "CloseThreadRequest",
     "ConnectorSmsGateCreds",
     "ConnectorTestRequest",
     "ConnectorTestResult",
     "ConnectorTextBeeCreds",
+    "EnrichmentConfig",
     "FollowupConfig",
     "ImportCommitOut",
+    "ImportPreviewColumn",
     "ImportPreviewOut",
     "ImportPreviewRow",
     "ImportPreviewSkipReason",
+    "MappingConfigIn",
+    "LeadEnrichCandidateOut",
+    "LeadEnrichIn",
+    "LeadEnrichOut",
     "LeadListOut",
+    "LeadOptOutIn",
     "LeadOut",
+    "DevSimInboundIn",
+    "DevSimInboundOut",
     "LlmCallOut",
+    "LlmCallsSummaryOut",
+    "LlmPresetModels",
+    "LlmPresetOut",
+    "LlmPresetsOut",
     "LlmUsage",
     "MessageOut",
     "SchedulerInfo",
     "SendDraftRequest",
+    "SCAN_STATUS_NEVER",
+    "ScanDetailOut",
+    "ScanListOut",
+    "ScanRowOut",
+    "ScanRunRequest",
+    "ScanRunResult",
+    "ScanSummaryOut",
     "Sends14dOut",
     "SendsByDay",
-    "SetupRequest",
-    "SetupStatus",
     "SuggestionOut",
     "SystemStatusOut",
     "TakeOverRequest",

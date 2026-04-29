@@ -16,20 +16,20 @@ export function QuotaMeter({
   const filledCount = Math.round(pct * bars);
 
   return (
-    <div className={cn('flex items-center gap-3', compact && 'gap-2')}>
-      <div className="flex flex-col gap-1">
+    <div className={cn('flex items-center gap-3 w-full min-w-0', compact && 'gap-2')}>
+      <div className="flex flex-col gap-1 w-full min-w-0">
         <div className="flex items-baseline gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-ink-muted whitespace-nowrap">
           <span>{label}</span>
           <span className="text-ink">
             {sent} <span className="text-ink-faint">/ {quota}</span>
           </span>
         </div>
-        <div className="flex gap-[2px] h-3 items-stretch">
+        <div className="flex gap-[2px] h-3 items-stretch w-full">
           {Array.from({ length: bars }).map((_, i) => (
             <span
               key={i}
               className={cn(
-                'w-[3px]',
+                'flex-1 min-w-px',
                 i < filledCount
                   ? pct >= 0.9
                     ? 'bg-rust'

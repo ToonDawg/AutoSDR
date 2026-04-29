@@ -1,13 +1,15 @@
-import { useQuery, keepPreviousData } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
-import { useEffect, useMemo, useState } from 'react';
-import { ChevronLeft, ChevronRight, Upload } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { ChevronLeft, ChevronRight, Database, Upload } from 'lucide-react';
 import { api } from '@/lib/api';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { FilterTabs, type FilterOption } from '@/components/ui/FilterTabs';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
+import { Input } from '@/components/ui/Input';
+import { useDebouncedValue } from '@/lib/useDebouncedValue';
 import {
   CONTACT_TYPE_LABEL,
   LEAD_STATUS_LABEL,
@@ -15,10 +17,21 @@ import {
   formatSkipReason,
   relTime,
 } from '@/lib/format';
-import { LeadStatus, type LeadStatusT } from '@/lib/types';
+import {
+  LeadStatus,
+  type LeadEnrichResult,
+  type LeadStatusT,
+} from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 type LeadFilterId = LeadStatusT | 'all' | 'do_not_contact';
+type AssignmentFilter = 'all' | 'in_campaign' | 'unassigned';
+
+const ASSIGNMENT_OPTIONS: ReadonlyArray<FilterOption<AssignmentFilter>> = [
+  { id: 'all', label: 'All' },
+  { id: 'in_campaign', label: 'In a campaign' },
+  { id: 'unassigned', label: 'Unassigned' },
+];
 
 const FILTERS: ReadonlyArray<FilterOption<LeadFilterId>> = [
   { id: 'all', label: 'All' },
@@ -56,32 +69,58 @@ const PAGE_SIZE = 100;
  */
 export function Leads() {
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const [filter, setFilter] = useState<LeadFilterId>('all');
+  const [assignment, setAssignment] = useState<AssignmentFilter>('all');
   const [qDraft, setQDraft] = useState('');
-  const [q, setQ] = useState('');
   const [page, setPage] = useState(0);
+  const [enrichOpen, setEnrichOpen] = useState(false);
+  const [sinceDays, setSinceDays] = useState('30');
+  const [enrichLimit, setEnrichLimit] = useState('50');
+  const [enrichDryRun, setEnrichDryRun] = useState(false);
+  const [enrichResult, setEnrichResult] = useState<LeadEnrichResult | null>(null);
 
-  // Debounce search input → committed query used for the fetch.
-  useEffect(() => {
-    const id = setTimeout(() => {
-      setQ(qDraft.trim());
-      setPage(0);
-    }, 200);
-    return () => clearTimeout(id);
-  }, [qDraft]);
+  const enrichMut = useMutation({
+    mutationFn: () =>
+      api.enrichLeads({
+        since_days: Number(sinceDays) || 30,
+        limit: Number(enrichLimit) || 50,
+        dry_run: enrichDryRun,
+      }),
+    onSuccess: (data) => {
+      setEnrichResult(data);
+      qc.invalidateQueries({ queryKey: ['leads'] });
+    },
+  });
 
+  const q = useDebouncedValue(qDraft.trim(), 200);
+
+  // Reset to page 0 in the change handlers themselves — keeps state
+  // derivation out of ``useEffect``. Setting page to 0 on every
+  // keystroke is a no-op when we're already on page 0 and avoids
+  // the "showing 1101–1200 of 50" overshoot when the result set
+  // shrinks.
+  const handleSearchChange = (next: string) => {
+    setQDraft(next);
+    setPage(0);
+  };
   const handleFilterChange = (next: LeadFilterId) => {
     setFilter(next);
+    setPage(0);
+  };
+  const handleAssignmentChange = (next: AssignmentFilter) => {
+    setAssignment(next);
     setPage(0);
   };
 
   const offset = page * PAGE_SIZE;
 
   const { data, isLoading, isFetching } = useQuery({
-    queryKey: ['leads', { status: filter, q, offset, limit: PAGE_SIZE }],
+    queryKey: ['leads', { status: filter, assignment, q, offset, limit: PAGE_SIZE }],
     queryFn: () =>
       api.listLeads({
         status: filter === 'all' ? undefined : filter,
+        assignment: assignment === 'all' ? undefined : assignment,
         q: q || undefined,
         limit: PAGE_SIZE,
         offset,
@@ -109,7 +148,7 @@ export function Leads() {
           <div className="flex items-center gap-3">
             <SearchInput
               value={qDraft}
-              onChange={setQDraft}
+              onChange={handleSearchChange}
               placeholder="Search name, category, phone…"
               className="w-72"
             />
@@ -121,11 +160,28 @@ export function Leads() {
                 Import
               </Button>
             </Link>
+            <Button
+              type="button"
+              variant="secondary"
+              iconLeft={<Database className="h-4 w-4" strokeWidth={1.5} />}
+              onClick={() => {
+                setEnrichResult(null);
+                setEnrichOpen(true);
+              }}
+            >
+              Enrich stale leads
+            </Button>
           </div>
         }
       />
 
       <FilterTabs options={FILTERS} active={filter} onChange={handleFilterChange} counts={counts} />
+
+      <FilterTabs
+        options={ASSIGNMENT_OPTIONS}
+        active={assignment}
+        onChange={handleAssignmentChange}
+      />
 
       <div className="flex items-center justify-between text-xs font-mono text-ink-muted">
         <span>
@@ -250,6 +306,106 @@ export function Leads() {
             Next
           </Button>
         </nav>
+      )}
+      {enrichOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4"
+          onClick={() => !enrichMut.isPending && setEnrichOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="paper-card w-full max-w-md p-5 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div>
+              <h2 className="text-base font-medium text-ink">Enrich stale leads</h2>
+              <p className="text-xs text-ink-muted mt-1 leading-relaxed">
+                Pre-fetch public website signals for leads whose cache is empty or older than the
+                window you set. Dry run lists who would be fetched without mutating data.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="flex flex-col gap-1.5">
+                <span className="label">Since (days)</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={365}
+                  value={sinceDays}
+                  onChange={(e) => setSinceDays(e.target.value)}
+                  disabled={enrichMut.isPending}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="label">Max leads</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={enrichLimit}
+                  onChange={(e) => setEnrichLimit(e.target.value)}
+                  disabled={enrichMut.isPending}
+                />
+              </label>
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={enrichDryRun}
+                onChange={(e) => setEnrichDryRun(e.target.checked)}
+                disabled={enrichMut.isPending}
+                className="rounded border-rule"
+              />
+              <span>Dry run (no HTTP, no DB writes)</span>
+            </label>
+            {enrichResult && (
+              <div className="text-xs font-mono text-ink-muted border border-rule rounded px-3 py-2">
+                {enrichResult.dry_run ? (
+                  <>
+                    would process {enrichResult.total} lead(s)
+                    {enrichResult.candidates && enrichResult.candidates.length > 0 && (
+                      <ul className="mt-2 max-h-32 overflow-y-auto list-disc pl-4">
+                        {enrichResult.candidates.map((c) => (
+                          <li key={c.lead_id}>
+                            {c.name ?? c.lead_id} — {c.last_fetched ?? 'never'}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    ok={enrichResult.ok} failed={enrichResult.failed} total={enrichResult.total}
+                  </>
+                )}
+              </div>
+            )}
+            {enrichMut.isError && (
+              <div className="text-xs text-oxblood">
+                {enrichMut.error instanceof Error
+                  ? enrichMut.error.message
+                  : 'Request failed'}
+              </div>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                onClick={() => setEnrichOpen(false)}
+                disabled={enrichMut.isPending}
+              >
+                Close
+              </Button>
+              <Button
+                variant="primary"
+                onClick={() => enrichMut.mutate()}
+                disabled={enrichMut.isPending}
+              >
+                {enrichMut.isPending ? 'Running…' : 'Run'}
+              </Button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

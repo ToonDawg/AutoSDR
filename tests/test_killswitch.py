@@ -28,14 +28,6 @@ def test_remove_flag_when_absent():
     assert killswitch.remove_flag() is False
 
 
-def test_pid_file_roundtrip():
-    assert killswitch.read_pid_file() is None
-    killswitch.write_pid_file()
-    assert killswitch.read_pid_file() is not None
-    killswitch.clear_pid_file()
-    assert killswitch.read_pid_file() is None
-
-
 async def test_await_shutdown_or_timeout_wakes_on_event():
     event = killswitch.shutdown_event()
 

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { CheckCircle2, FileText, Upload } from 'lucide-react';
@@ -8,13 +8,28 @@ import { Badge } from '@/components/ui/Badge';
 import { BackLink } from '@/components/ui/BackLink';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { CONTACT_TYPE_LABEL, formatPhone, formatSkipReason } from '@/lib/format';
-import type { ImportPreview } from '@/lib/types';
+import type {
+  CoreFieldName,
+  ImportPreview,
+  ImportPreviewColumn,
+  MappingConfig,
+} from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 /**
  * Two-step lead importer. Drop a CSV/JSON file, we preview what will
- * be imported versus skipped (and why), then the operator commits.
- * Commit reuses the same file — the server normalises and dedupes.
+ * be imported versus skipped, and we render a column-mapping table so
+ * the operator can approve or override every detected column before
+ * commit. Commit re-uploads the same file plus the operator's
+ * `mapping_config` — the server normalises and dedupes.
+ *
+ * Mapping table semantics:
+ * - Per-column choice: a core field, "raw_data only", or "drop entirely".
+ * - "Drop entirely" filters keys out of *this* import only — existing
+ *   ``raw_data`` for prior rows is left alone (commit-only — see ticket
+ *   0004 council resolution `drop-semantic`).
+ * - Choices preselect to the server's suggestion. Operator overrides
+ *   never get silently re-suggested.
  */
 export function LeadsImport() {
   const navigate = useNavigate();
@@ -22,14 +37,19 @@ export function LeadsImport() {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [choices, setChoices] = useState<Record<string, MappingChoice>>({});
 
   const previewMut = useMutation({
     mutationFn: (f: File) => api.previewImport(f),
-    onSuccess: setPreview,
+    onSuccess: (p) => {
+      setPreview(p);
+      setChoices(initialChoicesFromPreview(p));
+    },
   });
 
   const commitMut = useMutation({
-    mutationFn: (f: File) => api.commitImport(f),
+    mutationFn: ({ f, cfg }: { f: File; cfg: MappingConfig | null }) =>
+      api.commitImport(f, cfg),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['leads'] });
       navigate('/leads', { replace: true });
@@ -39,8 +59,30 @@ export function LeadsImport() {
   const handleFile = (f: File | null) => {
     setFile(f);
     setPreview(null);
+    setChoices({});
     if (f) previewMut.mutate(f);
   };
+
+  const setChoice = (col: string, choice: MappingChoice) =>
+    setChoices((prev) => ({ ...prev, [col]: choice }));
+
+  const dropAllUnsuggested = () => {
+    if (!preview) return;
+    setChoices((prev) => {
+      const next = { ...prev };
+      for (const col of preview.columns) {
+        if (col.suggested_target === null || col.suggestion_confidence === 'none') {
+          next[col.name] = 'drop';
+        }
+      }
+      return next;
+    });
+  };
+
+  const mappingConfig = useMemo(
+    () => (preview ? buildMappingConfig(preview.columns, choices) : null),
+    [preview, choices],
+  );
 
   return (
     <div className="page-narrow gap-6">
@@ -171,6 +213,15 @@ export function LeadsImport() {
             </div>
           </div>
 
+          {preview.columns.length > 0 && (
+            <ColumnMappingTable
+              columns={preview.columns}
+              choices={choices}
+              onChange={setChoice}
+              onDropAllUnsuggested={dropAllUnsuggested}
+            />
+          )}
+
           <div>
             <div className="flex items-center justify-between pb-2 border-b border-rule mb-3">
               <h2 className="text-sm font-medium">Sample</h2>
@@ -229,7 +280,7 @@ export function LeadsImport() {
               <Button
                 variant="primary"
                 iconLeft={<CheckCircle2 className="h-4 w-4" strokeWidth={1.5} />}
-                onClick={() => commitMut.mutate(file)}
+                onClick={() => commitMut.mutate({ f: file, cfg: mappingConfig })}
                 disabled={commitMut.isPending}
               >
                 {commitMut.isPending ? 'Committing…' : 'Commit import'}
@@ -255,4 +306,194 @@ function Rule({ title, body }: { title: string; body: string }) {
       <p className="text-xs text-ink-muted leading-relaxed">{body}</p>
     </div>
   );
+}
+
+// ---------- mapping table ----------
+
+/**
+ * What the operator picked for one source column. The wire format
+ * splits these into ``mapping`` / ``include_in_raw_only`` /
+ * ``drop_from_raw``; this UI-side enum keeps the radio model simple.
+ */
+type MappingChoice = CoreFieldName | 'raw_only' | 'drop';
+
+const CORE_FIELD_OPTIONS: { value: CoreFieldName; label: string }[] = [
+  { value: 'name', label: 'name' },
+  { value: 'category', label: 'category' },
+  { value: 'address', label: 'address' },
+  { value: 'website', label: 'website' },
+  { value: 'phone', label: 'phone' },
+];
+
+const CONFIDENCE_TONE: Record<
+  ImportPreviewColumn['suggestion_confidence'],
+  'forest' | 'mustard' | 'neutral'
+> = {
+  high: 'forest',
+  medium: 'mustard',
+  low: 'neutral',
+  none: 'neutral',
+};
+
+function initialChoicesFromPreview(p: ImportPreview): Record<string, MappingChoice> {
+  const next: Record<string, MappingChoice> = {};
+  for (const col of p.columns) {
+    next[col.name] = suggestionToChoice(col);
+  }
+  return next;
+}
+
+function suggestionToChoice(col: ImportPreviewColumn): MappingChoice {
+  if (col.suggested_target === null) return 'raw_only';
+  if (col.suggested_target === 'raw_only') return 'raw_only';
+  return col.suggested_target;
+}
+
+/**
+ * Convert the operator's per-column picks into the wire format.
+ * Returns ``null`` when the operator hasn't deviated from a default
+ * pure pass-through (no mappings, no drops, no raw-only forces) so we
+ * keep the wire payload empty for backward-compatible clients.
+ */
+function buildMappingConfig(
+  columns: ImportPreviewColumn[],
+  choices: Record<string, MappingChoice>,
+): MappingConfig | null {
+  const mapping: Partial<Record<CoreFieldName, string>> = {};
+  const drop: string[] = [];
+  const rawOnly: string[] = [];
+
+  for (const col of columns) {
+    const choice = choices[col.name];
+    if (choice === 'drop') {
+      drop.push(col.name);
+    } else if (choice === 'raw_only') {
+      rawOnly.push(col.name);
+    } else if (choice) {
+      mapping[choice] = col.name;
+    }
+  }
+
+  if (
+    Object.keys(mapping).length === 0 &&
+    drop.length === 0 &&
+    rawOnly.length === 0
+  ) {
+    return null;
+  }
+  return { mapping, drop_from_raw: drop, include_in_raw_only: rawOnly };
+}
+
+interface ColumnMappingTableProps {
+  columns: ImportPreviewColumn[];
+  choices: Record<string, MappingChoice>;
+  onChange: (col: string, choice: MappingChoice) => void;
+  onDropAllUnsuggested: () => void;
+}
+
+function ColumnMappingTable({
+  columns,
+  choices,
+  onChange,
+  onDropAllUnsuggested,
+}: ColumnMappingTableProps) {
+  return (
+    <div>
+      <div className="flex items-center justify-between pb-2 border-b border-rule mb-3">
+        <h2 className="text-sm font-medium">Column mapping</h2>
+        <button
+          type="button"
+          onClick={onDropAllUnsuggested}
+          className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted hover:text-ink"
+        >
+          Drop all unsuggested
+        </button>
+      </div>
+      <p className="text-xs text-ink-muted mb-3 leading-relaxed">
+        One row per column we found in your file. Map each to a core field, keep it
+        in <span className="font-mono">raw_data</span> only, or drop it entirely.{' '}
+        <span className="text-ink">
+          Dropping applies to this import only — existing records keep what they have.
+        </span>
+      </p>
+      <div className="paper-card">
+        <table className="t-table">
+          <thead>
+            <tr>
+              <th style={{ width: '22%' }}>Column</th>
+              <th style={{ width: '38%' }}>Sample values</th>
+              <th style={{ width: '14%' }}>Suggestion</th>
+              <th style={{ width: '26%' }}>Map to</th>
+            </tr>
+          </thead>
+          <tbody>
+            {columns.map((col) => (
+              <tr key={col.name}>
+                <td className="font-mono text-xs text-ink">{col.name}</td>
+                <td>
+                  <div
+                    className="text-xs text-ink-muted truncate max-w-md"
+                    title={formatSampleTitle(col.sample_values)}
+                  >
+                    {formatSampleInline(col.sample_values)}
+                  </div>
+                </td>
+                <td>
+                  {col.suggestion_confidence === 'none' ? (
+                    <Badge tone="neutral">no guess</Badge>
+                  ) : (
+                    <span title={col.suggestion_reason}>
+                      <Badge tone={CONFIDENCE_TONE[col.suggestion_confidence]}>
+                        {col.suggestion_confidence}
+                      </Badge>
+                    </span>
+                  )}
+                </td>
+                <td>
+                  <select
+                    className="w-full bg-paper border border-rule-strong px-2 py-1 text-xs font-mono text-ink focus:outline-none focus:border-ink"
+                    value={choices[col.name] ?? 'raw_only'}
+                    onChange={(e) =>
+                      onChange(col.name, e.target.value as MappingChoice)
+                    }
+                  >
+                    {CORE_FIELD_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        → {opt.label}
+                      </option>
+                    ))}
+                    <option value="raw_only">Keep in raw_data only</option>
+                    <option value="drop">Drop entirely</option>
+                  </select>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function formatSampleInline(values: unknown[]): string {
+  if (!values.length) return '—';
+  return values
+    .slice(0, 3)
+    .map((v) => formatSampleValue(v))
+    .join(' · ');
+}
+
+function formatSampleTitle(values: unknown[]): string {
+  return values.map((v) => formatSampleValue(v)).join('\n');
+}
+
+function formatSampleValue(v: unknown): string {
+  if (v === null || v === undefined) return '∅';
+  if (typeof v === 'string') return v.length > 60 ? `${v.slice(0, 60)}…` : v;
+  try {
+    const s = JSON.stringify(v);
+    return s.length > 60 ? `${s.slice(0, 60)}…` : s;
+  } catch {
+    return String(v);
+  }
 }

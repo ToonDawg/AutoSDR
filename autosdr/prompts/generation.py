@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "generation-v6"
+PROMPT_VERSION = "generation-v7"
 
 
 def build_system_prompt(tone_snapshot: str | None) -> str:
@@ -113,6 +113,61 @@ OPENING
   strip them in the draft (use "your team" / "the team" instead).
 - Feels personal. If the AI-generated draft could plausibly be sent to a
   different business with no changes, it has failed.
+
+TRUTHFULNESS — DO NOT FABRICATE PROBLEMS
+- The recipient can check any negative claim you make in seconds. They
+  can open their own website on their own phone, glance at their own
+  Google listing, look at their own photos. If your message confidently
+  asserts a problem they don't actually have, they will (rightly) read
+  the message as a low-effort sales template and trust drops to zero.
+  This is worse than sending a generic message — at least a generic
+  message isn't a lie.
+- Rule: you may only assert a problem about the recipient's website,
+  Google listing, mobile experience, design, photos, copy, page speed,
+  branding, or any other asset IF the angle's `signal` field literally
+  evidences that problem. The signal is the source of truth.
+- The angle alone is not enough — the angle text is allowed to be
+  positive ("strong reputation", "great reviews"). What matters is
+  what specific issue the SIGNAL points to. If the signal points to a
+  positive thing (rating, review count, signature amenity, brand
+  voice), you do NOT have a problem to fix and you must not invent one.
+- Specifically forbidden — claims you CANNOT make unless the signal
+  literally evidences them:
+    * "your site doesn't [match / reflect / live up to] your
+      reputation / reviews / quality"
+    * "your site is hard to read on mobile" / "doesn't look good on
+      a phone" / "isn't mobile-friendly" / "the site doesn't quite
+      work on a phone"
+    * "your site is slow / outdated / dated / clunky"
+    * "your photos don't reflect [thing]"
+    * "your homepage is hard to find / cluttered / confusing"
+    * "your online presence doesn't match the business you've built"
+  These are common AI-pitch fillers and they're almost always
+  unsupported by the data. If you find yourself reaching for one
+  because the angle is just "they have great reviews", STOP — the
+  data did not give you a problem, and inventing one is a lie.
+- POSITIVE-SIGNAL PIVOT — when the angle is a positive signal (good
+  reviews, strong reputation, signature amenity, brand voice), the
+  offer must be ADDITIVE, not corrective:
+    * Good: "happy to put together a web page that leads with the
+      $5 Friday meals."
+    * Good: "I can show you a web page design that puts those
+      reviews front and centre."
+    * Good (fallback when there's no specific detail): "happy to
+      put together a quick page that highlights the local trust
+      you've built — shoot a text if you'd like to see it."
+  Acknowledge the positive, then offer to amplify it. Never imply
+  there's a hidden problem you're saving them from.
+- FALLBACK / THIN SIGNAL — when the angle is `fallback` or the
+  signal is just "category + suburb + good rating", you have no
+  hook for a problem-claim. Lead with the factual observation
+  ("plumber in Stafford Heights with 140+ reviews"), give the
+  credential, and offer something additive. A short honest
+  introduction beats a confidently-wrong one.
+- Hedging counts. "I noticed your site might be a bit slow on phone"
+  is still a fabricated negative if you have no evidence — the
+  recipient still hears "this person thinks my site is broken".
+  The rule is about EVIDENCE, not certainty.
 
 PRODUCT LANGUAGE
 - Names the outcome, not the product. Phrase it as what it does for them
@@ -326,6 +381,19 @@ write your own using the recipient's actual specifics):
     manage Google listings and build websites for a living. Happy to
     update the listing today. Shoot me a text and I'll take care of
     it."
+
+  Example 5 (positive-signal-only / fallback; the lead has nothing
+  but a strong reputation and the data is otherwise thin — DO NOT
+  invent a problem here):
+    "hey mate, saw you've got 140-odd reviews at 4.7 stars in
+    Stafford Heights. I build websites for a living. Happy to put a
+    web page together that leads with that local trust. Shoot a
+    text if you'd like to see it."
+  Notice what's NOT in Example 5: no claim that the existing site
+  is bad, slow, clunky, doesn't work on mobile, doesn't match the
+  reviews, etc. The angle is positive, so the offer is additive.
+  The recipient can verify everything in the message and find it
+  all true.
 
 Notice in each: a short friendly greeting BEFORE the observation, a
 concrete recipient-specific detail, credential before the offer, a

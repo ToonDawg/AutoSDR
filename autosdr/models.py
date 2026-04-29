@@ -147,6 +147,11 @@ class Lead(Base):
         ),
         Index("idx_lead_workspace_status", "workspace_id", "status"),
         Index("idx_lead_import_order", "workspace_id", "import_order"),
+        Index(
+            "idx_lead_enrichment_status",
+            "workspace_id",
+            "enrichment_status",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -170,6 +175,16 @@ class Lead(Base):
         DateTime(timezone=True), nullable=True
     )
     do_not_contact_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Denormalised mirror of ``raw_data['enrichment']._meta.status`` /
+    # ``_meta.fetched_at``. Set by the scan worker on every persist so the
+    # Scans page can paginate / filter / aggregate in pure SQL instead of
+    # parsing the JSON envelope on every row. ``NULL`` here means "no
+    # scan attempt yet" — the API surfaces it as the synthetic
+    # ``never_scanned`` bucket.
+    enrichment_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    enrichment_fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -226,6 +241,13 @@ class Campaign(Base):
     # ``{enabled, template, delay_s, delay_jitter_s}``. ``None`` = disabled
     # (the default for legacy campaign rows).
     followup: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Optional per-campaign outreach window override. ``None`` = inherit
+    # the workspace default (``workspace.settings.outreach_window``).
+    # Structured as ``{enabled, start_hour, end_hour}`` where the hours
+    # are server-local 24h integers; the window is ``[start_hour:00,
+    # end_hour:00)`` so 8..17 means "8am inclusive, 5pm exclusive".
+    # See :mod:`autosdr.pacing` for how this gates the scheduler tick.
+    outreach_window: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     quota_reset_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -247,6 +269,7 @@ class CampaignLead(Base):
             "status",
             "queue_position",
         ),
+        Index("idx_campaign_lead_lead_id", "lead_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -285,6 +308,15 @@ class Thread(Base):
     )
     auto_reply_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     angle: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Discrete bucket from the analysis prompt's ``angle_type`` field —
+    # one of ``stale_info | weak_presence | signature_detail |
+    # differentiator | review_theme | brand_voice | fallback``.
+    # Populated alongside ``angle`` at first-contact analysis. Used by
+    # ``/api/stats/angle-funnel`` to aggregate "which opener gets
+    # replies" without re-parsing the freeform ``angle`` text. NULL on
+    # legacy rows that pre-date this column; the funnel buckets NULL as
+    # ``"unknown"``.
+    angle_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     tone_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     hitl_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     hitl_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -307,6 +339,13 @@ class Message(Base):
     __tablename__ = "message"
     __table_args__ = (
         Index("idx_message_thread", "thread_id", "created_at"),
+        # Used by the reply pipeline's idempotency check before persisting
+        # an inbound: a poller restart re-delivers everything still in the
+        # phone's SMSGate inbox, and without this lookup we'd append a
+        # second copy of every old SMS to its thread. Indexed on the
+        # composite key so the dedup probe is a single B-tree hit even on
+        # a long-lived thread with hundreds of messages.
+        Index("idx_message_provider_id", "thread_id", "provider_message_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -317,6 +356,17 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     metadata_: Mapped[dict] = mapped_column(
         "metadata", JSON, nullable=False, default=dict
+    )
+    # Connector-issued message id for the *original* inbound SMS. Populated
+    # for ``role == "lead"`` inserts so the next poll tick that re-fetches
+    # the same SMSGate inbox row can recognise it as already-seen. NULL on
+    # outbound rows (we have ``send_result.provider_message_id`` in
+    # ``metadata`` for those) and on legacy inbound rows that pre-date this
+    # column. Promoted out of ``metadata`` to a real column so the dedup
+    # query is portable across SQLite + Postgres without JSON-path
+    # operators.
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

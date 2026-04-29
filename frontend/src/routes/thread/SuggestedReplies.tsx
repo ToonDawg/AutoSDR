@@ -1,8 +1,7 @@
 import { memo } from 'react';
 import { Edit3, RefreshCcw, Send, Sparkles } from 'lucide-react';
-import { Badge } from '@/components/ui/Badge';
-import { Button } from '@/components/ui/Button';
 import { evalScoreTone } from '@/lib/format';
+import { cn } from '@/lib/utils';
 import type { Suggestion } from '@/lib/types';
 
 interface Props {
@@ -16,14 +15,17 @@ interface Props {
 }
 
 /**
- * "Paused for you" card that fans out the 2-3 stashed AI drafts.
+ * Smart-reply strip above the compose bar.
+ *
+ * Patterned after Messenger / Gmail Smart Reply: a thin, horizontally
+ * scrollable row of compact cards. Operator scans the drafts at a
+ * glance, taps Send to fire one, or Edit to load it into Compose for
+ * tweaking.
  *
  * A thread enters this state when an inbound reply lands while
  * `auto_reply_enabled` is off — `reply.py` captures the inbound,
  * classifies it, generates candidate drafts, evaluates them, and stashes
- * the whole set on `thread.hitl_context.suggestions`. The operator then
- * either sends one as-is, loads it into Compose to tweak, or asks for a
- * new batch via Regenerate.
+ * the whole set on `thread.hitl_context.suggestions`.
  */
 export function SuggestedReplies({
   suggestions,
@@ -37,42 +39,39 @@ export function SuggestedReplies({
   const empty = suggestions.length === 0;
 
   return (
-    <div className="border-t border-rule px-8 py-5 bg-paper-deep/40">
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <Sparkles className="h-3.5 w-3.5 text-rust" strokeWidth={1.5} />
-          <span className="text-sm font-medium">Suggested replies</span>
-          {pausedForHitl && !empty && (
-            <Badge tone="neutral" uppercase={false}>
-              pick one, edit, or regenerate
-            </Badge>
-          )}
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          iconLeft={<RefreshCcw className="h-3.5 w-3.5" strokeWidth={1.5} />}
+    <div className="border-t border-rule px-4 pt-2 pb-2.5 bg-paper-deep/40 shrink-0">
+      <div className="flex items-center gap-2 mb-1.5 px-1">
+        <Sparkles className="h-3 w-3 text-rust" strokeWidth={1.5} />
+        <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-ink-muted">
+          AI suggestions
+        </span>
+        <div className="flex-1" />
+        <button
+          type="button"
           onClick={onRegenerate}
           disabled={regenerating}
+          className="inline-flex items-center gap-1 text-[11px] text-ink-muted hover:text-ink cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
         >
+          <RefreshCcw
+            className={cn('h-3 w-3', regenerating && 'animate-spin')}
+            strokeWidth={1.5}
+          />
           {regenerating ? 'Regenerating…' : 'Regenerate'}
-        </Button>
+        </button>
       </div>
 
-      {empty && (
-        <div className="text-sm text-ink-muted italic">
+      {empty ? (
+        <div className="text-xs text-ink-muted italic px-1 py-1.5">
           {regenerating
             ? 'Running the generator…'
             : pausedForHitl
-              ? 'No drafts on file yet. Click Regenerate to ask the model for a few options.'
+              ? 'No drafts on file. Click Regenerate to ask the model.'
               : 'Generate drafts for the next outbound, without waiting for an inbound.'}
         </div>
-      )}
-
-      {!empty && (
-        <ol className="flex flex-col gap-3">
+      ) : (
+        <ol className="flex gap-2 overflow-x-auto pb-1 px-1 snap-x snap-mandatory">
           {suggestions.map((s, idx) => (
-            <SuggestionRow
+            <SuggestionChip
               key={s.gen_llm_call_id ?? `${idx}`}
               index={idx}
               suggestion={s}
@@ -87,11 +86,7 @@ export function SuggestedReplies({
   );
 }
 
-// Memoized: rows only re-render when their suggestion / disabled flag changes.
-// Parent can pass stable `onSend`/`onEdit` (e.g. via `useCallback`) and the
-// row binds the per-row draft locally without creating a new closure for the
-// child each render.
-const SuggestionRow = memo(function SuggestionRow({
+const SuggestionChip = memo(function SuggestionChip({
   index,
   suggestion,
   onSend,
@@ -104,48 +99,53 @@ const SuggestionRow = memo(function SuggestionRow({
   onEdit: (draft: string) => void;
   disabled: boolean;
 }) {
-  const score = Math.round((suggestion.overall ?? 0) * 100);
-  const tone = evalScoreTone(score);
+  const hasEvalScore = suggestion.overall != null;
+  const score = hasEvalScore ? Math.round((suggestion.overall ?? 0) * 100) : null;
+  const tone = score != null ? evalScoreTone(score) : 'neutral';
   return (
-    <li className="paper-card-deep px-4 py-3 flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-[11px] font-mono uppercase tracking-[0.14em] text-ink-muted">
-        <span>Option {index + 1}</span>
-        <span className="text-ink-faint">·</span>
-        <Badge tone={tone} uppercase={false}>
-          eval {score}
-        </Badge>
-        {suggestion.pass && (
-          <Badge tone="forest" uppercase={false}>
-            passed
-          </Badge>
+    <li className="paper-card w-72 shrink-0 snap-start px-3 py-2 flex flex-col gap-1.5">
+      <div className="flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-[0.12em] text-ink-muted">
+        <span>#{index + 1}</span>
+        {score != null && (
+          <span className={cn('px-1 border', SCORE_TONE[tone])}>{score}</span>
+        )}
+        {suggestion.pass === true && (
+          <span className="px-1 border border-forest text-forest">ok</span>
         )}
         {suggestion.temperature != null && (
-          <span className="text-ink-faint">temp {suggestion.temperature.toFixed(2)}</span>
+          <span className="text-ink-faint">t {suggestion.temperature.toFixed(1)}</span>
         )}
       </div>
-      <p className="text-sm leading-relaxed text-ink">{suggestion.draft}</p>
-      {suggestion.feedback && (
-        <div className="text-xs text-ink-muted italic leading-snug">{suggestion.feedback}</div>
-      )}
-      <div className="flex items-center gap-2">
-        <Button
-          variant="primary"
-          size="sm"
-          iconLeft={<Send className="h-3.5 w-3.5" strokeWidth={1.5} />}
+      <p className="text-xs leading-snug text-ink line-clamp-3 min-h-[2.6rem]">
+        {suggestion.draft}
+      </p>
+      <div className="flex items-center gap-1 -mb-0.5">
+        <button
+          type="button"
           onClick={() => onSend(suggestion.draft)}
           disabled={disabled}
+          className="inline-flex items-center gap-1 px-2 h-6 text-[11px] bg-ink text-paper border border-ink hover:bg-rust hover:border-rust cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          Send this
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          iconLeft={<Edit3 className="h-3.5 w-3.5" strokeWidth={1.5} />}
+          <Send className="h-3 w-3" strokeWidth={1.5} />
+          Send
+        </button>
+        <button
+          type="button"
           onClick={() => onEdit(suggestion.draft)}
+          className="inline-flex items-center gap-1 px-2 h-6 text-[11px] text-ink-muted hover:text-ink hover:bg-paper-deep cursor-pointer"
         >
+          <Edit3 className="h-3 w-3" strokeWidth={1.5} />
           Edit
-        </Button>
+        </button>
       </div>
     </li>
   );
 });
+
+const SCORE_TONE: Record<string, string> = {
+  forest: 'border-forest text-forest',
+  mustard: 'border-mustard text-mustard',
+  rust: 'border-rust text-rust',
+  oxblood: 'border-oxblood text-oxblood',
+  neutral: 'border-rule text-ink-muted',
+};

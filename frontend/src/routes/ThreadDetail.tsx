@@ -178,8 +178,8 @@ export function ThreadDetail() {
     : null;
 
   return (
-    <div className="grid grid-cols-12 min-h-[calc(100vh-3rem)]">
-      <div className="col-span-12 lg:col-span-8 xl:col-span-8 border-r border-rule flex flex-col min-w-0">
+    <div className="grid grid-cols-12 h-[calc(100vh-3rem)]">
+      <div className="col-span-12 lg:col-span-8 xl:col-span-8 border-r border-rule flex flex-col min-w-0 min-h-0">
         <div className="border-b border-rule px-8 pt-5 pb-4">
           <button
             onClick={() => navigate(-1)}

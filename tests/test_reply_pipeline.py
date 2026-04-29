@@ -270,8 +270,8 @@ async def test_positive_triggers_auto_reply(active_thread, fresh_db, monkeypatch
                 "confidence": 0.92,
                 "reason": "Lead wants to know more.",
             },
-            "generation-v6": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
-            "evaluation-v4.2": {
+            "generation-v7": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
+            "evaluation-v4.3": {
                 "scores": {
                     "tone_match": 0.92,
                     "personalisation": 0.9,
@@ -388,7 +388,12 @@ async def test_multi_campaign_routes_to_most_recent_outbound(
 
     from datetime import datetime, timedelta, timezone
 
-    ws_id = workspace_factory()
+    # This test exercises the multi-campaign routing rule (most-recent
+    # outbound wins) plus the close-lost propagation. Pinning auto-reply
+    # on keeps the terminal-intent shortcut alive — the first-message-only
+    # default would route every reply to HITL with suggestions instead,
+    # masking the routing assertion behind a different code path.
+    ws_id = workspace_factory(settings_overrides={"auto_reply_enabled": True})
     outbox = tmp_path / "outbox.jsonl"
 
     with fresh_db() as session:

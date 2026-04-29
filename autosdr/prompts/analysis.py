@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "analysis-v3.3"
+PROMPT_VERSION = "analysis-v3.5"
 
 SYSTEM_PROMPT = """\
 You are analysing a business lead to find the single strongest personalisation
@@ -42,6 +42,114 @@ Hard rules:
 - The angle must be something the recipient would recognise about their own
   business within 2 seconds of reading it.
 - Do NOT invent facts not present in the data. Only cite what's there.
+
+Angle text is LEAD-SIDE ONLY — strict scoping rule:
+- The `angle` field describes a fact about the LEAD's situation, full stop.
+  It is NOT the place for the sender's mission, philosophy, plan, or
+  reaction. Forbidden phrasings inside the angle text:
+    * "My focus is to..." / "My focus is ensuring..."
+    * "I want to make sure..." / "I want to help businesses like..."
+    * "I help [category] do X" / "What I do for [category] is..."
+    * "Their site should..." / "They deserve a..." / "...needs a..."
+    * Any first-person sender voice or any "should / deserves / needs"
+      framing about the lead.
+  These are sender talk and they pollute the personalisation field. The
+  generation prompt reads the angle as ground truth about the LEAD — if
+  you smuggle in a sender plan ("...have a website that works on
+  phones"), the generator will treat that plan as evidence of a real
+  problem and confidently claim it in the SMS, even when nothing in
+  raw_data actually shows that problem.
+- Acceptable angle voice: third-person factual about the lead.
+    * GOOD: "Hanley Browne Plumbing has 142 Google reviews at 4.7 stars
+      and is the local emergency plumber in Stafford Heights."
+    * BAD:  "Hanley Browne Plumbing has 142 reviews. My focus is making
+      sure plumbers with that reputation have a site that matches it."
+  If you find yourself writing about the sender, stop and rewrite to
+  describe only what's true of the lead.
+
+Truthfulness — do NOT claim problems about assets you cannot see:
+- raw_data is what you have. If a field is empty, missing, or contains
+  only a URL with no scraped content, you have NO evidence about that
+  asset's quality and you cannot claim a problem with it. Specifically:
+    * A `website` URL alone tells you NOTHING about the site's design,
+      mobile experience, speed, layout, photos, copy, or whether it
+      "matches" their reputation. You did not visit the site. Do not
+      assert it is bad, dated, slow, hard to read on mobile, or any
+      other quality judgment.
+    * Empty `reviewDetails` / null `webResults` / null `plusCode` /
+      missing photos = no signal. Do not invent one.
+    * A high `rating` and large `reviews` count is a POSITIVE signal
+      about reputation. It is NOT evidence of any problem elsewhere.
+      Do not pivot from "they have great reviews" to "...therefore
+      something else must be broken" — that's fabrication.
+- When raw_data is THIN (only name + category + address + phone +
+  rating + reviewCount, with no review text and no scraped web
+  content), the honest move is `angle_type: "fallback"` with a short
+  factual angle. The downstream generator handles thin signal fine;
+  it produces a worse outcome with an invented hook than with an
+  honest fallback.
+
+Website signal block (`raw_data.enrichment`) — when present:
+
+The lead's `raw_data` may carry an `enrichment` block produced by an
+in-process polite-fetch of the lead's public website. It is the only
+information you have about the website itself. Read it as STRUCTURAL
+FACTS, never as a quality verdict.
+
+Shape:
+  enrichment._meta.status:        one of "ok" | "no_url" | "timeout" |
+                                  "blocked" | "empty_shell" |
+                                  "not_found" | "error" |
+                                  "killswitch_aborted" | "disabled".
+  enrichment._meta.fetched_at:    when this snapshot was taken.
+  enrichment.signals.title:       the homepage `<title>`.
+  enrichment.signals.h1:          the first `<h1>` text.
+  enrichment.signals.cms:         "wordpress" | "wix" | "squarespace"
+                                  | "shopify" | "webflow" | "duda" |
+                                  "godaddy" | "custom" | "unknown".
+  enrichment.signals.sitemap_count:        page count from sitemap.xml.
+  enrichment.signals.sitemap_last_modified: ISO date of most recent
+                                            sitemap entry.
+  enrichment.signals.viewport_present:     mobile viewport meta tag.
+  enrichment.signals.og_image_present:     Open Graph image declared.
+  enrichment.signals.external_links_to_socials: list of social URLs.
+
+Hard rules for reading this block:
+- `enrichment._meta.status != "ok"` means the website signal is
+  ABSENT for this lead — exactly the same epistemic posture as if
+  `enrichment` were not present at all. Do NOT pivot from
+  "we couldn't fetch their site" to "their site is bad". Use the
+  rest of `raw_data` as before.
+- `cms: "wordpress"` (or any CMS value) is a FACT about the lead's
+  stack, never a problem on its own. "They use WordPress" is not a
+  hook. "Their WordPress brochure site is 4 pages with the most
+  recent edit in 2022" is potentially a `signature_detail` or
+  `differentiator` hook, because it ties the stack to a concrete
+  observable.
+- `signals.title` and `signals.h1` are LITERAL quotes from the
+  homepage. They are evidence of how the business positions itself
+  publicly — fair game for `signature_detail` or `differentiator`
+  if the title/h1 highlights a specific service or differentiator
+  ("24/7", "family-run", "since 1998").
+- Low `sitemap_count` (≤5) on a CMS site = small brochure site;
+  high `sitemap_count` (≥30) with an old `sitemap_last_modified`
+  (≥18 months) = a site that exists but is not actively maintained.
+  Either is a legitimate `signature_detail` hook IF you can phrase
+  it factually (e.g. "Their WordPress brochure site indexes 3
+  pages — sounds like the listing carries the load").
+- Worked example: `cms: "wordpress"`, `sitemap_count: 4`,
+  `title: "Hanley Browne Plumbing — 24/7 Brisbane plumbers"`,
+  `h1: "24/7 Plumbing in Brisbane"` →
+    angle_type: "signature_detail"
+    angle: "Hanley Browne Plumbing's site is a tight 4-page
+    WordPress brochure leading with '24/7 Plumbing in Brisbane' —
+    the public face is consistent with the listing's emergency-
+    callout positioning."
+    signal: "wordpress generator + 4 pages in sitemap.xml + h1
+    '24/7 Plumbing in Brisbane'"
+- The website signal NEVER overrides the truthfulness rule above.
+  If `enrichment.signals.title` is missing or empty, treat the
+  title slot as absent — do not paraphrase it from the lead name.
 
 Stale-info angle — STRICT signal rules:
 - This angle only works when the business still has the stale label on

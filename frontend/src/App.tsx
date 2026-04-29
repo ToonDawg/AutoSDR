@@ -1,9 +1,7 @@
 import { lazy, Suspense } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import { Navigate, Route, Routes } from 'react-router-dom';
 import { AppShell } from '@/components/layout/AppShell';
 import { Dashboard } from '@/routes/Dashboard';
-import { api } from '@/lib/api';
 
 // Dashboard is the index route and tiny — keep it eager so it paints
 // without a Suspense flash. Everything else is split into its own chunk
@@ -29,10 +27,13 @@ const LeadsImport = lazy(() =>
   import('@/routes/LeadsImport').then((m) => ({ default: m.LeadsImport })),
 );
 const Logs = lazy(() => import('@/routes/Logs').then((m) => ({ default: m.Logs })));
+const Scans = lazy(() => import('@/routes/Scans').then((m) => ({ default: m.Scans })));
+const ScanDetail = lazy(() =>
+  import('@/routes/ScanDetail').then((m) => ({ default: m.ScanDetail })),
+);
 const Settings = lazy(() =>
   import('@/routes/Settings').then((m) => ({ default: m.Settings })),
 );
-const Setup = lazy(() => import('@/routes/Setup').then((m) => ({ default: m.Setup })));
 const NotFound = lazy(() =>
   import('@/routes/NotFound').then((m) => ({ default: m.NotFound })),
 );
@@ -48,87 +49,29 @@ function RouteFallback() {
   );
 }
 
-/**
- * App shell + routing.
- *
- * `SetupGate` polls `GET /api/setup/required` once on mount. If the
- * backend has no workspace row yet, we force the user to `/setup` before
- * showing anything else. Once the wizard writes the workspace row, the
- * query is invalidated and the gate lets the normal app through.
- */
+/** App shell + routing. */
 export default function App() {
   return (
-    <SetupGate>
-      <Suspense fallback={<RouteFallback />}>
-        <Routes>
-          <Route path="/setup" element={<Setup />} />
-          <Route element={<AppShell />}>
-            <Route index element={<Dashboard />} />
-            <Route path="/inbox" element={<Inbox />} />
-            <Route path="/threads" element={<Threads />} />
-            <Route path="/threads/:id" element={<ThreadDetail />} />
-            <Route path="/campaigns" element={<Campaigns />} />
-            <Route path="/campaigns/:id" element={<CampaignDetail />} />
-            <Route path="/leads" element={<Leads />} />
-            <Route path="/leads/import" element={<LeadsImport />} />
-            <Route path="/leads/:id" element={<LeadDetail />} />
-            <Route path="/logs" element={<Logs />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="*" element={<NotFound />} />
-          </Route>
-        </Routes>
-      </Suspense>
-    </SetupGate>
+    <Suspense fallback={<RouteFallback />}>
+      <Routes>
+        <Route path="/setup" element={<Navigate to="/settings" replace />} />
+        <Route element={<AppShell />}>
+          <Route index element={<Dashboard />} />
+          <Route path="/inbox" element={<Inbox />} />
+          <Route path="/threads" element={<Threads />} />
+          <Route path="/threads/:id" element={<ThreadDetail />} />
+          <Route path="/campaigns" element={<Campaigns />} />
+          <Route path="/campaigns/:id" element={<CampaignDetail />} />
+          <Route path="/leads" element={<Leads />} />
+          <Route path="/leads/import" element={<LeadsImport />} />
+          <Route path="/leads/:id" element={<LeadDetail />} />
+          <Route path="/scans" element={<Scans />} />
+          <Route path="/scans/:leadId" element={<ScanDetail />} />
+          <Route path="/logs" element={<Logs />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<NotFound />} />
+        </Route>
+      </Routes>
+    </Suspense>
   );
-}
-
-/**
- * Gate the app on workspace setup. We derive the redirect target during
- * render rather than in an effect — react-router's `<Navigate>` handles
- * the navigation safely without a double render and avoids a redundant
- * `useEffect` + `useNavigate` pair.
- */
-function SetupGate({ children }: { children: React.ReactNode }) {
-  const location = useLocation();
-  const onSetupRoute = location.pathname.startsWith('/setup');
-
-  const { data, isLoading, isError } = useQuery({
-    queryKey: ['setup', 'required'],
-    queryFn: () => api.getSetupStatus(),
-    staleTime: 30_000,
-    retry: 1,
-  });
-
-  if (isLoading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-paper text-ink-muted text-sm font-mono">
-        <span className="inline-flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-rust dot-pulse" />
-          booting…
-        </span>
-      </div>
-    );
-  }
-
-  if (isError) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-paper text-ink p-8">
-        <div className="paper-card px-6 py-5 max-w-md">
-          <div className="text-sm font-medium">Can't reach the AutoSDR server.</div>
-          <div className="mt-2 text-xs text-ink-muted">
-            Check that the backend is running and refresh the page.
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (data?.setup_required && !onSetupRoute) {
-    return <Navigate to="/setup" replace />;
-  }
-  if (data && !data.setup_required && onSetupRoute) {
-    return <Navigate to="/" replace />;
-  }
-
-  return <>{children}</>;
 }

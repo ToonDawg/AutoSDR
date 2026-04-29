@@ -85,6 +85,7 @@ export function Dashboard() {
         callsToday={status?.llm_usage.calls_today ?? 0}
         tokensInToday={status?.llm_usage.tokens_in_today ?? 0}
         tokensOutToday={status?.llm_usage.tokens_out_today ?? 0}
+        estCostUsdToday={status?.llm_usage.estimated_cost_today_usd ?? 0}
         schedulerTickS={status?.scheduler.tick_s ?? 60}
         inboundPollS={status?.scheduler.poll_s ?? 20}
       />
@@ -225,6 +226,7 @@ function StatusStrip(props: {
   callsToday: number;
   tokensInToday: number;
   tokensOutToday: number;
+  estCostUsdToday: number;
   schedulerTickS: number;
   inboundPollS: number;
 }) {
@@ -255,7 +257,10 @@ function StatusStrip(props: {
       <Stat
         label="LLM today"
         value={`${props.callsToday} calls`}
-        hint={`${props.tokensInToday}→${props.tokensOutToday} tokens`}
+        hint={
+          `${props.tokensInToday}→${props.tokensOutToday} tokens` +
+          ` · est $${props.estCostUsdToday.toFixed(4)}`
+        }
       />
     </div>
   );

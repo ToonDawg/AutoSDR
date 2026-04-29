@@ -43,6 +43,8 @@ from autosdr.models import (
     Thread,
     ThreadStatus,
 )
+from autosdr.db import session_scope
+from autosdr.pipeline._shared import thread_history
 from autosdr.pipeline.followup import schedule_followup_send
 from autosdr.pipeline.reply import HITL_AWAITING_HUMAN_REPLY
 from autosdr.pipeline.suggestions import generate_reply_variants
@@ -245,6 +247,12 @@ async def regenerate_suggestions(thread_id: str) -> ThreadOut:
     of the dice.
     """
 
+    # Phase 1: load context + release the SQLite write lock before any LLM
+    # call. Holding the txn open while the parallel suggestion generations
+    # run would deadlock against their ``LlmCall`` audit-row inserts (see
+    # :mod:`autosdr.pipeline.suggestions` for the full anatomy). We only
+    # need the txn long enough to read the thread/campaign/lead snapshot
+    # plus the message history.
     with db_session() as session:
         workspace = require_workspace(session)
         thread = _load_thread(session, thread_id)
@@ -256,16 +264,27 @@ async def regenerate_suggestions(thread_id: str) -> ThreadOut:
         campaign = session.get(Campaign, campaign_lead.campaign_id)
         lead = session.get(Lead, campaign_lead.lead_id)
         n = int((workspace.settings or {}).get("suggestions_count", 3))
+        history = thread_history(session, thread)
+        thread_id_snapshot = thread.id
+        # Detach the ORM objects so the helper code below can read scalar
+        # attributes (workspace.settings, thread.angle, …) after the session
+        # closes. ``expire_on_commit=False`` is configured on the
+        # sessionmaker so attribute reads on detached instances continue to
+        # return their cached values.
+        session.expunge_all()
 
-        suggestions = await generate_reply_variants(
-            session=session,
-            workspace=workspace,
-            campaign=campaign,
-            lead=lead,
-            thread=thread,
-            n=n,
-        )
+    suggestions = await generate_reply_variants(
+        workspace=workspace,
+        campaign=campaign,
+        lead=lead,
+        thread=thread,
+        history=history,
+        n=n,
+    )
 
+    # Phase 2: persist results in a fresh, short-lived transaction.
+    with session_scope() as session:
+        thread = _load_thread(session, thread_id_snapshot)
         existing = dict(thread.hitl_context or {})
         existing["suggestions"] = suggestions
         thread.hitl_context = existing

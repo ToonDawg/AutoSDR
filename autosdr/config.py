@@ -5,9 +5,9 @@ thresholds, override recipient, scheduler knobs — lives in
 ``workspace.settings`` (a JSON blob on the workspace row). That is the
 single source of truth at runtime and is mutated via the REST API.
 
-Only truly infrastructural values (database url, server host/port, paths for
-the kill-switch flag/PID file, log directory, built-frontend location) are
-read from the environment. These rarely change and don't belong in the UI.
+Only truly infrastructural values (database url, server host/port, path for
+the kill-switch flag, log directory, built-frontend location) are read from
+the environment. These rarely change and don't belong in the UI.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ class Settings(BaseSettings):
 
     # Kill switch
     pause_flag_path: Path = Path("data/.autosdr-pause")
-    pid_file_path: Path = Path("data/autosdr.pid")
 
     # FileConnector outbox
     outbox_path: Path = Path("data/outbox.jsonl")
@@ -49,6 +48,18 @@ class Settings(BaseSettings):
 
     # Built frontend (served from FastAPI at / when present).
     frontend_dist_dir: Path = Path("frontend/dist")
+
+    # Lead-website scan fan-out — max concurrent ``enrich_lead`` tasks.
+    # 20 is the polite-by-default rate for cross-host crawling on a
+    # single Python process: enough parallelism to keep the network
+    # busy without saturating DNS, the OS-level TCP stack, or the
+    # shared ``httpx.AsyncClient`` pool. Override with
+    # ``SCAN_CONCURRENCY=...`` in the environment; values north of
+    # ~100 typically need OS ulimit + httpx pool tuning to actually
+    # pay off (the previous 200 default ignored both, which was the
+    # whole reason every lead was returning ``status=timeout``).
+    # See :mod:`autosdr.pipeline.scans`.
+    scan_concurrency: int = 20
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +84,31 @@ DEFAULT_WORKSPACE_SETTINGS: dict = {
     "min_inter_send_delay_s": 30,
     "max_batch_per_tick": 2,
     "inbound_poll_s": 20,
+
+    # Outreach window — pace each campaign's daily quota evenly across a
+    # working window in server-local time. Outside the window, the
+    # outreach tick is a no-op for sends (the inbound poller, reply
+    # pipeline, follow-up beat and manual kickoff are unaffected). A
+    # per-campaign override on ``campaign.outreach_window`` takes
+    # precedence; ``None`` there means "inherit this default".
+    "outreach_window": {
+        "enabled": True,
+        "start_hour": 8,   # inclusive, 0-23
+        "end_hour": 17,    # exclusive, 1-24
+    },
+
+    # Lead-website enrichment — per-lead public-website fetch run
+    # immediately before the analysis LLM call so the prompt has
+    # structural signals (title, H1, CMS, sitemap count) the Apify
+    # ``webResults: null`` slot otherwise leaves blank. See ticket 0011.
+    # Caps: 3 HTTP requests max per lead, ≤1.5 s/request, ≤budget_s
+    # total wall time, polite robots policy default.
+    "enrichment": {
+        "enabled": True,
+        "budget_s": 4.0,
+        "cache_ttl_days": 30,
+        "respect_robots": True,
+    },
 
     # LLM
     "llm": {

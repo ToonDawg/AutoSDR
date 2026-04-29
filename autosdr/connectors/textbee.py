@@ -32,13 +32,23 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_ts(raw: Any) -> datetime:
+    """Parse TextBee's ``receivedAt`` to a timezone-aware UTC datetime.
+
+    TextBee normally emits ISO-8601 with ``Z``; we still defend against
+    naive strings the same way the SMSGate connector does — interpret
+    them as host-local time and normalise to UTC so a missing offset
+    doesn't shift the message by the device's UTC offset in the
+    transcript.
+    """
+
     if isinstance(raw, str):
         try:
-            # TextBee returns ISO-8601 with 'Z'; fromisoformat understands that
-            # on Python 3.11+.
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             return datetime.now(tz=timezone.utc)
+        if parsed.tzinfo is None:
+            return parsed.astimezone(timezone.utc)
+        return parsed.astimezone(timezone.utc)
     return datetime.now(tz=timezone.utc)
 
 
@@ -66,10 +76,13 @@ class TextBeeConnector(BaseConnector):
         self.poll_limit = max(1, min(100, poll_limit))
         self.consecutive_failures = 0
 
-        # High-water mark of message ids already dispatched. Persisted across
-        # polls for the life of the process; we do not persist across restarts
-        # because the reply pipeline's ``UnmatchedWebhook`` and ``Message``
-        # tables catch most duplicates via ``provider_message_id``.
+        # High-water mark of message ids already dispatched. Persisted
+        # across polls for the life of the process; we do not persist
+        # across restarts because the reply pipeline's
+        # ``_resolve_and_capture_inbound`` rejects any inbound whose
+        # ``provider_message_id`` is already on the thread, so a fresh
+        # ``_seen_ids`` after a restart is harmless — the DB-layer dedup
+        # picks up the slack.
         self._seen_ids: set[str] = set()
         self._last_poll_at: datetime | None = None
 

@@ -27,10 +27,23 @@ local-server users sent every POST to a non-existent path while the GET-based
 test-connection probe falsely reported "reachable" because it didn't
 distinguish 404 from 200.
 
-Inbound replies are pushed to us as ``sms:received`` webhook POSTs (the Android
-device delivers them directly, so your LAN IP is enough — no internet tunnel
-is needed as long as the phone and host are on the same network). The POC
-exposes ``POST /api/webhooks/sms`` for this purpose.
+Inbound replies arrive via two paths, either of which can be used in
+isolation:
+
+* **Polling** (``poll_incoming``) — the scheduler asks SMSGate for the
+  current inbox every ``inbound_poll_s`` seconds via
+  ``GET {api_url}/messages/inbox``. This is the default for the POC because
+  it works with zero network plumbing on the host: no public URL, no
+  ``--host 0.0.0.0`` binding, no firewall hole, no manual webhook
+  registration. The ``/messages/inbox`` endpoint requires SMSGate
+  **v1.60.0+** (capcom6/android-sms-gateway PR #339); older builds will
+  404 and the poller will log it each tick.
+* **Webhook** (``parse_webhook``) — the Android device POSTs
+  ``sms:received`` events to ``POST /api/webhooks/sms``. Lower latency
+  than polling but requires the operator to register the webhook with the
+  device themselves (``POST {api_url}/webhooks``) and to ensure the
+  AutoSDR API is reachable from the phone's LAN IP. AutoSDR does not
+  currently auto-register the webhook.
 
 API reference: https://docs.sms-gate.app/integration/api
 """
@@ -94,11 +107,31 @@ def _normalize_api_url(raw: str) -> str:
 
 
 def _parse_ts(raw: Any) -> datetime:
+    """Parse SMSGate's ``receivedAt`` to a timezone-aware UTC datetime.
+
+    Modern builds return ISO-8601 with an explicit offset (``...Z`` or
+    ``...+10:00``); older / mis-configured on-device builds occasionally
+    drop the offset, leaving a naive ISO string. Treating that naive
+    string as UTC would silently shift the lead's reply by the device's
+    UTC offset — on an AEST phone that's a 10-hour drift, which is what
+    surfaced as "lead replied 10 hours after the AI sent the opener" in
+    the inbox. We normalise naive timestamps as host-local (the SMSGate
+    server runs on the same LAN as AutoSDR in practice) and convert to
+    UTC so downstream storage and the frontend see a single canonical
+    representation.
+    """
+
     if isinstance(raw, str):
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             return datetime.now(tz=timezone.utc)
+        if parsed.tzinfo is None:
+            # ``astimezone(utc)`` on a naive datetime treats it as the
+            # process's local timezone (Python ≥3.6) — exactly what we
+            # want for the on-device SMSGate case.
+            return parsed.astimezone(timezone.utc)
+        return parsed.astimezone(timezone.utc)
     return datetime.now(tz=timezone.utc)
 
 
@@ -114,6 +147,7 @@ class SmsGateConnector(BaseConnector):
         username: str,
         password: str,
         http_timeout_s: float = 20.0,
+        poll_limit: int = 50,
     ) -> None:
         normalized = _normalize_api_url(api_url)
         if not normalized:
@@ -131,7 +165,20 @@ class SmsGateConnector(BaseConnector):
         self.username = username
         self.password = password
         self.http_timeout_s = http_timeout_s
+        self.poll_limit = max(1, min(100, poll_limit))
         self.consecutive_failures = 0
+
+        # Per-process high-water mark of inbox message ids already
+        # dispatched. We do not persist this across restarts because the
+        # reply pipeline now does its own idempotency check against the
+        # ``message.provider_message_id`` column — see
+        # ``_resolve_and_capture_inbound`` in :mod:`autosdr.pipeline.reply`.
+        # This in-memory set therefore exists purely to skip the network
+        # call to ``process_incoming_message`` (and the DB SELECT it
+        # performs) when we already know we've ingested the id in the
+        # current process. The DB is the source of truth; this is the
+        # cache.
+        self._seen_ids: set[str] = set()
 
     def _auth_header(self) -> dict[str, str]:
         token = base64.b64encode(
@@ -256,6 +303,133 @@ class SmsGateConnector(BaseConnector):
             raw_payload=payload,
             provider_message_id=str(msg_id) if msg_id else None,
         )
+
+    async def poll_incoming(self) -> list[IncomingMessage]:
+        """Fetch the device inbox and return any messages we haven't seen.
+
+        Tries ``GET {api_url}/messages/inbox`` first and falls back to
+        ``GET {api_url}/inbox`` on 404. The two paths cover the three
+        deployment shapes we support:
+
+        * Cloud server + docker private server expose the inbox at
+          ``/messages/inbox`` (matches the published OpenAPI spec).
+        * The on-device Android local server (capcom6 v1.60.0+) mounts
+          it at ``/inbox`` instead — same data, shorter path, mirrors
+          the way it mounts ``/messages`` at root with no
+          ``/3rdparty/v1`` prefix. This is the path operators hit when
+          they paste their phone's host:port into Settings.
+
+        Both paths predate nothing earlier than v1.60.0
+        (capcom6/android-sms-gateway PR #339); on older builds both
+        404 and we log + return ``[]`` so the poller stays alive
+        without crashing the scheduler.
+
+        Field aliasing mirrors :meth:`parse_webhook`. The on-device
+        local-server build, the docker private server, and the cloud
+        server have all shipped slightly different field names for the
+        inbox DTO at various points (``sender``/``phoneNumber``,
+        ``message``/``contentPreview``, ``receivedAt``/``createdAt``);
+        we accept any of them so an SMSGate point-release does not
+        silently break inbound. Dedup uses :attr:`_seen_ids` so the
+        scheduler can poll on every ``inbound_poll_s`` tick without
+        re-dispatching the same SMS.
+        """
+
+        killswitch.raise_if_paused()
+
+        params = {"limit": self.poll_limit}
+        plural_url = f"{self.api_url}/messages/inbox"
+        singular_url = f"{self.api_url}/inbox"
+
+        try:
+            async with httpx.AsyncClient(timeout=self.http_timeout_s) as client:
+                response = await client.get(
+                    plural_url, headers=self._headers(), params=params
+                )
+                hit_url = plural_url
+                if response.status_code == 404:
+                    response = await client.get(
+                        singular_url, headers=self._headers(), params=params
+                    )
+                    hit_url = singular_url
+        except httpx.HTTPError as exc:
+            self.consecutive_failures += 1
+            logger.warning("smsgate poll network error: %s", exc)
+            return []
+
+        if response.status_code >= 400:
+            self.consecutive_failures += 1
+            logger.warning(
+                "smsgate poll %s at %s: %s",
+                response.status_code,
+                hit_url,
+                response.text[:200],
+            )
+            return []
+
+        self.consecutive_failures = 0
+        try:
+            body = response.json()
+        except ValueError:
+            logger.warning("smsgate poll returned non-JSON body")
+            return []
+
+        items: list[dict[str, Any]] = []
+        if isinstance(body, list):
+            items = [x for x in body if isinstance(x, dict)]
+        elif isinstance(body, dict):
+            data = body.get("data") or body.get("messages")
+            if isinstance(data, list):
+                items = [x for x in data if isinstance(x, dict)]
+
+        incoming: list[IncomingMessage] = []
+        for item in items:
+            msg_id = str(
+                item.get("id")
+                or item.get("messageId")
+                or item.get("smsId")
+                or ""
+            ).strip()
+            if msg_id and msg_id in self._seen_ids:
+                continue
+
+            sender = str(
+                item.get("phoneNumber")
+                or item.get("sender")
+                or item.get("from")
+                or ""
+            ).strip()
+            content = str(
+                item.get("message")
+                or item.get("content")
+                or item.get("contentPreview")
+                or item.get("body")
+                or ""
+            ).strip()
+            if not sender or not content:
+                continue
+
+            incoming.append(
+                IncomingMessage(
+                    contact_uri=sender,
+                    content=content,
+                    received_at=_parse_ts(
+                        item.get("receivedAt") or item.get("createdAt")
+                    ),
+                    raw_payload=item,
+                    provider_message_id=msg_id or None,
+                )
+            )
+            if msg_id:
+                self._seen_ids.add(msg_id)
+
+        if incoming:
+            logger.info(
+                "smsgate polled %d new inbound (%d seen cumulative)",
+                len(incoming),
+                len(self._seen_ids),
+            )
+        return incoming
 
     # ----- validate --------------------------------------------------------
 

@@ -30,7 +30,7 @@ oxblood, teal) mapped to semantic meaning — they live as CSS variables on
 
 ```bash
 cd frontend && npm install && npm run build && cd ..
-uv run autosdr run
+uv run uvicorn autosdr.webhook:app --host 127.0.0.1 --port 8000
 ```
 
 Open <http://localhost:8000>. The backend serves `/api/...` and, for

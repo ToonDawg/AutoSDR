@@ -13,8 +13,9 @@ pilot can still fly manually while autopilot is off. Those call sites open a
 :func:`allow_manual_send` context so the guard sees the pause as cleared for
 the duration of the action. Shutdown (layer 1) still aborts either way.
 
-Layer 3 — CLI wrappers in ``autosdr.cli`` (``pause`` / ``resume`` / ``stop``)
-that manipulate the flag file or send a signal to the PID recorded at startup.
+Layer 3 — HTTP control plane: ``POST /api/status/pause`` /
+``POST /api/status/resume`` touch or remove the flag file. Operators can also
+send Ctrl+C / SIGTERM to uvicorn for process shutdown.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ import asyncio
 import contextlib
 import contextvars
 import logging
-import os
 import signal
 from collections.abc import Iterator
 from pathlib import Path
@@ -230,35 +230,6 @@ def remove_flag(path: Path | None = None) -> bool:
         target.unlink()
         return True
     return False
-
-
-def write_pid_file() -> Path:
-    """Write the current PID so ``autosdr stop`` can signal us."""
-
-    settings = get_settings()
-    path = settings.pid_file_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(os.getpid()))
-    return path
-
-
-def clear_pid_file() -> None:
-    path = get_settings().pid_file_path
-    if path.exists():
-        try:
-            path.unlink()
-        except OSError:  # pragma: no cover - best effort
-            pass
-
-
-def read_pid_file() -> int | None:
-    path = get_settings().pid_file_path
-    if not path.exists():
-        return None
-    try:
-        return int(path.read_text().strip())
-    except (OSError, ValueError):
-        return None
 
 
 def reset_for_tests() -> None:

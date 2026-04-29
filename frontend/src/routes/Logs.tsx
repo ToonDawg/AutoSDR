@@ -4,12 +4,18 @@ import { useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '@/lib/api';
+import { AngleFunnelPanel } from '@/components/domain/AngleFunnelPanel';
 import { BackLink } from '@/components/ui/BackLink';
 import { FilterTabs, type FilterOption } from '@/components/ui/FilterTabs';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { absTime } from '@/lib/format';
-import type { LlmCall, LlmCallPurposeT } from '@/lib/types';
+import type {
+  EnrichmentFilter,
+  LlmCall,
+  LlmCallPurposeT,
+  LlmCallsSummary,
+} from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 const PURPOSES: ReadonlyArray<FilterOption<LlmCallPurposeT | 'all'>> = [
@@ -37,6 +43,7 @@ export function Logs() {
   const threadFilter = params.get('thread');
   const campaignFilter = params.get('campaign');
   const leadFilter = params.get('lead');
+  const enrichmentFilter = (params.get('enrichment') ?? 'all') as EnrichmentFilter;
   const [purpose, setPurpose] = useState<LlmCallPurposeT | 'all'>('all');
   const [q, setQ] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -49,6 +56,19 @@ export function Logs() {
         campaignId: campaignFilter ?? undefined,
         leadId: leadFilter ?? undefined,
         limit: 200,
+      }),
+  });
+  // Server-aggregated total — the list endpoint caps at 200 rows, so summing
+  // ``calls`` on the client would silently underreport spend on any older
+  // workspace. Filters mirror the list query so the figure tracks whatever
+  // scope the operator is currently viewing.
+  const { data: summary } = useQuery({
+    queryKey: ['llm-calls-summary', { threadFilter, campaignFilter, leadFilter }],
+    queryFn: () =>
+      api.llmCallsSummary({
+        threadId: threadFilter ?? undefined,
+        campaignId: campaignFilter ?? undefined,
+        leadId: leadFilter ?? undefined,
       }),
   });
   const { data: threads } = useQuery({
@@ -129,13 +149,30 @@ export function Logs() {
         }
         description="One row per LLM attempt — analysis, generation, evaluation, classification. Click to expand the full prompt and response."
         right={
-          <SearchInput
-            value={q}
-            onChange={setQ}
-            placeholder="Search prompts, models…"
-            className="w-60"
-          />
+          <div className="flex items-center gap-4">
+            <LlmCostTotal summary={summary} />
+            <SearchInput
+              value={q}
+              onChange={setQ}
+              placeholder="Search prompts, models…"
+              className="w-60"
+            />
+          </div>
         }
+      />
+
+      <AngleFunnelPanel
+        campaignId={campaignFilter ?? undefined}
+        enrichment={enrichmentFilter}
+        onEnrichmentChange={(next) => {
+          const merged = new URLSearchParams(params);
+          if (next === 'all') {
+            merged.delete('enrichment');
+          } else {
+            merged.set('enrichment', next);
+          }
+          setParams(merged);
+        }}
       />
 
       <FilterTabs options={PURPOSES} active={purpose} onChange={setPurpose} counts={counts} />
@@ -145,8 +182,9 @@ export function Logs() {
           <div className="col-span-2">Time</div>
           <div className="col-span-2">Purpose</div>
           <div className="col-span-2">Model</div>
-          <div className="col-span-2">Prompt</div>
+          <div className="col-span-1">Prompt</div>
           <div className="col-span-1 text-right">Tokens</div>
+          <div className="col-span-1 text-right">Cost</div>
           <div className="col-span-1 text-right">Latency</div>
           <div className="col-span-1 text-right">Attempt</div>
           <div className="col-span-1 text-right">Thread</div>
@@ -197,11 +235,21 @@ export function Logs() {
                         </span>
                       </div>
                       <div className="col-span-2 text-ink truncate">{c.model}</div>
-                      <div className="col-span-2 text-ink-muted truncate">
+                      <div className="col-span-1 text-ink-muted truncate">
                         {c.prompt_version ?? '—'}
                       </div>
                       <div className="col-span-1 text-right text-ink-muted tabular-nums">
                         {c.tokens_in}→{c.tokens_out}
+                      </div>
+                      <div
+                        className="col-span-1 text-right text-ink-muted tabular-nums"
+                        title={
+                          c.cost_usd == null
+                            ? 'No pricing data for this model'
+                            : `Estimated cost at current pricing snapshot`
+                        }
+                      >
+                        {c.cost_usd == null ? '—' : `$${c.cost_usd.toFixed(4)}`}
                       </div>
                       <div className="col-span-1 text-right text-ink-muted tabular-nums">
                         {c.latency_ms}ms
@@ -320,6 +368,52 @@ export function Logs() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Total spend for the current Logs scope — workspace-wide by default,
+ * or scoped to whatever filter the URL is currently carrying (thread,
+ * campaign, lead). Sourced from ``GET /api/llm-calls/summary`` so the
+ * figure stays accurate past the list endpoint's row cap.
+ *
+ * When ``unpriced_calls`` is non-zero we render ``≥ $X`` and surface the
+ * count via title — those rows contribute $0 to the sum (no rate card)
+ * and we'd rather show "at least" than imply precision we don't have.
+ */
+function LlmCostTotal({ summary }: { summary?: LlmCallsSummary }) {
+  if (!summary) {
+    return (
+      <div className="flex flex-col items-end font-mono text-[10px] tracking-[0.14em] uppercase text-ink-faint">
+        <span>Total</span>
+        <span className="text-ink tabular-nums text-base normal-case tracking-normal">—</span>
+      </div>
+    );
+  }
+  const isFloor = summary.unpriced_calls > 0;
+  const dollars = `$${summary.total_cost_usd.toFixed(4)}`;
+  const titleParts = [
+    `${summary.total_calls.toLocaleString()} call${summary.total_calls === 1 ? '' : 's'}`,
+    `${summary.total_tokens_in.toLocaleString()} in / ${summary.total_tokens_out.toLocaleString()} out`,
+  ];
+  if (isFloor) {
+    titleParts.push(
+      `${summary.unpriced_calls.toLocaleString()} call${
+        summary.unpriced_calls === 1 ? '' : 's'
+      } with no rate card — true total is at least this figure`,
+    );
+  }
+  return (
+    <div
+      className="flex flex-col items-end font-mono text-[10px] tracking-[0.14em] uppercase text-ink-muted"
+      title={titleParts.join(' · ')}
+    >
+      <span>Total spend</span>
+      <span className="text-ink tabular-nums text-base normal-case tracking-normal">
+        {isFloor && <span className="text-ink-muted mr-1">≥</span>}
+        {dollars}
+      </span>
     </div>
   );
 }

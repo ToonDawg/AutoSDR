@@ -54,6 +54,10 @@ export function ConnectorCard({ workspace }: { workspace: Workspace }) {
   // saved) so the operator can verify credentials before committing them.
   // Response is always 200; failures come back as ``{ok:false, detail:...}``.
   const [testResult, setTestResult] = useState<ConnectorTestResult | null>(null);
+  const [simOpen, setSimOpen] = useState(false);
+  const [simFrom, setSimFrom] = useState('+61400000001');
+  const [simContent, setSimContent] = useState('tell me more');
+  const [simNote, setSimNote] = useState<string | null>(null);
   const testConn = useMutation({
     mutationFn: (payload: ConnectorTestRequest) => api.testConnector(payload),
     onSuccess: (data) => setTestResult(data),
@@ -87,6 +91,26 @@ export function ConnectorCard({ workspace }: { workspace: Workspace }) {
     }
     testConn.mutate(payload);
   };
+
+  const simInbound = useMutation({
+    mutationFn: () =>
+      api.devSimInbound({
+        contact_uri: simFrom.trim(),
+        content: simContent.trim(),
+      }),
+    onSuccess: (data) => {
+      setSimNote(
+        `Simulated inbound ok — action=${data.action} thread=${data.thread_id ?? '—'} intent=${data.intent ?? '—'}`,
+      );
+      setSimOpen(false);
+    },
+    onError: (err: unknown) => {
+      const detail =
+        err instanceof ApiError ? JSON.stringify(err.payload ?? err.message) : String(err);
+      setSimNote(`Inbound sim failed: ${detail}`);
+      setSimOpen(false);
+    },
+  });
 
   return (
     <Card
@@ -177,10 +201,32 @@ export function ConnectorCard({ workspace }: { workspace: Workspace }) {
       )}
 
       {form.state.type === 'file' && (
-        <p className="mt-4 text-xs text-ink-muted">
-          Outbound drafts are appended to <code className="font-mono">data/outbox.jsonl</code>.
-          Use <code className="font-mono">autosdr sim</code> to inject inbound replies.
-        </p>
+        <div className="mt-4 flex flex-col gap-3">
+          <p className="text-xs text-ink-muted">
+            Outbound drafts are appended to{' '}
+            <code className="font-mono">data/outbox.jsonl</code>. Save settings with
+            Connector = File, then simulate an inbound SMS — it drives the same reply
+            pipeline as a real device.
+          </p>
+          <div>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                setSimNote(null);
+                setSimOpen(true);
+              }}
+            >
+              Simulate inbound
+            </Button>
+          </div>
+          {simNote && (
+            <div className="text-xs font-mono border border-forest/30 bg-forest-soft/40 text-forest rounded px-3 py-2 wrap-break-word">
+              {simNote}
+            </div>
+          )}
+        </div>
       )}
 
       {testResult && (
@@ -205,6 +251,63 @@ export function ConnectorCard({ workspace }: { workspace: Workspace }) {
               </span>
             </div>
             <div className="text-xs mt-0.5 wrap-break-word">{testResult.detail}</div>
+          </div>
+        </div>
+      )}
+      {simOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4"
+          onClick={() => !simInbound.isPending && setSimOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="paper-card w-full max-w-md p-5 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div>
+              <h2 className="text-base font-medium text-ink">Simulate inbound SMS</h2>
+              <p className="text-xs text-ink-muted mt-1 leading-relaxed">
+                Uses the{' '}
+                <span className="font-semibold">saved</span> workspace connector — save first if
+                you just switched to File or changed rehearsal settings.
+              </p>
+            </div>
+            <Field label="From (contact URI)">
+              <Input
+                value={simFrom}
+                onChange={(e) => setSimFrom(e.target.value)}
+                className="font-mono"
+                disabled={simInbound.isPending}
+              />
+            </Field>
+            <Field label="Message body">
+              <Input
+                value={simContent}
+                onChange={(e) => setSimContent(e.target.value)}
+                disabled={simInbound.isPending}
+              />
+            </Field>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                type="button"
+                onClick={() => setSimOpen(false)}
+                disabled={simInbound.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                type="button"
+                onClick={() => simInbound.mutate()}
+                disabled={
+                  simInbound.isPending || !simFrom.trim() || !simContent.trim()
+                }
+              >
+                {simInbound.isPending ? 'Running…' : 'Send'}
+              </Button>
+            </div>
           </div>
         </div>
       )}

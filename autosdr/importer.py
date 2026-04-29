@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -184,7 +185,7 @@ def _iter_ndjson(path: Path) -> Iterable[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Field mapping (POC: exact-match only, with a few common aliases)
+# Field mapping
 # ---------------------------------------------------------------------------
 
 
@@ -192,20 +193,91 @@ def _canonical_key(key: str) -> str:
     return key.strip().lower().replace(" ", "_").replace("-", "_")
 
 
-def _split_core_and_raw(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Partition a row into core-field values + raw_data blob.
+def _normalise_mapping_config(
+    mapping_config: dict[str, Any] | None,
+) -> tuple[dict[str, str], set[str], set[str]]:
+    """Pull the three sub-fields out of an operator-supplied mapping config.
 
-    Note: core fields are NOT stripped from raw_data; the LLM uses raw_data
-    as its primary context, so it needs the full source record.
+    Returns ``(canonical_to_source, drop_from_raw, include_in_raw_only)``.
+
+    - ``canonical_to_source`` maps a canonical core field (``phone``, ``name``…)
+      to the *source* column name in the row that should fill it. It overrides
+      the alias map; it does **not** override an exact same-name match (e.g. an
+      explicit ``"phone": "phone"`` is just the identity).
+    - ``drop_from_raw`` is the set of source column names that must NOT be
+      copied into ``raw_data``. They are filtered out of the incoming payload
+      only — never retroactively pruned from existing ``raw_data`` (resolved
+      OQ3, ticket 0004).
+    - ``include_in_raw_only`` is the set of source column names the operator
+      explicitly opted into ``raw_data`` only. These are *never* promoted to a
+      core field even if the column name would otherwise alias-match — e.g. an
+      operator who wants ``phone`` ignored as a contact URI and kept only as
+      reference text.
     """
 
+    if not mapping_config:
+        return {}, set(), set()
+
+    raw_mapping = mapping_config.get("mapping") or {}
+    drop = mapping_config.get("drop_from_raw") or []
+    include_only = mapping_config.get("include_in_raw_only") or []
+
+    canonical_to_source: dict[str, str] = {}
+    if isinstance(raw_mapping, dict):
+        for canonical, source in raw_mapping.items():
+            if canonical in _CORE_FIELDS and isinstance(source, str) and source:
+                canonical_to_source[canonical] = source
+
+    drop_set: set[str] = {s for s in drop if isinstance(s, str)}
+    include_only_set: set[str] = {s for s in include_only if isinstance(s, str)}
+
+    return canonical_to_source, drop_set, include_only_set
+
+
+def _split_core_and_raw(
+    row: dict[str, Any],
+    mapping_config: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Partition a row into core-field values + raw_data blob.
+
+    Without a ``mapping_config``, behaviour is unchanged: core fields are
+    matched by exact lowercase name or via the ``_CORE_ALIASES`` table; every
+    incoming key is preserved in ``raw_data`` (the LLM uses raw_data as its
+    primary context, so it sees the full source record).
+
+    With a ``mapping_config``:
+
+    - Operator-supplied ``mapping`` (canonical → source column name) wins over
+      the alias map. Operator can both correct a bad guess (``"phone":
+      "mobile_e164"``) and explicitly bind the same name (``"phone": "phone"``).
+    - ``include_in_raw_only`` columns are forced to stay out of ``core`` even
+      if their name would alias-match. They still land in ``raw_data``.
+    - ``drop_from_raw`` columns are filtered out of ``raw_data`` entirely —
+      they will not be passed to the LLM nor stored.
+    """
+
+    canonical_to_source, drop_set, include_only_set = _normalise_mapping_config(
+        mapping_config
+    )
+
     core: dict[str, Any] = {}
-    raw: dict[str, Any] = dict(row)
+
+    if canonical_to_source:
+        for canonical, source_col in canonical_to_source.items():
+            value = row.get(source_col)
+            if value not in (None, ""):
+                core[canonical] = value
+
+    raw: dict[str, Any] = {k: v for k, v in row.items() if k not in drop_set}
 
     for key, value in row.items():
         if value in (None, ""):
             continue
+        if key in include_only_set:
+            continue
         canon = _canonical_key(key)
+        if canon in canonical_to_source:
+            continue
         target = _CORE_ALIASES.get(canon, canon if canon in _CORE_FIELDS else None)
         if target is not None and target not in core:
             core[target] = value
@@ -233,8 +305,9 @@ def _process_row(
     source_file: str,
     region_hint: str,
     row: dict[str, Any],
+    mapping_config: dict[str, Any] | None = None,
 ) -> ImportRowResult:
-    core, raw = _split_core_and_raw(row)
+    core, raw = _split_core_and_raw(row, mapping_config=mapping_config)
 
     raw_phone = core.get("phone")
     if not raw_phone:
@@ -349,11 +422,17 @@ def import_file(
     workspace_id: str,
     path: Path,
     region_hint: str = "AU",
+    mapping_config: dict[str, Any] | None = None,
 ) -> ImportSummary:
     """Import a CSV or NDJSON file into the lead table.
 
     Commits are the caller's responsibility — the function uses ``session.flush``
     throughout so the caller can wrap the whole import in a transaction.
+
+    ``mapping_config`` is the operator-supplied per-import override (ticket
+    0004). When supplied, it is persisted onto ``ImportJob.mapping_config`` so
+    ``raw_data`` decisions on this run are auditable later. ``None`` is a fully
+    backward-compatible default.
     """
 
     path = Path(path)
@@ -366,6 +445,7 @@ def import_file(
         filename=path.name,
         file_type=file_type,
         status=ImportJobStatus.PROCESSING,
+        mapping_config=mapping_config,
     )
     session.add(job)
     session.flush()
@@ -383,6 +463,7 @@ def import_file(
                 source_file=path.name,
                 region_hint=region_hint,
                 row=row,
+                mapping_config=mapping_config,
             )
         except Exception as exc:  # defensive: one bad row does not kill the import
             logger.exception("import row %d failed", row_number)
@@ -406,6 +487,14 @@ def import_file(
 
 _PREVIEW_SAMPLE_LIMIT = 20
 
+# Heuristic thresholds (resolved 2026-04-27 via council on ticket 0004 OQ2).
+# Tiered: 90% match -> high, 80% match -> medium, with a minimum support
+# floor so a column with one or two non-null cells does not claim
+# certainty on a 100% rate.
+_HEURISTIC_HIGH_RATIO = 0.9
+_HEURISTIC_MEDIUM_RATIO = 0.8
+_HEURISTIC_MIN_SUPPORT = 5
+
 
 @dataclass
 class PreviewRow:
@@ -419,12 +508,34 @@ class PreviewRow:
 
 
 @dataclass
+class ColumnPreview:
+    """One distinct source column observed in the preview sample.
+
+    ``suggested_target`` is one of ``_CORE_FIELDS`` when the suggestion engine
+    has an opinion, otherwise ``None``. ``suggestion_confidence`` follows the
+    tiered scheme: ``high`` (exact match or strong heuristic with >= 5
+    supporting cells), ``medium`` (alias / Levenshtein / substring / weaker
+    heuristic), ``low`` (weakest signal kept), or ``none`` (no opinion).
+    ``suggestion_reason`` is a short human-readable label that the UI shows
+    next to the confidence badge.
+    """
+
+    name: str
+    sample_values: list[Any]
+    suggested_target: str | None
+    suggestion_confidence: str  # "high" | "medium" | "low" | "none"
+    suggestion_reason: str
+
+
+@dataclass
 class ImportPreview:
     """The shape the ``POST /api/leads/import/preview`` endpoint returns.
 
     ``would_skip`` is ordered by frequency descending so the endpoint can
     render it directly. ``sample`` is capped at the first ``_PREVIEW_SAMPLE_LIMIT``
-    rows — enough to eyeball without blowing up big-file previews.
+    rows — enough to eyeball without blowing up big-file previews. ``columns``
+    is the union of keys observed across the sampled rows, with one
+    ``ColumnPreview`` entry per distinct name.
     """
 
     file_type: str
@@ -432,15 +543,256 @@ class ImportPreview:
     would_import: int
     would_skip: list[tuple[str, int]]
     sample: list[PreviewRow]
+    columns: list[ColumnPreview] = field(default_factory=list)
 
 
-def preview_import_file(*, path: Path, region_hint: str = "AU") -> ImportPreview:
+# ---------------------------------------------------------------------------
+# Column suggestion engine (deterministic, rule-based)
+# ---------------------------------------------------------------------------
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Iterative Levenshtein distance.
+
+    No external dep; the use case here is comparing two short column names so
+    the cost is negligible. The smallest off-the-shelf alternative
+    (``rapidfuzz``) would be a new top-level dependency for ~30 lines of
+    arithmetic — not justified.
+    """
+
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[-1]
+
+
+_HTTP_URL_HEAD = ("http://", "https://")
+
+
+_PHONE_ALLOWED_CHARS = set("0123456789 +-().\t")
+
+
+def _looks_like_phone(value: Any) -> bool:
+    """A loose phone-shape check — used to gate ``phone`` heuristic suggestion.
+
+    We do **not** call ``normalise_phone`` here because it depends on a
+    region hint and would raise / log on unparseable values; the suggestion
+    engine just needs "does this column smell like a phone column?" and the
+    operator confirms.
+
+    Phone strings are digits plus a tight punctuation set (``+ - ( ) . space``).
+    Anything else (e.g. a ``T`` or ``Z`` in an ISO timestamp) disqualifies.
+    """
+
+    if value is None:
+        return False
+    s = str(value).strip()
+    if not s:
+        return False
+    digits = sum(1 for c in s if c.isdigit())
+    if digits < 7:
+        return False
+    return all(c in _PHONE_ALLOWED_CHARS for c in s)
+
+
+def _looks_like_url(value: Any) -> bool:
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    return s.startswith(_HTTP_URL_HEAD)
+
+
+_ADDRESS_WORD_RE = re.compile(
+    r"\b("
+    r"st|street|"
+    r"rd|road|"
+    r"ave|avenue|"
+    r"dr|drive|"
+    r"hwy|highway|"
+    r"ln|lane|"
+    r"ct|court|"
+    r"pl|place|"
+    r"tce|terrace|"
+    r"cres|crescent|"
+    r"blvd|boulevard|"
+    r"qld|nsw|vic|tas|sa|wa|nt|act"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_address(value: Any) -> bool:
+    """Loose address heuristic: comma-separated, OR contains a street / region
+    keyword on a word boundary. Tuned for AU + en-US shapes seen in scraped
+    lead data.
+
+    Earlier iterations of this rule also matched "starts-with-digit + has a
+    space"; that was over-permissive — Google Plus Codes (``6F8X+9R Caboolture``)
+    and AU phone strings (``0431 222 333``) tripped it. Real addresses in
+    every observed sample have either a comma or a street keyword, so the
+    weaker rule is dead weight.
+    """
+
+    if value is None:
+        return False
+    s = str(value).strip()
+    if not s:
+        return False
+    if "," in s:
+        return True
+    if _ADDRESS_WORD_RE.search(s):
+        return True
+    return False
+
+
+_HEURISTIC_TESTS = {
+    "phone": _looks_like_phone,
+    "website": _looks_like_url,
+    "address": _looks_like_address,
+}
+
+
+def _suggest_column_target(
+    column_name: str,
+    sample_values: list[Any],
+) -> tuple[str | None, str, str]:
+    """Run the suggestion pyramid for a single column.
+
+    Returns ``(suggested_target, confidence, reason)``. The pyramid is:
+
+    1. Exact match against ``_CORE_FIELDS`` -> high.
+    2. Alias map hit -> high.
+    3. Levenshtein <= 2 against any core field -> medium.
+    4. Substring match against any core field -> medium.
+    5. Sample-value heuristic (per ``_HEURISTIC_TESTS``):
+       * ratio >= 0.9 with >= 5 non-null support -> high
+       * ratio >= 0.8 with >= 5 non-null support -> medium
+       * (address weakens to ``low`` because the heuristic is loose.)
+    6. Otherwise ``(None, "none", "no signal")``.
+    """
+
+    canon = _canonical_key(column_name)
+
+    if canon in _CORE_FIELDS:
+        return canon, "high", "exact column-name match"
+
+    if canon in _CORE_ALIASES:
+        return _CORE_ALIASES[canon], "high", f"alias map ('{canon}')"
+
+    for core in sorted(_CORE_FIELDS):
+        if _levenshtein(canon, core) <= 2 and len(core) >= 4:
+            return core, "medium", f"close to '{core}' (typo distance)"
+
+    for core in sorted(_CORE_FIELDS):
+        if core in canon and core != canon:
+            return core, "medium", f"name contains '{core}'"
+
+    # Heuristics only make sense for scalar columns. A column whose values are
+    # nested structures (lists / dicts — e.g. Apify's ``reviewDetails``) is
+    # not an address even if the Python repr of the list happens to contain a
+    # comma; surface as ``none`` instead of misleading the operator.
+    scalar_non_null = [
+        v
+        for v in sample_values
+        if v not in (None, "") and not isinstance(v, (list, dict))
+    ]
+    if len(scalar_non_null) >= _HEURISTIC_MIN_SUPPORT:
+        for target, predicate in _HEURISTIC_TESTS.items():
+            hits = sum(1 for v in scalar_non_null if predicate(v))
+            ratio = hits / len(scalar_non_null)
+            if ratio >= _HEURISTIC_HIGH_RATIO:
+                base = "low" if target == "address" else "high"
+                return target, base, f"{int(ratio * 100)}% of values look like {target}"
+            if ratio >= _HEURISTIC_MEDIUM_RATIO:
+                base = "low" if target == "address" else "medium"
+                return target, base, f"{int(ratio * 100)}% of values look like {target}"
+
+    return None, "none", "no signal"
+
+
+def _build_columns_preview(
+    sampled_rows: list[dict[str, Any]],
+) -> list[ColumnPreview]:
+    """Build one ``ColumnPreview`` per distinct column name across the sampled
+    rows. Sample values are the first ``_PREVIEW_SAMPLE_LIMIT`` non-null cells
+    (de-duplicated to keep the UI table compact)."""
+
+    seen_names: list[str] = []
+    samples_by_name: dict[str, list[Any]] = {}
+
+    for row in sampled_rows:
+        for key, value in row.items():
+            if key not in samples_by_name:
+                seen_names.append(key)
+                samples_by_name[key] = []
+            samples_by_name[key].append(value)
+
+    out: list[ColumnPreview] = []
+    for name in seen_names:
+        values = samples_by_name[name][:_PREVIEW_SAMPLE_LIMIT]
+        target, confidence, reason = _suggest_column_target(name, values)
+
+        # Surface a *deduped*, readable sample. Long values truncated to keep
+        # the JSON payload sane on a 50 KB reviewDetails blob.
+        compact: list[Any] = []
+        seen: set[str] = set()
+        for v in values:
+            if v in (None, ""):
+                continue
+            key = repr(v)[:200]
+            if key in seen:
+                continue
+            seen.add(key)
+            if isinstance(v, str) and len(v) > 200:
+                compact.append(v[:200] + "…")
+            else:
+                compact.append(v)
+            if len(compact) >= 5:
+                break
+
+        out.append(
+            ColumnPreview(
+                name=name,
+                sample_values=compact,
+                suggested_target=target,
+                suggestion_confidence=confidence,
+                suggestion_reason=reason,
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Preview entry point
+# ---------------------------------------------------------------------------
+
+
+def preview_import_file(
+    *,
+    path: Path,
+    region_hint: str = "AU",
+    mapping_config: dict[str, Any] | None = None,
+) -> ImportPreview:
     """Dry-run version of :func:`import_file`.
 
     The web preview endpoint used to reach directly into ``_detect_file_type``,
     ``_iter_csv``/``_iter_ndjson``, and ``_split_core_and_raw``. Exposing one
     helper here means the parsing rules, alias resolution, and phone
     normalisation stay in a single module; callers just get a summary.
+
+    When the operator supplies a ``mapping_config``, the same partition logic
+    that the commit path will use is applied — so preview and commit cannot
+    drift (resolved OQ1, ticket 0004).
     """
 
     path = Path(path)
@@ -451,10 +803,13 @@ def preview_import_file(*, path: Path, region_hint: str = "AU") -> ImportPreview
     would_import = 0
     skip_counter: Counter[str] = Counter()
     sample: list[PreviewRow] = []
+    sampled_rows: list[dict[str, Any]] = []
 
     for row in iterator:
         total += 1
-        core, _raw = _split_core_and_raw(row)
+        if len(sampled_rows) < _PREVIEW_SAMPLE_LIMIT:
+            sampled_rows.append(row)
+        core, _raw = _split_core_and_raw(row, mapping_config=mapping_config)
         raw_phone = core.get("phone")
 
         if not raw_phone:
@@ -499,4 +854,5 @@ def preview_import_file(*, path: Path, region_hint: str = "AU") -> ImportPreview
         would_import=would_import,
         would_skip=list(skip_counter.most_common()),
         sample=sample,
+        columns=_build_columns_preview(sampled_rows),
     )

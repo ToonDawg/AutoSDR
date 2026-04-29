@@ -16,7 +16,7 @@ from autosdr.models import (
     Thread,
     ThreadStatus,
 )
-from autosdr.quota import count_ai_messages_last_24h
+from autosdr.quota import count_outreach_contacts_last_24h
 from autosdr.scheduler import _next_queued_leads, run_campaign_outreach_batch
 
 
@@ -46,32 +46,66 @@ def _build_fixture(session, ws_id: str, num_leads: int) -> str:
     return campaign.id
 
 
-def test_count_ai_messages_last_24h_includes_only_ai_role(fresh_db, workspace_factory):
+def test_count_outreach_contacts_one_per_thread_not_per_ai_message(
+    fresh_db, workspace_factory
+):
+    """Two AI sends + a follow-up beat on the same thread = one contact.
+
+    Quota counts new conversations opened, not raw outbound message volume —
+    otherwise turning the follow-up beat on would silently halve the
+    effective daily cap. Two separate threads each with their own first AI
+    message must count as two contacts.
+    """
+
     ws_id = workspace_factory()
     with fresh_db() as session:
-        cid = _build_fixture(session, ws_id, 1)
-        cl = session.query(CampaignLead).first()
-        thread = Thread(
-            campaign_lead_id=cl.id, connector_type="android_sms",
+        cid = _build_fixture(session, ws_id, 2)
+        cls = (
+            session.query(CampaignLead)
+            .filter(CampaignLead.campaign_id == cid)
+            .order_by(CampaignLead.queue_position.asc())
+            .all()
+        )
+
+        thread_a = Thread(
+            campaign_lead_id=cls[0].id, connector_type="android_sms",
             status=ThreadStatus.ACTIVE, angle="x", tone_snapshot="x",
         )
-        session.add(thread)
+        thread_b = Thread(
+            campaign_lead_id=cls[1].id, connector_type="android_sms",
+            status=ThreadStatus.ACTIVE, angle="x", tone_snapshot="x",
+        )
+        session.add_all([thread_a, thread_b])
         session.flush()
 
         session.add_all(
             [
-                Message(thread_id=thread.id, role=MessageRole.AI, content="1", metadata_={}),
-                Message(thread_id=thread.id, role=MessageRole.AI, content="2", metadata_={}),
-                Message(thread_id=thread.id, role=MessageRole.LEAD, content="l", metadata_={}),
+                Message(thread_id=thread_a.id, role=MessageRole.AI, content="hi", metadata_={}),
+                Message(
+                    thread_id=thread_a.id,
+                    role=MessageRole.AI,
+                    content="follow-up",
+                    metadata_={"source": "followup"},
+                ),
+                Message(thread_id=thread_a.id, role=MessageRole.LEAD, content="l", metadata_={}),
+                Message(thread_id=thread_b.id, role=MessageRole.AI, content="hi", metadata_={}),
             ]
         )
         session.flush()
 
-        count = count_ai_messages_last_24h(session, cid)
-        assert count == 2
+        assert count_outreach_contacts_last_24h(session, cid) == 2
 
 
-def test_count_ai_messages_last_24h_excludes_old_messages(fresh_db, workspace_factory):
+def test_count_outreach_contacts_excludes_threads_first_contacted_outside_window(
+    fresh_db, workspace_factory
+):
+    """A thread whose first AI message is older than 24h doesn't count.
+
+    Even if a fresh follow-up or auto-reply landed inside the window —
+    the *contact* was made yesterday, the new send is a continuation of
+    that conversation, not a new opening.
+    """
+
     ws_id = workspace_factory()
     with fresh_db() as session:
         cid = _build_fixture(session, ws_id, 1)
@@ -91,39 +125,54 @@ def test_count_ai_messages_last_24h_excludes_old_messages(fresh_db, workspace_fa
         old.created_at = now - timedelta(hours=25)
         session.flush()
 
-        count = count_ai_messages_last_24h(session, cid)
-        assert count == 1
+        assert count_outreach_contacts_last_24h(session, cid) == 0
 
 
-def test_count_ai_messages_last_24h_respects_campaign_reset(fresh_db, workspace_factory):
+def test_count_outreach_contacts_respects_campaign_reset(fresh_db, workspace_factory):
+    """A thread first contacted before ``quota_reset_at`` doesn't count.
+
+    The reset starts a fresh window; conversations opened earlier still
+    exist on the timeline but have already been "paid for" against the
+    pre-reset budget. A *new* thread opened after the reset adds one.
+    """
+
     ws_id = workspace_factory()
     with fresh_db() as session:
-        cid = _build_fixture(session, ws_id, 1)
+        cid = _build_fixture(session, ws_id, 2)
         campaign = session.get(Campaign, cid)
-        cl = session.query(CampaignLead).first()
-        thread = Thread(
-            campaign_lead_id=cl.id, connector_type="android_sms",
+        cls = (
+            session.query(CampaignLead)
+            .filter(CampaignLead.campaign_id == cid)
+            .order_by(CampaignLead.queue_position.asc())
+            .all()
+        )
+        thread_old = Thread(
+            campaign_lead_id=cls[0].id, connector_type="android_sms",
             status=ThreadStatus.ACTIVE, angle="x", tone_snapshot="x",
         )
-        session.add(thread)
+        session.add(thread_old)
         session.flush()
 
-        before_reset = Message(
-            thread_id=thread.id, role=MessageRole.AI, content="before", metadata_={},
+        session.add(
+            Message(thread_id=thread_old.id, role=MessageRole.AI, content="before", metadata_={})
         )
-        session.add(before_reset)
         session.flush()
 
         campaign.quota_reset_at = datetime.now(tz=timezone.utc)
         session.flush()
 
-        after_reset = Message(
-            thread_id=thread.id, role=MessageRole.AI, content="after", metadata_={},
+        thread_new = Thread(
+            campaign_lead_id=cls[1].id, connector_type="android_sms",
+            status=ThreadStatus.ACTIVE, angle="x", tone_snapshot="x",
         )
-        session.add(after_reset)
+        session.add(thread_new)
+        session.flush()
+        session.add(
+            Message(thread_id=thread_new.id, role=MessageRole.AI, content="after", metadata_={})
+        )
         session.flush()
 
-        assert count_ai_messages_last_24h(session, cid) == 1
+        assert count_outreach_contacts_last_24h(session, cid) == 1
 
 
 def test_next_queued_leads_orders_by_queue_position(fresh_db, workspace_factory):

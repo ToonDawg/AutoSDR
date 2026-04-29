@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 from httpx import AsyncClient, MockTransport, Request, Response
 
 from autosdr.connectors.base import ConnectorError, OutgoingMessage
-from autosdr.connectors.textbee import TextBeeConnector
+from autosdr.connectors.textbee import TextBeeConnector, _parse_ts
 
 
 def _install_transport(monkeypatch: pytest.MonkeyPatch, handler):
@@ -161,6 +163,47 @@ def test_parse_webhook_rejects_missing_fields():
     connector = _make_connector()
     with pytest.raises(ValueError):
         connector.parse_webhook({"sender": "+61400000001"})
+
+
+class TestParseTs:
+    """Mirror of the smsgate ``_parse_ts`` contract.
+
+    TextBee normally emits an explicit ``Z``, but we still defend
+    against naive strings the same way smsgate does — otherwise the
+    same +10h timezone drift bug would resurface the moment the
+    upstream provider drops the offset.
+    """
+
+    def test_z_suffix_returns_utc(self):
+        result = _parse_ts("2026-04-28T07:17:00Z")
+        assert result == datetime(2026, 4, 28, 7, 17, 0, tzinfo=timezone.utc)
+
+    def test_explicit_offset_is_normalised_to_utc(self):
+        result = _parse_ts("2026-04-28T17:17:00+10:00")
+        assert result == datetime(2026, 4, 28, 7, 17, 0, tzinfo=timezone.utc)
+
+    def test_naive_string_is_treated_as_local_and_returns_utc(self, monkeypatch):
+        import os
+        import time
+
+        monkeypatch.setenv("TZ", "Australia/Brisbane")
+        time.tzset()
+
+        try:
+            result = _parse_ts("2026-04-28T07:17:00")
+        finally:
+            os.environ.pop("TZ", None)
+            time.tzset()
+
+        assert result == datetime(2026, 4, 27, 21, 17, 0, tzinfo=timezone.utc)
+
+    def test_unparseable_string_falls_back_to_now_utc(self):
+        result = _parse_ts("garbage")
+        assert result.tzinfo is not None
+
+    def test_non_string_falls_back_to_now_utc(self):
+        result = _parse_ts(12345)
+        assert result.tzinfo is not None
 
 
 async def test_validate_config_reports_401(monkeypatch):

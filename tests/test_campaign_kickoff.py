@@ -118,6 +118,7 @@ def fake_outreach(monkeypatch):
         campaign,
         campaign_lead,
         lead,
+        http_client=None,
     ):
         sent_leads.append(lead.name or "")
         thread = Thread(

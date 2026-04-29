@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timezone
 
 import pytest
 from httpx import AsyncClient, MockTransport, Request, Response
 
 from autosdr.connectors.base import ConnectorError, OutgoingMessage
-from autosdr.connectors.smsgate import SmsGateConnector, _normalize_api_url
+from autosdr.connectors.smsgate import SmsGateConnector, _normalize_api_url, _parse_ts
 
 
 def _install_transport(monkeypatch: pytest.MonkeyPatch, handler):
@@ -231,6 +232,59 @@ def test_parse_webhook_rejects_missing_fields():
         )
 
 
+class TestParseTs:
+    """``_parse_ts`` is the on-ramp every inbound timestamp goes through.
+
+    The downstream pipeline persists ``Message.created_at`` straight from
+    this value and the frontend renders it via ``date-fns format()`` —
+    if it's naive we'd serialise without a tz offset, the React side
+    would treat it as UTC, and AEST devices would show inbound replies
+    10 hours after the AI sent the opener (the bug that motivated this
+    test). Every branch must therefore return a tz-aware UTC datetime.
+    """
+
+    def test_z_suffix_returns_utc(self):
+        result = _parse_ts("2026-04-28T07:17:00Z")
+        assert result.tzinfo is not None
+        assert result.utcoffset() == timezone.utc.utcoffset(None)
+        assert result == datetime(2026, 4, 28, 7, 17, 0, tzinfo=timezone.utc)
+
+    def test_explicit_offset_is_normalised_to_utc(self):
+        result = _parse_ts("2026-04-28T17:17:00+10:00")
+        assert result.tzinfo is not None
+        assert result == datetime(2026, 4, 28, 7, 17, 0, tzinfo=timezone.utc)
+
+    def test_naive_string_is_treated_as_local_and_returns_utc(self, monkeypatch):
+        # Pin the host's local timezone to AEST so the test runs the same
+        # in CI and on a developer laptop. We patch ``astimezone`` on
+        # naive datetimes by overriding the system tz via ``time.tzset``.
+        import os
+        import time
+
+        monkeypatch.setenv("TZ", "Australia/Brisbane")
+        time.tzset()
+
+        try:
+            result = _parse_ts("2026-04-28T07:17:00")
+        finally:
+            os.environ.pop("TZ", None)
+            time.tzset()
+
+        assert result.tzinfo is not None
+        # 07:17 Brisbane (UTC+10) → 21:17 UTC the previous day.
+        assert result == datetime(2026, 4, 27, 21, 17, 0, tzinfo=timezone.utc)
+
+    def test_unparseable_string_falls_back_to_now_utc(self):
+        result = _parse_ts("not a date")
+        assert result.tzinfo is not None
+        assert result.utcoffset() == timezone.utc.utcoffset(None)
+
+    def test_non_string_input_falls_back_to_now_utc(self):
+        result = _parse_ts(None)
+        assert result.tzinfo is not None
+        assert result.utcoffset() == timezone.utc.utcoffset(None)
+
+
 async def test_validate_config_reports_unreachable(monkeypatch):
     import httpx
 
@@ -371,3 +425,195 @@ async def test_send_falls_back_to_singular_on_404(monkeypatch):
         "http://192.168.0.13:8080/messages",
         "http://192.168.0.13:8080/message",
     ]
+
+
+# ---------------------------------------------------------------------------
+# poll_incoming — GET /messages/inbox, the polling path the scheduler drives
+# every ``inbound_poll_s`` so the operator does not have to register a webhook
+# or expose the AutoSDR API to the phone's LAN.
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_incoming_hits_inbox_endpoint_with_basic_auth(monkeypatch):
+    """Hits ``{api_url}/messages/inbox`` with Basic auth + ``limit`` set.
+
+    The on-device server, the docker private server, and the cloud server
+    all mount the inbox API under the same path relative to the configured
+    base — so we just append ``/messages/inbox`` and trust the URL the
+    operator pasted the same way ``send`` does.
+    """
+
+    seen: dict = {}
+
+    def handler(request: Request) -> Response:
+        seen["url"] = str(request.url)
+        seen["method"] = request.method
+        seen["headers"] = dict(request.headers)
+        return Response(
+            200,
+            json=[
+                {
+                    "id": "in-1",
+                    "phoneNumber": "+61400000001",
+                    "message": "hi back",
+                    "receivedAt": "2026-04-27T01:00:00Z",
+                    "type": "SMS",
+                }
+            ],
+        )
+
+    _install_transport(monkeypatch, handler)
+
+    connector = _make_connector()
+    incoming = await connector.poll_incoming()
+
+    assert seen["method"] == "GET"
+    assert seen["url"].startswith(
+        "http://localhost:3000/api/3rdparty/v1/messages/inbox"
+    )
+    assert "limit=50" in seen["url"]
+
+    expected_token = base64.b64encode(b"ops:s3cret").decode("ascii")
+    assert seen["headers"].get("authorization") == f"Basic {expected_token}"
+
+    assert len(incoming) == 1
+    assert incoming[0].contact_uri == "+61400000001"
+    assert incoming[0].content == "hi back"
+    assert incoming[0].provider_message_id == "in-1"
+
+
+async def test_poll_incoming_dedups_by_message_id(monkeypatch):
+    """Polling the same id twice in a row yields it once.
+
+    The reply pipeline already dedups via ``provider_message_id`` at the
+    DB layer, but per-process ``_seen_ids`` keeps us from re-running the
+    classification + LLM call burst for an id we already dispatched in
+    this process. Mirrors TextBee's behaviour.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(
+            200,
+            json=[
+                {
+                    "id": "in-42",
+                    "phoneNumber": "+61400000007",
+                    "message": "yep",
+                    "receivedAt": "2026-04-27T01:05:00Z",
+                }
+            ],
+        )
+
+    _install_transport(monkeypatch, handler)
+
+    connector = _make_connector()
+    first = await connector.poll_incoming()
+    second = await connector.poll_incoming()
+
+    assert [m.provider_message_id for m in first] == ["in-42"]
+    assert second == []
+
+
+async def test_poll_incoming_handles_field_aliases(monkeypatch):
+    """The on-device, docker, and cloud builds disagree on field names.
+
+    PR #339 introduced ``IncomingMessageResponse`` with ``sender`` /
+    ``contentPreview`` / ``createdAt``; earlier on-device builds and the
+    webhook payload use ``phoneNumber`` / ``message`` / ``receivedAt``;
+    some older builds expose ``messageId`` instead of ``id``. We accept
+    any of these so a SMSGate point release can't silently zero-out
+    inbound.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(
+            200,
+            json=[
+                {
+                    "id": "in-modern",
+                    "phoneNumber": "+61400000001",
+                    "message": "modern shape",
+                    "receivedAt": "2026-04-27T02:00:00Z",
+                },
+                {
+                    "messageId": "in-pr339",
+                    "sender": "+61400000002",
+                    "contentPreview": "pr339 shape",
+                    "createdAt": "2026-04-27T02:00:01Z",
+                },
+            ],
+        )
+
+    _install_transport(monkeypatch, handler)
+
+    incoming = await _make_connector().poll_incoming()
+
+    assert len(incoming) == 2
+    by_id = {m.provider_message_id: m for m in incoming}
+    assert by_id["in-modern"].contact_uri == "+61400000001"
+    assert by_id["in-modern"].content == "modern shape"
+    assert by_id["in-pr339"].contact_uri == "+61400000002"
+    assert by_id["in-pr339"].content == "pr339 shape"
+
+
+async def test_poll_incoming_returns_empty_on_4xx(monkeypatch):
+    """A 4xx on both fallback paths must not crash the poller —
+    return ``[]`` and bump the failure counter so an
+    operator-visible degradation can be surfaced later.
+    """
+
+    def handler(request: Request) -> Response:
+        return Response(404, text="not found")
+
+    _install_transport(monkeypatch, handler)
+
+    connector = _make_connector()
+    result = await connector.poll_incoming()
+
+    assert result == []
+    assert connector.consecutive_failures == 1
+
+
+async def test_poll_incoming_falls_back_to_singular_inbox_on_404(monkeypatch):
+    """The Android local-server build mounts the inbox at ``/inbox`` —
+    NOT ``/messages/inbox`` like the cloud / docker servers. We mirror
+    the ``/messages`` → ``/message`` plural-first fallback so the same
+    code path serves all three deployment shapes.
+    """
+
+    seen: list[str] = []
+
+    def handler(request: Request) -> Response:
+        seen.append(str(request.url))
+        if "/messages/inbox" in request.url.path:
+            return Response(404, text="not found")
+        return Response(
+            200,
+            json=[
+                {
+                    "id": "in-local",
+                    "sender": "+61400000003",
+                    "contentPreview": "from /inbox",
+                    "createdAt": "2026-04-27T03:00:00+10:00",
+                }
+            ],
+        )
+
+    _install_transport(monkeypatch, handler)
+
+    connector = SmsGateConnector(
+        api_url="http://192.168.0.99:8080",
+        username="ops",
+        password="s3cret",
+    )
+    incoming = await connector.poll_incoming()
+
+    assert [u.split("?", 1)[0] for u in seen] == [
+        "http://192.168.0.99:8080/messages/inbox",
+        "http://192.168.0.99:8080/inbox",
+    ]
+    assert len(incoming) == 1
+    assert incoming[0].provider_message_id == "in-local"
+    assert incoming[0].contact_uri == "+61400000003"
+    assert incoming[0].content == "from /inbox"
+    assert connector.consecutive_failures == 0

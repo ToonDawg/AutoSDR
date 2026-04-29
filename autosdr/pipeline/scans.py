@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
-import httpx
 from sqlalchemy import select
 
 from sqlalchemy.orm import Session
@@ -139,7 +138,7 @@ def _snapshot_workspace_lead_pairs() -> list[tuple[str, str | None]]:
         return [(str(r[0]), r[1]) for r in rows]
 
 
-def start_scan(http_client: httpx.AsyncClient) -> bool:
+def start_scan() -> bool:
     """Begin a full pass over all scannable leads, or ``False`` if busy."""
 
     global _state
@@ -175,7 +174,6 @@ def start_scan(http_client: httpx.AsyncClient) -> bool:
         try:
             await _fan_out(
                 pairs,
-                http_client=http_client,
                 host_locks=host_locks,
                 concurrency=concurrency,
             )
@@ -225,7 +223,6 @@ def stop_scan() -> bool:
 async def _fan_out(
     pairs: list[tuple[str, str | None]],
     *,
-    http_client: httpx.AsyncClient,
     host_locks: dict[str, asyncio.Lock],
     concurrency: int | None = None,
 ) -> None:
@@ -259,7 +256,6 @@ async def _fan_out(
                     # in-flight scan, default pool 5+10=15).
                     result = await enrich_lead(
                         website_url=website,
-                        http_client=http_client,
                         budget_s=_BUDGET_S,
                         respect_robots=_RESPECT_ROBOTS,
                     )
@@ -303,13 +299,11 @@ async def scan_one_lead(
     *,
     session: Session,
     lead: Lead,
-    http_client: httpx.AsyncClient,
 ) -> str:
     """Enrich one lead and persist — detail page \"Re-scan now\"."""
 
     result = await enrich_lead(
         website_url=lead.website,
-        http_client=http_client,
         budget_s=_BUDGET_S,
         respect_robots=_RESPECT_ROBOTS,
     )

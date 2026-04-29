@@ -445,7 +445,7 @@ def test_get_scan_returns_never_scanned_when_no_blob(fresh_db, workspace_factory
 def _install_enrichment_handler(monkeypatch):
     """Stub :func:`enrich_lead` so the handler doesn't make real HTTP."""
 
-    async def fake_enrich_lead(*, website_url, http_client, budget_s, respect_robots):
+    async def fake_enrich_lead(*, website_url, budget_s, respect_robots):
         from autosdr.enrichment import EnrichmentResult
 
         return EnrichmentResult(

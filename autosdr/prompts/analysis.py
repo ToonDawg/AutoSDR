@@ -113,6 +113,18 @@ Shape:
   enrichment.signals.viewport_present:     mobile viewport meta tag.
   enrichment.signals.og_image_present:     Open Graph image declared.
   enrichment.signals.external_links_to_socials: list of social URLs.
+  enrichment.signals.http_status:          actual HTTP status of the homepage.
+  enrichment.signals.word_count:           rough word count of the visible body text.
+  enrichment.signals.text_snippet:         first ~300 chars of stripped body text.
+  enrichment.signals.lang:                 `<html lang>` value (e.g. en-AU vs en-US).
+  enrichment.signals.canonical_url:        `<link rel=canonical>` href.
+  enrichment.signals.copyright_year:       latest year mentioned in a footer copyright string.
+  enrichment.signals.abn:                  Australian Business Number on the homepage (digits only).
+  enrichment.signals.acn:                  Australian Company Number on the homepage (digits only).
+  enrichment.signals.email_addresses:      `mailto:` addresses linked from the homepage.
+  enrichment.signals.phone_numbers:        `tel:` numbers linked from the homepage.
+  enrichment.signals.jsonld_present:       boolean — is JSON-LD structured data declared.
+  enrichment.signals.og_title / og_description / og_site_name: curated Open Graph copy.
 
 Hard rules for reading this block:
 - `enrichment._meta.status != "ok"` means the website signal is

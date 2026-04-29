@@ -15,7 +15,6 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -260,17 +259,12 @@ async def run_outreach_for_campaign_lead(
     campaign: Campaign,
     campaign_lead: CampaignLead,
     lead: Lead,
-    http_client: httpx.AsyncClient | None = None,
 ) -> OutreachResult:
     """Execute the outreach pipeline for a single campaign-lead assignment.
 
-    ``http_client`` is accepted for signature compatibility with the
-    scheduler, but is unused by this pipeline now that enrichment runs
-    in the background scan worker. Keeping the parameter avoids
-    churning the scheduler call site; a follow-up can drop it.
+    Lead-website enrichment runs in the background scan worker (crawlee);
+    this path only reads the cached envelope.
     """
-
-    del http_client  # enrichment is no longer on this path
 
     settings_blob = workspace.settings or {}
     settings_llm, eval_threshold, eval_max_attempts = read_loop_settings(workspace)

@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, literal, or_, select
 
 from autosdr.api.deps import db_session, require_workspace
@@ -273,8 +273,7 @@ def scans_summary(include_unassigned: bool = Query(False)) -> ScanSummaryOut:
 
 
 @router.post("/run", response_model=ScanRunResult)
-async def run_scans(payload: ScanRunRequest, request: Request) -> ScanRunResult:
-    http_client = getattr(request.app.state, "enrichment_http_client", None)
+async def run_scans(payload: ScanRunRequest) -> ScanRunResult:
 
     if payload.lead_id:
         with db_session() as session:
@@ -289,17 +288,8 @@ async def run_scans(payload: ScanRunRequest, request: Request) -> ScanRunResult:
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={"error": "lead_not_found", "lead_id": payload.lead_id},
                 )
-            if http_client is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail={"error": "http_client_unavailable"},
-                )
 
-            sts = await scan_one_lead(
-                session=session,
-                lead=lead,
-                http_client=http_client,
-            )
+            sts = await scan_one_lead(session=session, lead=lead)
             logger.info(
                 "scan manual lead=%s status=%s",
                 lead.id,
@@ -326,12 +316,7 @@ async def run_scans(payload: ScanRunRequest, request: Request) -> ScanRunResult:
 
     started = False
     if payload.enabled:
-        if http_client is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"error": "http_client_unavailable"},
-            )
-        started = bool(start_scan(http_client))
+        started = bool(start_scan())
     else:
         stop_scan()
 

@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from autosdr.models import Campaign, CampaignLead, Message, MessageRole, Thread
+from autosdr.models import Campaign, CampaignLead, Lead, Message, MessageRole, Thread
 
 
 def count_outreach_contacts_last_24h(session: Session, campaign_id: str) -> int:
@@ -99,6 +99,62 @@ def count_outreach_contacts_last_24h_bulk(
     return counts
 
 
+def count_outreach_contacts_per_category_24h(
+    session: Session, campaign_id: str
+) -> dict[str | None, int]:
+    """Return ``{Lead.category: contacts_in_last_24h}`` for one campaign.
+
+    Same definition of "contact" as :func:`count_outreach_contacts_last_24h`
+    (one thread per first AI message, respecting ``quota_reset_at``) but
+    bucketed by the lead's ``category``. Used by the scheduler's
+    category-rotation picker to bias toward under-represented buckets so
+    a plumber-heavy queue doesn't burn the whole day on plumbers.
+
+    Categories with zero contacts are simply absent from the dict — the
+    caller treats a missing key as ``0``. ``Lead.category`` may be
+    ``None``; that is preserved as a distinct ``None`` bucket so
+    uncategorised leads rotate among themselves rather than collapsing
+    into another category's count.
+    """
+
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+
+    first_ai = (
+        select(
+            Thread.id.label("thread_id"),
+            CampaignLead.campaign_id.label("campaign_id"),
+            Lead.category.label("category"),
+            func.min(Message.created_at).label("first_ai_at"),
+        )
+        .join(Thread, Thread.id == Message.thread_id)
+        .join(CampaignLead, CampaignLead.id == Thread.campaign_lead_id)
+        .join(Lead, Lead.id == CampaignLead.lead_id)
+        .where(
+            CampaignLead.campaign_id == campaign_id,
+            Message.role == MessageRole.AI,
+        )
+        .group_by(Thread.id, CampaignLead.campaign_id, Lead.category)
+    ).subquery()
+
+    stmt = (
+        select(first_ai.c.category, func.count(first_ai.c.thread_id))
+        .join(Campaign, Campaign.id == first_ai.c.campaign_id)
+        .where(
+            first_ai.c.first_ai_at >= cutoff,
+            or_(
+                Campaign.quota_reset_at.is_(None),
+                first_ai.c.first_ai_at >= Campaign.quota_reset_at,
+            ),
+        )
+        .group_by(first_ai.c.category)
+    )
+
+    counts: dict[str | None, int] = {}
+    for category, count in session.execute(stmt).all():
+        counts[category] = int(count or 0)
+    return counts
+
+
 # Back-compat aliases — the previous public names referenced "ai_messages"
 # but the semantics changed to "outreach contacts" (one per thread, not one
 # per AI send). Callers can migrate at their leisure; both names point at
@@ -112,4 +168,5 @@ __all__ = [
     "count_ai_messages_last_24h_bulk",
     "count_outreach_contacts_last_24h",
     "count_outreach_contacts_last_24h_bulk",
+    "count_outreach_contacts_per_category_24h",
 ]

@@ -219,7 +219,7 @@ async def test_pacing_at_midpoint_allows_send_when_behind(fresh_db, monkeypatch)
 
     sent_calls: list[str] = []
 
-    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead, http_client=None):
+    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead):
         sent_calls.append(campaign_lead.id)
 
         class _R:
@@ -349,7 +349,7 @@ async def test_disabled_window_short_circuits_pacing(fresh_db, monkeypatch):
 
     sent_calls: list[str] = []
 
-    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead, http_client=None):
+    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead):
         sent_calls.append(campaign_lead.id)
 
         class _R:
@@ -392,7 +392,7 @@ async def test_campaign_override_beats_workspace_default(fresh_db, monkeypatch):
 
     sent_calls: list[str] = []
 
-    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead, http_client=None):
+    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead):
         sent_calls.append(campaign_lead.id)
 
         class _R:
@@ -433,7 +433,7 @@ async def test_campaign_override_beats_workspace_default(fresh_db, monkeypatch):
 async def test_kickoff_bypasses_window(fresh_db, monkeypatch):
     """Manual kickoff (``respect_quota=False``) ignores the window."""
 
-    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead, http_client=None):
+    async def fake_outreach(*, session, connector, workspace, campaign, campaign_lead, lead):
         class _R:
             sent = True
             reason = ""

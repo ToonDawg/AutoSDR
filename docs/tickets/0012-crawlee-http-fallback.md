@@ -1,8 +1,20 @@
-# [feature/scraper] HTTP-based Crawlee fallback for lead enrichment (deferred)
+# [feature/scraper] HTTP-based Crawlee fallback for lead enrichment (superseded)
 
 <!-- TYPE: investigation -->
 <!-- AREA: scraper -->
-<!-- STATUS: deferred — see Phase 1 evidence -->
+<!-- STATUS: superseded 2026-04-29 — see plan crawlee-only_enrichment_richer_signals -->
+
+> **Superseded 2026-04-29.** The crawlee swap shipped (full
+> replacement, not a fallback) under the
+> `crawlee-only_enrichment_richer_signals` plan. The httpx fetcher was
+> retired entirely; `enrich_lead()` and the standalone enrichment
+> script both run through `crawlee.BeautifulSoupCrawler` now, and the
+> kitchen-sink signal set was added (`http_status`, `word_count`,
+> `text_snippet`, `lang`, `canonical_url`, `copyright_year`, `abn`,
+> `acn`, `email_addresses`, `phone_numbers`, link buckets, JSON-LD
+> presence, OG meta). See `data/crawlee-test-report-20260429.md` for
+> the cohort numbers that justified pulling the trigger. Trigger
+> evidence below is left intact for historical context.
 
 ## Problem
 

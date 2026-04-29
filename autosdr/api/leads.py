@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import ValidationError
 from sqlalchemy import func, or_, select
 
@@ -369,7 +369,7 @@ def _lead_last_fetched_iso(lead: Lead) -> str | None:
 
 
 @router.post("/enrich", response_model=LeadEnrichOut)
-async def post_enrich_batch(request: Request, body: LeadEnrichIn) -> LeadEnrichOut:
+async def post_enrich_batch(body: LeadEnrichIn) -> LeadEnrichOut:
     """Pre-fetch website enrichment for leads whose cache is stale or empty."""
 
     with db_session() as session:
@@ -399,20 +399,12 @@ async def post_enrich_batch(request: Request, body: LeadEnrichIn) -> LeadEnrichO
                 candidates=cand_out,
             )
 
-        http_client = getattr(request.app.state, "enrichment_http_client", None)
-        if http_client is None:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"error": "http_client_unavailable"},
-            )
-
         ok = 0
         fail = 0
         for lead in candidates:
             try:
                 result = await enrich_lead(
                     website_url=lead.website,
-                    http_client=http_client,
                     budget_s=4.0,
                     respect_robots=True,
                 )

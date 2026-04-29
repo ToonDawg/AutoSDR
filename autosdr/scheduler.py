@@ -24,7 +24,6 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
-import httpx
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
@@ -37,6 +36,9 @@ from autosdr.models import (
     CampaignLeadStatus,
     CampaignStatus,
     Lead,
+    Message,
+    MessageRole,
+    Thread,
     Workspace,
 )
 from autosdr.pacing import (
@@ -45,7 +47,10 @@ from autosdr.pacing import (
     window_allowance,
 )
 from autosdr.pipeline import process_incoming_message, run_outreach_for_campaign_lead
-from autosdr.quota import count_outreach_contacts_last_24h
+from autosdr.quota import (
+    count_outreach_contacts_last_24h,
+    count_outreach_contacts_per_category_24h,
+)
 from autosdr.workspace_settings import load_workspace_settings_or_empty
 
 logger = logging.getLogger(__name__)
@@ -65,15 +70,103 @@ class OutreachBatchSummary:
     capped_by_window: bool = False
 
 
+# Sentinel used by the picker to mean "no previous category at all"
+# (cold-start campaign). Crucially distinct from ``None``, which is a
+# real category value (uncategorised leads); using ``None`` as the
+# sentinel would make the very first cold-start pick wrongly
+# deprioritise the uncategorised bucket against itself.
+_NO_LAST_CATEGORY: object = object()
+
+
+def _most_recent_contact_category(
+    session: Session, campaign_id: str
+) -> str | None | object:
+    """Category of the lead whose most recent AI message landed in this campaign.
+
+    Used by the picker to avoid back-to-back same-category sends across
+    tick boundaries — without it, the very first pick of each tick has no
+    "last category" memory and would happily start a 50-plumber streak.
+
+    Returns ``_NO_LAST_CATEGORY`` if no AI messages exist yet (cold-start
+    campaign) so the picker can express "no preference" without colliding
+    with a real ``None`` (uncategorised) category. If the most recent
+    contact's lead is itself uncategorised, returns ``None`` — the
+    picker should still avoid stacking another uncategorised send next.
+    """
+
+    stmt = (
+        select(Lead.category)
+        .join(CampaignLead, CampaignLead.lead_id == Lead.id)
+        .join(Thread, Thread.campaign_lead_id == CampaignLead.id)
+        .join(Message, Message.thread_id == Thread.id)
+        .where(
+            CampaignLead.campaign_id == campaign_id,
+            Message.role == MessageRole.AI,
+        )
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    row = session.execute(stmt).first()
+    return row[0] if row is not None else _NO_LAST_CATEGORY
+
+
+def _categories_ever_contacted(
+    session: Session, campaign_id: str
+) -> set[str | None]:
+    """Distinct ``Lead.category`` values that have ever received an AI message.
+
+    Powers the "untouched categories first" tier of the picker score: a
+    category that has *never* been messaged in this campaign sorts ahead
+    of any category that has, regardless of how recently it was hit.
+    Includes ``None`` if any uncategorised lead has been contacted.
+    """
+
+    stmt = (
+        select(Lead.category)
+        .join(CampaignLead, CampaignLead.lead_id == Lead.id)
+        .join(Thread, Thread.campaign_lead_id == CampaignLead.id)
+        .join(Message, Message.thread_id == Thread.id)
+        .where(
+            CampaignLead.campaign_id == campaign_id,
+            Message.role == MessageRole.AI,
+        )
+        .distinct()
+    )
+    return {row[0] for row in session.execute(stmt).all()}
+
+
 def _next_queued_leads(
     session: Session, campaign_id: str, limit: int
 ) -> list[tuple[CampaignLead, Lead]]:
-    """Return the next N queued campaign-lead assignments, joined with the lead."""
+    """Pick the next N queued campaign-lead assignments with category rotation.
+
+    The naive picker — ``ORDER BY queue_position ASC LIMIT N`` — burns a
+    plumber-heavy import on plumbers for days. Instead, we fetch the
+    queued candidates once and run a 4-key Python scoring loop per pick:
+
+    1. Avoid back-to-back same category (compared against the previous
+       pick in this batch, falling back to the most recent AI contact in
+       the campaign so the rule survives tick boundaries).
+    2. Prefer categories that have never been contacted in this
+       campaign — first the untouched buckets, then the rest.
+    3. Within "already contacted", prefer the *least* recently contacted
+       (24h count + intra-batch picks).
+    4. Tie-break on ``queue_position`` so import order still wins inside
+       a category.
+
+    The intent is light interleaving, not a strict cap: degenerates to
+    pure FIFO when only one category is queued, and won't ever skip a
+    lead that the old picker would have sent.
+
+    All quota / outreach-window enforcement happens upstream in
+    :func:`run_campaign_outreach_batch`; we only reorder within the
+    ``limit`` it has already decided on.
+    """
 
     if limit <= 0:
         return []
 
-    stmt = (
+    candidate_stmt = (
         select(CampaignLead, Lead)
         .join(Lead, Lead.id == CampaignLead.lead_id)
         .where(
@@ -84,9 +177,48 @@ def _next_queued_leads(
             )
         )
         .order_by(CampaignLead.queue_position.asc())
-        .limit(limit)
     )
-    return list(session.execute(stmt).all())
+    all_candidates: list[tuple[CampaignLead, Lead]] = list(
+        session.execute(candidate_stmt).all()
+    )
+    if not all_candidates:
+        return []
+
+    sent_24h = count_outreach_contacts_per_category_24h(session, campaign_id)
+    ever_contacted = _categories_ever_contacted(session, campaign_id)
+    last_sent_cat = _most_recent_contact_category(session, campaign_id)
+
+    # Group candidates by category, keeping each bucket FIFO. Popping
+    # from the head of each bucket is O(1) and makes the per-pick scan
+    # O(num_categories) rather than O(num_queued).
+    buckets: dict[str | None, list[tuple[CampaignLead, Lead]]] = {}
+    for cl, lead in all_candidates:
+        buckets.setdefault(lead.category, []).append((cl, lead))
+
+    intra_batch: dict[str | None, int] = {}
+    picked: list[tuple[CampaignLead, Lead]] = []
+
+    while len(picked) < limit:
+        non_empty_cats = [cat for cat, rows in buckets.items() if rows]
+        if not non_empty_cats:
+            break
+
+        def score(cat: str | None) -> tuple[int, int, int, int]:
+            head = buckets[cat][0]
+            return (
+                1 if cat == last_sent_cat else 0,
+                1 if cat in ever_contacted else 0,
+                sent_24h.get(cat, 0) + intra_batch.get(cat, 0),
+                head[0].queue_position,
+            )
+
+        chosen_cat = min(non_empty_cats, key=score)
+        cl, lead = buckets[chosen_cat].pop(0)
+        picked.append((cl, lead))
+        intra_batch[chosen_cat] = intra_batch.get(chosen_cat, 0) + 1
+        last_sent_cat = chosen_cat
+
+    return picked
 
 
 def _count_queued_leads(session: Session, campaign_id: str) -> int:
@@ -118,7 +250,6 @@ async def run_campaign_outreach_batch(
     min_delay_s: int = 0,
     prior_success_count: int = 0,
     now_local: datetime | None = None,
-    enrichment_http_client: httpx.AsyncClient | None = None,
 ) -> OutreachBatchSummary:
     """Send up to ``max_count`` queued leads for one campaign.
 
@@ -203,7 +334,6 @@ async def run_campaign_outreach_batch(
                 campaign=campaign,
                 campaign_lead=campaign_lead,
                 lead=lead,
-                http_client=enrichment_http_client,
             )
         except killswitch.KillSwitchTripped:
             raise
@@ -229,8 +359,6 @@ async def run_campaign_outreach_batch(
 
 async def _run_campaign_tick(
     connector: BaseConnector,
-    *,
-    enrichment_http_client: httpx.AsyncClient | None = None,
 ) -> dict[str, int]:
     """One pass across all active campaigns; returns a send summary."""
 
@@ -268,7 +396,6 @@ async def _run_campaign_tick(
                     respect_quota=True,
                     min_delay_s=min_delay_s,
                     prior_success_count=summary["sent"],
-                    enrichment_http_client=enrichment_http_client,
                 )
             except killswitch.KillSwitchTripped:
                 logger.info("kill switch tripped mid-outreach; stopping tick")
@@ -362,18 +489,11 @@ async def run_inbound_poller(connector: BaseConnector) -> None:
             return
 
 
-async def run_scheduler(
-    connector: BaseConnector,
-    *,
-    enrichment_http_client: httpx.AsyncClient | None = None,
-) -> None:
+async def run_scheduler(connector: BaseConnector) -> None:
     """Main scheduler loop. Exits when the kill-switch shutdown event fires.
 
-    ``enrichment_http_client`` is the workspace-shared
-    :class:`httpx.AsyncClient` for lead-website enrichment (ticket 0011).
-    The webhook lifespan owns its construction/disposal so connection
-    pooling survives ticks. Tests omit this — outreach falls back to an
-    ephemeral client per campaign-lead.
+    Lead-website enrichment is owned by crawlee inside
+    :mod:`autosdr.enrichment`; no per-loop client to thread through.
     """
 
     settings_blob = load_workspace_settings_or_empty()
@@ -393,10 +513,7 @@ async def run_scheduler(
             logger.debug("pause flag set — skipping tick")
         else:
             try:
-                summary = await _run_campaign_tick(
-                    connector=connector,
-                    enrichment_http_client=enrichment_http_client,
-                )
+                summary = await _run_campaign_tick(connector=connector)
                 if summary["sent"] or summary["failed"]:
                     logger.info("scheduler tick summary: %s", summary)
             except Exception:

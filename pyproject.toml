@@ -19,6 +19,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "litellm>=1.80.8",
     "httpx>=0.27",
+    "crawlee[beautifulsoup]>=0.6",
     "phonenumbers>=8.13",
     "python-multipart>=0.0.26",
 ]

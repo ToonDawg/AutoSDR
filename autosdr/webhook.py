@@ -27,7 +27,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -181,37 +180,9 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
             logger.exception("failed to initialise db schema on boot")
             raise
 
-        # Workspace-scoped enrichment HTTP client. One pool, shared
-        # across every outreach tick + the scan fan-out — connection
-        # re-use is the only reason this lives at the workspace
-        # level. The fetcher itself owns per-request timeouts and
-        # the total budget; we keep the client construction here so
-        # the lifespan owns its disposal. See ticket 0011 and
-        # ``autosdr.enrichment``.
-        #
-        # Pool sizing rule of thumb: each in-flight scan does up to
-        # 3 sequential HTTP requests (robots, root, sitemap), so
-        # peak concurrent outbound connections track the scan
-        # ``SCAN_CONCURRENCY`` setting almost 1:1. We size the pool
-        # at ~4× that to leave breathing room for the scheduler's
-        # outreach-time enrichment without ever queueing inside
-        # httpx (queueing eats into the per-lead 4s budget and
-        # produces ``status=timeout`` for free).
-        scan_conc = max(1, int(get_settings().scan_concurrency))
-        max_conn = max(64, scan_conc * 4)
-        max_keep = max(32, scan_conc * 2)
-        app.state.enrichment_http_client = httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_keepalive_connections=max_keep,
-                max_connections=max_conn,
-            ),
-        )
-        logger.info(
-            "enrichment http client: max_connections=%d max_keepalive=%d (scan_concurrency=%d)",
-            max_conn,
-            max_keep,
-            scan_conc,
-        )
+        # Lead-website enrichment is powered by crawlee (its own
+        # session pool, retry, and concurrency); nothing for the
+        # FastAPI lifespan to construct or dispose for it.
 
         # Apply LLM provider keys from settings into os.environ before any
         # scheduler tick runs — LiteLLM reads them at call time.
@@ -240,10 +211,7 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
         if run_scheduler_task and app.state.connector is not None:
             scheduler_task = asyncio.create_task(
                 _defer_background_start(
-                    lambda: run_scheduler(
-                        app.state.connector,
-                        enrichment_http_client=app.state.enrichment_http_client,
-                    )
+                    lambda: run_scheduler(app.state.connector)
                 ),
                 name="autosdr.scheduler",
             )
@@ -268,11 +236,6 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
                     await task
                 except (asyncio.CancelledError, Exception):  # pragma: no cover
                     pass
-            try:
-                await app.state.enrichment_http_client.aclose()
-            except Exception:  # pragma: no cover - shutdown best-effort
-                logger.exception("failed to close enrichment http client")
-
     app = FastAPI(title="AutoSDR", lifespan=lifespan)
     install_exception_handlers(app)
 

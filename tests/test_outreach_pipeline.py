@@ -1011,7 +1011,6 @@ async def test_outreach_reads_cached_enrichment(
                 campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
                 campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
                 lead=session.get(Lead, prepared_campaign["lead_id"]),
-                http_client=http_client,
             )
 
     assert result.sent
@@ -1119,7 +1118,6 @@ async def test_outreach_surfaces_cached_failure_status(
                 campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
                 campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
                 lead=session.get(Lead, prepared_campaign["lead_id"]),
-                http_client=http_client,
             )
 
     assert result.sent
@@ -1184,7 +1182,6 @@ async def test_outreach_with_no_enrichment_blob_records_missing_status(
                 campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
                 campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
                 lead=session.get(Lead, prepared_campaign["lead_id"]),
-                http_client=http_client,
             )
 
     assert result.sent
@@ -1260,7 +1257,6 @@ async def test_enrichment_disabled_short_circuits(
                 campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
                 campaign_lead=session.get(CampaignLead, prepared_campaign["campaign_lead_id"]),
                 lead=session.get(Lead, prepared_campaign["lead_id"]),
-                http_client=http_client,
             )
 
     assert fetch_count == 0

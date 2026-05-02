@@ -38,6 +38,8 @@ from autosdr.api import ALL_ROUTERS
 from autosdr.api.deps import SETUP_REQUIRED_STATUS
 from autosdr.api.errors import install_exception_handlers
 from autosdr.config import get_settings, merge_workspace_settings
+from autosdr.networking import log_host_bind_warning
+from autosdr.push import ensure_vapid_keys
 from autosdr.connectors import get_connector
 from autosdr.db import create_all, session_scope
 from autosdr.llm import apply_llm_provider_keys, get_usage_snapshot
@@ -207,6 +209,24 @@ def create_app(*, run_scheduler_task: bool = True) -> FastAPI:
                 "no workspace yet — waiting for setup wizard before starting scheduler"
             )
             app.state.connector = None
+
+        # VAPID keypair lifecycle (ticket 0005). Idempotent — first boot
+        # generates the keypair, subsequent boots reuse it. Safe to call
+        # before setup; returns ``None`` keys if the workspace doesn't
+        # exist yet and the push fanout treats that as "no push".
+        try:
+            ensure_vapid_keys()
+        except Exception:
+            logger.exception("failed to ensure VAPID keypair on boot")
+
+        # Operator nudge: warn at boot when AutoSDR is bound to localhost
+        # but Tailscale is up — the *PC-bind-interface footgun* the
+        # Pragmatist surfaced in ticket 0005's *Remote-access architecture*
+        # round. Best-effort; a failed probe stays silent.
+        try:
+            log_host_bind_warning()
+        except Exception:
+            logger.exception("networking probe failed on boot")
 
         if run_scheduler_task and app.state.connector is not None:
             scheduler_task = asyncio.create_task(

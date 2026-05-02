@@ -12,6 +12,7 @@ from autosdr.api.dev import router as dev_router
 from autosdr.api.leads import router as leads_router
 from autosdr.api.llm import router as llm_router
 from autosdr.api.llm_calls import router as llm_calls_router
+from autosdr.api.push import router as push_router
 from autosdr.api.scans import router as scans_router
 from autosdr.api.setup import router as setup_router
 from autosdr.api.stats import router as stats_router
@@ -32,6 +33,7 @@ ALL_ROUTERS = [
     llm_router,
     stats_router,
     scans_router,
+    push_router,
     webhooks_router,
 ]
 

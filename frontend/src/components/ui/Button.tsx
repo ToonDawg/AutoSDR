@@ -29,9 +29,12 @@ const variants: Record<Variant, string> = {
     'bg-transparent text-ink border-0 px-0 py-0 hover:text-rust underline-offset-4 hover:underline',
 };
 
+// Mobile floor (<md): h-11 = 44px = iOS hit-target minimum.
+// Desktop (md+) returns to original densities so dense laptop UI doesn't
+// suffer.
 const sizes: Record<Size, string> = {
-  sm: 'text-xs h-7 px-3',
-  md: 'text-sm h-9 px-4',
+  sm: 'text-xs h-11 md:h-7 px-3',
+  md: 'text-sm h-11 md:h-9 px-4',
   lg: 'text-sm h-11 px-5',
 };
 

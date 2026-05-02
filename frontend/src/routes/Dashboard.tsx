@@ -55,8 +55,8 @@ export function Dashboard() {
   );
 
   return (
-    <div className="page gap-8">
-      <header className="flex items-baseline justify-between border-b border-rule pb-4">
+    <div className="page gap-6 md:gap-8">
+      <header className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-3 border-b border-rule pb-4">
         <div>
           <h1 className="text-2xl font-medium">Dashboard</h1>
           <p className="text-sm text-ink-muted mt-1">
@@ -69,7 +69,7 @@ export function Dashboard() {
         </div>
         <Link
           to="/inbox"
-          className="inline-flex items-center gap-2 px-4 h-9 bg-ink text-paper text-sm hover:bg-rust transition-colors"
+          className="inline-flex items-center justify-center gap-2 px-4 min-h-11 bg-ink text-paper text-sm hover:bg-rust transition-colors self-start sm:self-auto"
         >
           Open inbox
           {hitlCount > 0 && (
@@ -92,7 +92,7 @@ export function Dashboard() {
         inboundPollS={status?.scheduler.poll_s ?? 20}
       />
 
-      <div className="grid grid-cols-12 gap-8">
+      <div className="grid grid-cols-12 gap-6 md:gap-8">
         <section className="col-span-12 lg:col-span-7">
           <PanelHeader
             title={hitlCount > 0 ? 'Waiting for you' : 'Inbox is clean'}

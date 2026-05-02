@@ -47,8 +47,9 @@ rehearsal mode — is set from the Settings page and hot-reloaded at runtime.
 - A Google Gemini API key (free tier fine for the POC —
   <https://aistudio.google.com/app/apikey>)
 - For real SMS: an Android phone running [TextBee](https://textbee.dev) or
-  [SMSGate](https://sms-gate.app). No tunnel / public URL — the scheduler
-  polls the gateway's REST API.
+  [SMSGate](https://sms-gate.app). No tunnel / public URL on the LAN path —
+  the scheduler polls the gateway's REST API. (For phone-on-cellular ⇄
+  PC-at-home, see [Remote access](#remote-access-use-autosdr-from-your-phone).)
 - For local testing: nothing extra. The file connector writes outbound SMS
   to `data/outbox.jsonl`; use **Settings → Connector → Simulate inbound**
   (after saving `connector.type=file`) to drive the reply pipeline.
@@ -100,6 +101,66 @@ connector type **File**, or call `POST /api/dev/sim-inbound` with `{ "contact_ur
 
 AutoSDR classifies the intent, generates candidate drafts, parks the thread
 as "Needs you", and the UI's Inbox will surface it within a few seconds.
+
+---
+
+## Remote access (use AutoSDR from your phone)
+
+By default AutoSDR binds to `127.0.0.1:8000`, which means *only* the PC
+running it can reach the dashboard. That's the right default for a
+laptop-only operator. If you want to triage HITL pushes (ticket 0005) from
+your phone *while AutoSDR is at home and your phone is on cellular*, the
+canonical pattern is:
+
+1. **Install Tailscale on the PC and on the phone.** Sign in with the
+   same account on both. Free for up to 100 devices —
+   <https://tailscale.com/download>. Tailscale gives the PC a stable
+   `100.x` address and a MagicDNS hostname like
+   `autosdr-pc.tail-scale.ts.net`; the phone can reach it from any
+   network as long as Tailscale is connected on both ends.
+2. **Bind AutoSDR to all interfaces.** In your `.env` (next to
+   `DATABASE_URL`), set `HOST=0.0.0.0` and restart uvicorn. Without
+   this, FastAPI only listens on the loopback interface and the phone
+   can't reach it even on the tailnet. Settings → Networking shows
+   you whether you got this right; if AutoSDR is bound to localhost
+   *and* Tailscale is up, it logs a warning and surfaces an amber
+   chip.
+3. **Open the dashboard from the phone.** In the phone browser, go to
+   `http://[your-pc-tailnet-name]:8000` (e.g.
+   `http://autosdr-pc.tail-scale.ts.net:8000`). On iOS Safari /
+   Chrome → Add to Home Screen to install it as a PWA. On Android →
+   the browser will offer Install. iOS 16.4+ requires the PWA to be
+   installed before it can receive push notifications.
+4. **Subscribe this device.** Open Settings → Notifications → Enable
+   on this device, accept the permission prompt, and fire a test
+   notification to confirm the round-trip.
+5. **Decide on the SMS path.** SMSGate has two modes:
+   - **Local Server (recommended for one tool).** Keep the phone on
+     Tailscale; AutoSDR talks to `http://[phone-tailnet]:8080` over
+     the tailnet. One VPN, one URL.
+   - **Cloud Server (decouples SMS from the VPN).** Switch the phone
+     to SMSGate Cloud Server mode and point AutoSDR's connector at
+     `https://api.sms-gate.app/3rdparty/v1`. Useful if Tailscale-on-
+     phone burns too much battery or the cellular network is flaky.
+   In both cases the AutoSDR connector is the same — only the URL
+   the operator pastes changes (see `autosdr/connectors/smsgate.py`).
+
+What this is *not*: a public dashboard. There's no `https://`
+hostname, no Cloudflare Tunnel, and no inbound port-forward involved.
+The dashboard is private to your tailnet; a notification deep-link
+shared off the tailnet is harmless because the URL doesn't resolve.
+
+If something doesn't work, the order of things to check is:
+
+1. `tailscale status` on both ends — both connected?
+2. From the phone: `http://[your-pc-tailnet-name]:8000/healthz` —
+   does it return `{"status": "ok"}`? If not, almost always
+   `HOST=127.0.0.1` (Settings → Networking will tell you).
+3. From the PC: `curl http://[phone-tailnet]:8080/health` (SMSGate
+   Local Server) — does the SMSGate API respond?
+4. Settings → Notifications → "Send test notification" — does the
+   notification arrive? If "gone" > 0 the device side dropped the
+   subscription; tap Enable on this device again.
 
 ---
 
@@ -225,6 +286,14 @@ your own authentication layer.
 - A second LLM provider out of the box (LiteLLM can talk to any of them —
   OpenAI, Anthropic, local via Ollama — just put the key in Settings and
   change the model slug).
-- Web Push notifications. Poll-based refresh handles the send volumes
-  AutoSDR is designed for.
-- Anything mobile-first. Laptop UI. Works down to ~1024px.
+- A self-hosted push relay. Web Push uses the browser-vendor public
+  push gateways (FCM, APNS via Apple's push gateway, Mozilla autopush).
+  Payloads are privacy-strict — only the lead's first name + thread id +
+  a short generic body — so a leaked notification reveals "thread X
+  needs attention" and nothing more. See ticket 0005 for the
+  threat-model write-up.
+- A native mobile app. The operator console is a single SPA that adapts
+  down to ~360 px wide: hamburger drawer below `md:`, card-list fallback
+  for tables, master-detail collapse on Inbox, sticky compose bar and
+  collapsed LLM trail in `ThreadDetail`. Tap targets are ≥ 44 px on
+  mobile.

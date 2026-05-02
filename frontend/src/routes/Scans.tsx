@@ -6,6 +6,7 @@ import { api } from '@/lib/api';
 import { useDebouncedValue } from '@/lib/useDebouncedValue';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
+import { CardList, CardListItem } from '@/components/ui/CardList';
 import { FilterTabs, type FilterOption } from '@/components/ui/FilterTabs';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
@@ -249,7 +250,7 @@ export function Scans() {
         {isFetching && !isLoading && <span className="text-ink-faint">Refreshing…</span>}
       </div>
 
-      <div className="paper-card overflow-x-auto">
+      <div className="paper-card hidden md:block overflow-x-auto">
         <table className="t-table min-w-[700px] w-full table-fixed">
           <thead>
             <tr>
@@ -332,6 +333,53 @@ export function Scans() {
           <div className="py-14 text-center text-ink-muted text-sm">Loading scans…</div>
         )}
       </div>
+
+      <CardList className="md:hidden">
+        {scans.map((row) => (
+          <CardListItem
+            key={row.lead_id}
+            to={`/scans/${row.lead_id}`}
+            title={row.lead_name ?? '—'}
+            description={
+              <>
+                {row.website && (
+                  <div className="font-mono text-[11px] truncate">{row.website}</div>
+                )}
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
+                  {row.cms && <span className="font-mono">{row.cms}</span>}
+                  {row.sitemap_count != null && (
+                    <span className="font-mono tabular-nums">
+                      {row.sitemap_count} sitemap
+                    </span>
+                  )}
+                  {row.latency_ms != null && (
+                    <span className="font-mono tabular-nums">{row.latency_ms}ms</span>
+                  )}
+                </div>
+              </>
+            }
+            badges={
+              <Badge tone={STATUS_TONE[row.status] ?? 'neutral'} dot>
+                {row.status}
+              </Badge>
+            }
+            trailing={
+              <span className="font-mono text-[10px] text-ink-muted">
+                {row.fetched_at ? relTime(row.fetched_at) : '—'}
+              </span>
+            }
+          />
+        ))}
+        {scans.length === 0 && !isLoading && (
+          <li className="paper-card py-10 text-center text-ink-muted text-sm">
+            {q || filter !== 'all'
+              ? 'No scans match this filter.'
+              : includeUnassigned
+                ? 'No leads yet — import some to start scanning.'
+                : 'No campaign leads yet — assign leads to a campaign or include unassigned.'}
+          </li>
+        )}
+      </CardList>
 
       {total > PAGE_SIZE && (
         <nav className="flex items-center justify-between pt-2">

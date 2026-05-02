@@ -176,8 +176,58 @@ export interface WorkspaceSettings {
     override_to: string | null;
   };
 
+  // Browser-vendor Web Push for HITL escalations. The
+  // ``vapid_public`` is hot-loaded once via ``GET /api/push/vapid-public``;
+  // the private half never crosses the API boundary, so the type only
+  // declares the operator-visible knobs. See ticket 0005.
+  push?: {
+    hitl_escalations?: boolean;
+    dashboard_origin?: string | null;
+    vapid_subject?: string;
+  };
+
   // Anything else the server knows about but the UI doesn't.
   [key: string]: unknown;
+}
+
+export interface PushVapidPublic {
+  public_key: string | null;
+  dashboard_origin: string | null;
+}
+
+export interface PushSubscriptionRow {
+  id: string;
+  endpoint_host: string;
+  user_agent: string | null;
+  last_seen_at: ISODate | null;
+  last_error: string | null;
+  created_at: ISODate;
+}
+
+export interface PushSubscriptionsResponse {
+  subscriptions: PushSubscriptionRow[];
+  hitl_escalations: boolean;
+  dashboard_origin: string | null;
+}
+
+export interface PushTestResult {
+  sent: number;
+  gone: number;
+  failed: number;
+}
+
+export interface NetworkingStatus {
+  host: string;
+  port: number;
+  bound_for_remote_access: boolean;
+  tailscale: {
+    state: 'running' | 'not_running' | 'not_detected';
+    detail: string | null;
+  };
+  warning: string | null;
+  dashboard_origin_override: string | null;
+  dashboard_origin_resolved: string | null;
+  request_origin: string | null;
 }
 
 // ---------- records ----------
@@ -816,6 +866,23 @@ export interface SystemStatus {
   scheduler: {
     tick_s: number;
     poll_s: number;
+  };
+  /**
+   * Depth + age of the killswitch's deferred-inbound queue (ticket
+   * 0009). When the killswitch is on the webhook handler stashes
+   * inbounds in ``paused_inbound`` instead of dropping them; the
+   * resume endpoint drains the queue. Mirrors
+   * ``autosdr.api.schemas.PausedInboundStatus``.
+   *
+   * - ``pending_count`` is the unreplayed row count.
+   * - ``oldest_pending_at`` is the ``created_at`` of the oldest row,
+   *   useful for flagging stale queues.
+   *
+   * Both are zero / null on a fresh boot.
+   */
+  paused_inbound: {
+    pending_count: number;
+    oldest_pending_at: ISODate | null;
   };
 }
 

@@ -214,19 +214,19 @@ export function ThreadDetail() {
     : null;
 
   return (
-    <div className="grid grid-cols-12 h-[calc(100vh-3rem)]">
-      <div className="col-span-12 lg:col-span-8 xl:col-span-8 border-r border-rule flex flex-col min-w-0 min-h-0">
-        <div className="border-b border-rule px-8 pt-5 pb-4">
+    <div className="flex flex-col lg:grid lg:grid-cols-12 lg:h-[calc(100vh-3rem)]">
+      <div className="lg:col-span-8 xl:col-span-8 lg:border-r lg:border-rule flex flex-col min-w-0 lg:min-h-0">
+        <div className="border-b border-rule px-4 md:px-8 pt-4 md:pt-5 pb-4">
           <button
             onClick={() => navigate(-1)}
-            className="inline-flex items-center gap-1.5 text-[11px] text-ink-muted hover:text-ink cursor-pointer mb-3"
+            className="inline-flex items-center gap-1.5 text-[11px] text-ink-muted hover:text-ink cursor-pointer mb-3 min-h-[44px] -ml-1 px-1"
           >
             <ArrowLeft className="h-3 w-3" strokeWidth={1.5} />
             Back
           </button>
-          <div className="flex items-baseline justify-between gap-4 mb-2">
-            <Link to={`/leads/${thread.lead_id}`} className="hover:text-ink">
-              <h1 className="text-xl font-medium">
+          <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-2 mb-2">
+            <Link to={`/leads/${thread.lead_id}`} className="hover:text-ink min-w-0">
+              <h1 className="text-xl font-medium truncate">
                 {thread.lead_name ?? "Unknown lead"}
               </h1>
             </Link>
@@ -253,7 +253,7 @@ export function ThreadDetail() {
         </div>
 
         {optOutClosed && (
-          <div className="px-8 py-3 border-b border-oxblood/40 bg-oxblood-soft/60 flex items-start gap-4">
+          <div className="px-4 md:px-8 py-3 border-b border-oxblood/40 bg-oxblood-soft/60 flex items-start gap-4">
             <Badge tone="oxblood" dot>
               Opted out
             </Badge>
@@ -277,7 +277,7 @@ export function ThreadDetail() {
         )}
 
         {pausedForHitl && thread.hitl_reason && (
-          <div className="px-8 py-3 border-b border-rust/40 bg-rust-soft/60 flex items-start gap-4">
+          <div className="px-4 md:px-8 py-3 border-b border-rust/40 bg-rust-soft/60 flex flex-col sm:flex-row items-start gap-2 sm:gap-4">
             <Badge tone={thread.hitl_dismissed_at ? "neutral" : "rust"} dot>
               {thread.hitl_dismissed_at ? "Dismissed" : "Paused for you"}
             </Badge>
@@ -322,7 +322,7 @@ export function ThreadDetail() {
           </div>
         )}
 
-        <div className="flex-1 overflow-y-auto px-8 py-6">
+        <div className="lg:flex-1 lg:overflow-y-auto px-4 md:px-8 py-6">
           <div className="flex flex-col gap-6">
             {messages?.map((m) => (
               <MessageBubble
@@ -375,7 +375,7 @@ export function ThreadDetail() {
         {sendError && (
           <div
             role="alert"
-            className="border-t border-oxblood/30 bg-oxblood-soft px-8 py-3 flex items-start gap-2 text-sm text-oxblood"
+            className="border-t border-oxblood/30 bg-oxblood-soft px-4 md:px-8 py-3 flex items-start gap-2 text-sm text-oxblood"
           >
             <AlertTriangle
               className="h-4 w-4 mt-0.5 shrink-0"
@@ -388,19 +388,21 @@ export function ThreadDetail() {
           </div>
         )}
 
-        <ComposeBar
-          draft={manualDraft}
-          onDraftChange={setManualDraft}
-          onSendManual={() =>
-            sendDraft.mutate({ draft: manualDraft, source: "manual" })
-          }
-          onClose={(outcome) => close.mutate(outcome)}
-          sending={sendDraft.isPending}
-        />
+        <div className="sticky bottom-0 z-20 bg-paper">
+          <ComposeBar
+            draft={manualDraft}
+            onDraftChange={setManualDraft}
+            onSendManual={() =>
+              sendDraft.mutate({ draft: manualDraft, source: "manual" })
+            }
+            onClose={(outcome) => close.mutate(outcome)}
+            sending={sendDraft.isPending}
+          />
+        </div>
       </div>
 
-      <aside className="col-span-12 lg:col-span-4 xl:col-span-4 flex flex-col min-w-0 overflow-y-auto">
-        <section className="px-6 py-5 border-b border-rule">
+      <aside className="lg:col-span-4 xl:col-span-4 flex flex-col min-w-0 lg:overflow-y-auto border-t lg:border-t-0 border-rule">
+        <section className="px-4 md:px-6 py-5 border-b border-rule">
           <div className="label mb-2">Angle</div>
           <AngleTag angle={thread.angle} />
           {campaign && (
@@ -415,7 +417,7 @@ export function ThreadDetail() {
 
         <LlmTrail threadId={thread.id} calls={llmCalls} />
 
-        <section className="px-6 py-5">
+        <section className="px-4 md:px-6 py-5">
           <div className="label mb-3">Stats</div>
           <dl className="grid grid-cols-2 gap-y-2 gap-x-5 text-sm">
             <dt className="text-ink-muted">Messages sent</dt>

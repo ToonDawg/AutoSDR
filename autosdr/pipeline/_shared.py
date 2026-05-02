@@ -11,7 +11,9 @@ obscured the dependency).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -28,6 +30,7 @@ from autosdr.models import (
     Workspace,
 )
 from autosdr.prompts import evaluation, generation
+from autosdr.push import fanout_hitl_push
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,54 @@ def pause_thread_for_hitl(
     thread.hitl_reason = reason
     thread.hitl_context = context
     thread.hitl_dismissed_at = None
+
+
+def _on_push_task_done(task: asyncio.Task) -> None:
+    """Swallow background-task exceptions so a flaky push gateway
+    can't crash the reply pipeline."""
+
+    try:
+        task.result()
+    except Exception:  # noqa: BLE001 — fire-and-forget; logged for ops grep
+        logger.exception("hitl push fanout task failed")
+
+
+def schedule_hitl_push(
+    *,
+    thread_id: str,
+    lead_name: str | None,
+    hitl_reason: str,
+) -> None:
+    """Best-effort fan-out of a HITL push notification.
+
+    Call this **after** ``session.flush()`` succeeds at every
+    :func:`pause_thread_for_hitl` site. The fanout itself runs as a
+    background task on the current event loop so a slow push gateway
+    can never block the HITL hot-path. If there is no running event
+    loop (sync test harness, replay scripts, CLI smoke tools), this
+    silently no-ops — the push is a notification surface, not the
+    source of truth.
+
+    Privacy posture: we hand :func:`autosdr.push.fanout_hitl_push` the
+    lead's full name on purpose; the payload builder strips it to the
+    first token before anything leaves the server. Keeping the strip
+    in one place (the push module) prevents accidental leakage from
+    new call sites.
+    """
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    coro = fanout_hitl_push(
+        thread_id=thread_id,
+        lead_name=lead_name,
+        hitl_reason=hitl_reason,
+        escalated_at=datetime.now(timezone.utc),
+    )
+    task = loop.create_task(coro, name="hitl-push-fanout")
+    task.add_done_callback(_on_push_task_done)
 
 
 def hitl_context_from_loop_failure(

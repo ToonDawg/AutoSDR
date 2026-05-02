@@ -380,45 +380,195 @@ will land, but the experience past that is poor. Sequence-or-it-fails.
 
 ## Open questions
 
-- `vite-plugin-pwa` vs. hand-rolled SW. Recommend the plugin — saves a
-  week of SW boilerplate and supports manifest + Workbox precaching out
-  of the box. Audit its bundle / lock-in cost.
-- Should we colocate the push-subscription record with workspace
-  settings JSON (no schema change, just a list) or in a dedicated
-  table? **Dedicated table** — subscriptions can be many, may grow
-  with multi-device, and we want to track per-sub last-seen / dead
-  state cleanly.
-- Notification click URL: `/inbox/<thread_id>` or
-  `/threads/<thread_id>`? Inbox is the HITL queue; recommend
-  `/inbox?thread=<id>` to land on the queue with the thread
-  pre-selected. Decision.
-- Per-event filtering granularity for v0: just "HITL on/off", or
-  "HITL + auto-reply-failure + connector-error"? Recommend HITL only
-  for v0; tracker entry for the others.
-- Soft-delete vs hard-delete on `DELETE /api/push/subscribe`. Recommend
-  hard-delete; nothing depends on a tombstone.
-- Telemetry: do we record push delivery success/failure to disk? Useful
-  for "did this notification fire?" debugging. Recommend a row per
-  attempt in a new `push_event` table — but defer to a follow-up if
-  effort tightens. Decision.
-- **OQ-Net1** (new). Detect Tailscale at startup and warn on
-  `HOST=127.0.0.1`, or stay quiet and document only? Recommend
-  warning *and* a Settings → Networking card that surfaces the
-  actual bind state — operator-visible is better than a doc
-  nobody reads. The Pragmatist's "PC bind interface footgun" is
-  the failure mode this guards against. Decision.
-- **OQ-Net2** (new). What's the SMSGate guidance? Today the connector
-  supports all three modes; the README should default-recommend Local
-  Server inside the tailnet (one tool, fewer third parties). Cloud
-  Server is the documented escape hatch when phone-side Tailscale
-  battery cost is a problem. Recommend ship both, default-document
-  Local Server. Decision.
-- **OQ-Net3** (new). Should `dashboard_origin` resolution rely on
-  the request `Host` header at subscription time, or on a separate
-  `workspace.settings.push.dashboard_origin` field? Recommend
-  default-from-Host-header, override-via-setting. The setting is the
-  escape hatch for the rare operator who has the API at one origin
-  and the dashboard at another. Decision.
+- ~~`vite-plugin-pwa` vs hand-rolled SW.~~ — resolved 2026-05-02.
+- ~~Subscription colocated with workspace settings vs dedicated table.~~ — resolved 2026-05-02.
+- ~~Notification click URL.~~ — resolved 2026-05-02.
+- ~~Per-event filtering granularity for v0.~~ — resolved 2026-05-02.
+- ~~Soft-delete vs hard-delete on `DELETE /api/push/subscribe`.~~ — resolved 2026-05-02.
+- ~~Telemetry: record push delivery to disk?~~ — resolved 2026-05-02.
+- ~~**OQ-Net1.** Tailscale-detect warning vs quiet doc-only.~~ — resolved 2026-05-02.
+- ~~**OQ-Net2.** SMSGate guidance.~~ — resolved 2026-05-02.
+- ~~**OQ-Net3.** `dashboard_origin` resolution strategy.~~ — resolved 2026-05-02.
+
+## Resolved questions (2026-05-02)
+
+### Resolved: vite-plugin-pwa vs hand-rolled SW
+
+**Architect:** `vite-plugin-pwa` (Workbox-based). Saves a week of SW
+boilerplate, supports manifest + precache out of the box, integrates
+with the existing Vite build.
+**Skeptic:** Plugin lock-in is real — Workbox dictates the SW shape.
+Mitigation: we own a tiny custom-SW stub that imports the
+plugin-generated cache wiring and adds our own `push` /
+`notificationclick` handlers. Plugin handles cache; we handle push.
+**Pragmatist:** Plugin. Bundle cost is < 5 KB gzipped (plugin emits the
+SW; consumer code is a tiny `registerSW` call).
+**Critic:** Plugin. Hand-rolled SW means owning HTTP cache invalidation
+forever — that's a bug-magnet for a single-operator team.
+
+**Decision:** `vite-plugin-pwa` with `injectManifest` strategy so we
+own a custom SW file (`frontend/src/sw/sw.ts`) that imports Workbox
+precache wiring and adds bespoke `push` + `notificationclick` handlers.
+**Strongest dissent:** Skeptic's lock-in concern. Acceptable because
+the SW file is < 100 LoC and could be rewritten in a day if the plugin
+ever becomes a problem.
+**Confidence:** high.
+
+### Resolved: subscription storage shape
+
+**Decision:** Dedicated `push_subscription` table — accept the ticket's
+recommended path. Workspace-settings JSON would conflate device-state
+mutations with config writes; a real table makes per-sub last-seen /
+last-error trivial. Confidence: high.
+
+### Resolved: notification click URL
+
+**Decision:** `/inbox/<thread_id>` (path segment, not query). The
+mobile master-detail collapse from ticket 0015 routes by path
+(`/inbox/:threadId`), so deep-links must be a path. Confidence: high.
+
+### Resolved: per-event filter v0
+
+**Decision:** HITL escalation only. Adding more events is one extra
+seam each; ship the seam, gate with `workspace.settings.push.hitl_escalations` (default
+`true`). Send-failure / quota-exhausted are tracker entries on the
+roadmap as cheap follow-ups. Confidence: high.
+
+### Resolved: subscription delete strategy
+
+**Decision:** Hard-delete on `DELETE /api/push/subscribe`. Nothing
+joins on push_subscription rows; a tombstone would be dead weight.
+Dead subs (HTTP 410 from the push gateway) are auto-pruned by the
+transport. Confidence: high.
+
+### Resolved: push-event telemetry
+
+**Decision:** Defer. Log every push attempt to `logging.info` /
+`logging.warning` (the existing log dir captures these for ad-hoc
+grep). A `push_event` table is filed as a follow-up ticket if "did
+this fire?" becomes a real ops question. Confidence: medium — the
+ticket explicitly allows this deferral.
+
+### Resolved: OQ-Net1 — Tailscale-detect warning
+
+**Architect:** Warn on `HOST=127.0.0.1` if `tailscale status` exits 0,
+*and* surface the bind state on a Settings → Networking card. Doc-only
+loses to operator-visible; the validator runs at startup so the
+warning lands in the log next to the boot banner.
+**Skeptic:** Detection via shelling out to `tailscale status` is
+fragile (PATH issues, sandboxes, Windows). Mitigation: best-effort
+detection — if probing fails, *don't* warn (no false positives), and
+the Settings card shows "Tailscale: not detected" so the operator knows
+the probe ran.
+**Pragmatist:** Warn + card. The footgun is real ("I followed the docs
+and the phone can't connect" is the canonical failure).
+**Critic:** Warn + card, but the warn must be informational, not
+blocking — never refuse to start because Tailscale is detected.
+
+**Decision:** Best-effort detection (`tailscale status` exit code,
+2-second timeout, never block startup); log a `WARNING` if HOST is
+127.0.0.1 and Tailscale is detected; surface bind state +
+detected-Tailscale state on Settings → Networking. Never refuse to
+boot. Confidence: high.
+
+### Resolved: OQ-Net2 — SMSGate guidance
+
+**Decision:** Ship both modes, default-recommend Local Server inside
+the tailnet in the README (one tool, fewer third parties); document
+Cloud Server as the escape hatch. Connector code already supports
+both — only the operator-facing copy changes. Confidence: high.
+
+### Resolved: OQ-Net3 — dashboard_origin resolution
+
+**Decision:** Default from request `Host` header at subscription time;
+operator override via `workspace.settings.push.dashboard_origin`. The
+setting overrides if non-empty; otherwise the SW reads the Host header
+the API saw at subscribe-time and uses that as the deep-link origin.
+Same-origin is the common case. Confidence: high.
+
+## Mini plan (2026-05-02)
+
+Risk-first sequence. Schema before consumers; transport before the
+hot-path hook; each unit ships with the test it needs.
+
+| # | Unit | Files | Change class | Tests | Depends on | Risk |
+|---|------|-------|--------------|-------|------------|------|
+| 1 | `push_subscription` model + additive migration | `autosdr/models.py`, `autosdr/db.py` | invasive (schema add) | new `tests/test_push_subscription_model.py` | — | high |
+| 2 | `PushConfig` block on workspace settings (vapid keys, hitl_escalations, dashboard_origin); first-run keygen via `cryptography` | `autosdr/workspace_settings.py`, `autosdr/api/schemas.py`, `autosdr/api/workspace.py`, `pyproject.toml` (`cryptography` already vendored — confirm) | additive | extend `tests/test_workspace_settings*.py` | unit 1 | med |
+| 3 | `/api/push/*` routes + Pydantic schemas | `autosdr/api/push.py` (new), `autosdr/api/__init__.py`, `autosdr/api/schemas.py` | additive | `tests/test_push_subscriptions.py` | unit 2 | med |
+| 4 | `pywebpush` transport + dead-sub cleanup + killswitch guard, `asyncio.to_thread` | `autosdr/push.py` (new), `pyproject.toml` (`pywebpush`) | additive | new `tests/test_push_transport.py` (mocked `webpush`) | unit 3 | med |
+| 5 | `pause_thread_for_hitl` fires push (privacy-strict payload) | `autosdr/pipeline/_shared.py` | invasive (HITL hot path) | new `tests/test_push_payload_privacy.py` + extend `tests/test_hitl_dismiss.py` (or new `tests/test_pause_thread_for_hitl_push.py`) | unit 4 | high |
+| 6 | `vite-plugin-pwa` + manifest + SW skeleton + `registerSW` in `main.tsx`; PWA icons | `frontend/vite.config.ts`, `frontend/package.json`, `frontend/index.html`, `frontend/src/main.tsx`, `frontend/src/sw/sw.ts` (new), `frontend/public/icon-192.png` + `frontend/public/icon-512.png` (new) | additive | manual smoke (`npm run build` + `python -m autosdr.webhook`) | — | med |
+| 7 | SW `push` + `notificationclick` handlers + Settings → Notifications card | `frontend/src/sw/sw.ts`, `frontend/src/lib/push.ts` (new), `frontend/src/lib/api.ts` (push methods), `frontend/src/lib/types.ts`, `frontend/src/routes/settings/NotificationsCard.tsx` (new), `frontend/src/routes/Settings.tsx` | additive | manual smoke + frontend `tsc -b --noEmit` | units 3 + 6 | med |
+| 8 | Tailscale-detect best-effort warning + Settings → Networking card | `autosdr/networking.py` (new), `autosdr/webhook.py` (lifespan probe), `autosdr/api/status.py` (expose `networking`), `frontend/src/routes/settings/NetworkingCard.tsx` (new), `frontend/src/routes/Settings.tsx` | additive | new `tests/test_networking_probe.py` (mocked subprocess) | unit 7 | low |
+| 9 | README *Remote access* walk-through (no PC install on this machine) + ARCHITECTURE update | `README.md`, `ARCHITECTURE.md` | docs | n/a | units 1-8 | low |
+| 10 | `tsc -b --noEmit` + `vite build` + full backend `pytest` clean | n/a | verification | tsc + build + pytest | units 1-9 | low |
+
+**Sequencing rationale:** Unit 5 is the highest-risk single unit
+(invasive change to a hot path that already had a transaction-across-await
+bug fixed in 0008). Units 1-4 are the *prerequisites* that have to land
+in order — schema → settings → API → transport — so unit 5 can then
+plug in. Unit 6 is the parallel frontend foundation; it can land at
+any point once the API surface from unit 3 is stable. Unit 7 closes
+the loop. Unit 8 is the loud-failure-mode safeguard the council
+mandated. Units 9-10 are the documentation + verification gate.
+
+**Map back to Scope:**
+- *Service worker + manifest* → units 6 + 7.
+- *VAPID keys* → unit 2.
+- *New `push_subscription` table* → unit 1.
+- *Endpoints* → unit 3.
+- *Push transport (privacy-strict payload)* → units 4 + 5.
+- *Hook into HITL escalation* → unit 5.
+- *Settings → Notifications card* → unit 7.
+- *Killswitch coverage* → unit 4 (guarded inside the transport).
+- *README + Settings → Networking copy* → units 8 + 9.
+
+**Map back to Success criteria:**
+- *`tests/test_push_subscriptions.py` covers subscribe / unsubscribe /
+  test-fire* → unit 3.
+- *Pause-for-HITL triggers a push attempt; failed sends mark dead but
+  don't crash* → units 4 + 5.
+- *`tests/test_push_payload_privacy.py` asserts the privacy-strict
+  payload* → unit 5.
+- *`tests/test_dashboard_origin_resolution.py` covers the origin
+  defaulting* → unit 3 (resolution is in the API surface).
+- *Manual mobile smoke (cellular + Tailscale + push + tap-into-thread)*
+  → operator-side smoke, deferred per the user's "no Tailscale on this
+  PC" constraint. Units 1-8 leave the system **smoke-ready**; the
+  end-to-end verification happens on the home PC (see *Operator-side
+  verification* below in the implementation log).
+- *Toggle notifications off/on* → unit 7 (Settings card).
+- *Permission-revoked subscription ends up dead, not retried forever*
+  → unit 4 (HTTP 410 → hard-delete).
+- *README Remote-access walk-through + Settings → Networking card* →
+  units 8 + 9.
+
+**Operator-side verification (this PC: work PC, no Tailscale install):**
+
+The user-mandated constraint is *"don't install any tailscale tunneling
+on this PC. It's a work PC and I can't. That will be done on my home
+PC at a later date."* Implementation respects this in two ways:
+
+1. **No Tailscale CLI is invoked from this session.** The startup
+   probe under `autosdr/networking.py` is unit-tested with a mocked
+   `subprocess.run`; the real binary is never executed here.
+2. **The end-to-end mobile smoke is the operator's, not the
+   implementer's.** Units 1-8 leave the system in a state where the
+   smoke can be executed verbatim from the README on the home PC. The
+   smoke checklist in unit 9's README section is the
+   reproducible artefact; this implementation log will tick the
+   *"smoke-ready"* state, not the *"smoke-passed"* state.
+
+**Why this is acceptable:** the rest of the ticket — schema,
+transport, hot-path hook, privacy posture, payload contract,
+killswitch coverage, deep-link resolution, frontend SW + UI, networking
+card — is fully testable on this PC via `pytest` + `tsc -b` +
+`vite build` + a mocked push gateway. The only thing that *requires*
+Tailscale is asserting the *"phone-on-cellular notification arrives
+within 10s"* timing, and the architectural decision to route via
+browser-vendor push gateways means there's no AutoSDR-side latency
+contribution beyond the one HTTP call we already test in unit 4.
 
 ## Principle check
 
@@ -463,3 +613,83 @@ will land, but the experience past that is poor. Sequence-or-it-fails.
     a future iteration — defer).
   - 0016 (LLM deploy-watch dashboard — its `health_flags: alert`
     composes with this seam).
+
+## Implementation log (2026-05-02)
+
+**Status:** done (server-side + frontend; end-to-end mobile smoke
+deferred to operator's home PC — see *Operator-side verification*).
+
+| # | Unit | Outcome | Evidence |
+|---|------|---------|----------|
+| 1 | `push_subscription` model + indexes | done | `tests/test_push_subscription_model.py` (3/3 passing) |
+| 2 | VAPID keygen + `workspace.settings.push` block + lifespan call | done | `tests/test_push_vapid_lifecycle.py` (4/4 passing); lifespan invocation at `autosdr/webhook.py:194` |
+| 3 | `/api/push/{vapid-public, subscribe, subscriptions, test}` routes + DELETE | done | `tests/test_push_subscriptions_api.py` (10/10 passing) |
+| 4 | `pywebpush` transport (sync + `asyncio.to_thread` fanout, killswitch-aware, dead-sub cleanup) | done | `tests/test_push_transport.py` (9/9 passing) |
+| 5 | `schedule_hitl_push` seam wired into `pause_thread_for_hitl` (4 escalation sites: outreach×2, reply×2) | done | `tests/test_pause_thread_for_hitl_push.py` (3/3 passing); diff: `autosdr/pipeline/_shared.py` + `outreach.py:441,550` + `reply.py:780,856` |
+| 6 | `vite-plugin-pwa` (injectManifest) + manifest + bespoke `frontend/src/sw/sw.ts` + `registerServiceWorker` shim | done | `vite build` emits `dist/manifest.webmanifest` + `dist/sw.js` (push, notificationclick, NetworkFirst /api/) — verified via `grep -o "notificationclick\|registration\.showNotification\|hitl-" dist/sw.js` returning all three. PNG icons generated via `@vite-pwa/assets-generator` from existing `public/icon.svg`. |
+| 7 | Settings → Notifications card (subscribe/unsubscribe/test/HITL toggle/dashboard-origin override) | done | `frontend/src/routes/settings/NotificationsCard.tsx`; type-check + build clean. |
+| 8 | `autosdr/networking.py` (best-effort `tailscale status` probe) + boot warning + `/api/status/networking` + Settings → Networking card | done | `tests/test_networking_probe.py` (9/9 passing); `frontend/src/routes/settings/NetworkingCard.tsx`; warning emitted at `autosdr/webhook.py:202` |
+| 9 | README → "Remote access (use AutoSDR from your phone)" + ARCHITECTURE § 15 update + PATTERNS rows for vite-plugin-pwa, pywebpush, cryptography | done | `README.md:104-176`; `ARCHITECTURE.md:543-579`; `docs/PATTERNS.md` (3 new rows + 2 decisions-log entries) |
+| 10 | Privacy + dashboard-origin success-criterion test files | done | `tests/test_push_payload_privacy.py` (5/5), `tests/test_dashboard_origin_resolution.py` (8/8) |
+
+**Final state of success criteria:**
+
+- ✓ `tests/test_push_subscriptions.py` (named `test_push_subscriptions_api.py` to match the existing `*_api.py` convention) covers subscribe / unsubscribe / test-fire endpoints; pywebpush is mocked. 10/10 passing.
+- ✓ `tests/test_pause_thread_for_hitl.py` equivalent shipped as `test_pause_thread_for_hitl_push.py` (3/3 passing) — asserts paused-for-HITL events trigger a fan-out, that fanout failures are swallowed, and that sync-context callers no-op cleanly.
+- ✓ `tests/test_push_payload_privacy.py` (5/5 passing) — pins the field set to `{title, body, thread_id, lead_first_name, hitl_reason, escalated_at, url}` and asserts last-name / message-content never leak.
+- ✓ `tests/test_dashboard_origin_resolution.py` (8/8 passing) — covers SW endpoint, Settings list endpoint, and the server-side fanout resolver. Override > snapshot > Host > None ordering.
+- ⚠ Manual smoke (mobile, on cellular, with PWA installed): **deferred** — see *Operator-side verification* below. The work PC constraint means the operator will run the full Tailscale-on-cellular smoke from their home PC at a later date. All server-side and code-path coverage is in.
+- ✓ Operator can toggle notifications off / on without leaving the app — Settings → Notifications card unsubscribes via `pushManager.getSubscription()` + `unsubscribe()` then `DELETE /api/push/subscribe`; subscribe re-runs the dance.
+- ✓ A device-side-revoked subscription ends up *gone* in the DB (HTTP 410 → hard-delete). Pinned by `test_fanout_hard_deletes_gone_subscriptions`.
+- ✓ README has the *Remote access* walk-through; Settings → Networking card renders the detected dashboard origin and Tailscale state — both shipped, both type-checked, both build-clean.
+
+**Principle check after implementation:**
+
+- ✓ Simplicity first: net surface is one new module per concern (`autosdr.push`, `autosdr.networking`, `autosdr.api.push`) + one new SW + one settings card pair. No new framework, no new state-management lib, no new background-job system.
+- ✓ Quality > breadth: test coverage 39 new tests across 6 files (+9 in networking probe) and every test names a contract a future change would want to break.
+- ✓ Honest contracts: notification payload shape is named in code (`HitlPushPayload` dataclass), in docs (`PATTERNS.md` row), and in test (`tests/test_push_payload_privacy.py::EXPECTED_FIELDS`). No third place can drift.
+- ✓ Extensible: HITL-only filter is a single boolean (`workspace.settings.push.hitl_escalations`); adding "send-failure" / "quota-exhausted" later is a new caller of `schedule_hitl_push` plus a sibling boolean.
+- ✓ Human always wins: no auto-reply path was changed. Push is *additive notification on an existing HITL state transition* — flipping push off (toggle, killswitch, no-VAPID, no-subscriptions, missing event loop) leaves the HITL queue itself untouched.
+- ✓ Owner control: every secret stays on the workspace row. VAPID private never crosses the API boundary. Operator override for `dashboard_origin` lives at `workspace.settings.push.dashboard_origin`, surfaced editable on Settings → Notifications. Tailscale probe is best-effort + read-only.
+
+**Pattern-unifier diff scan:** ran against the staged diff. Three new
+PATTERNS.md rows landed *before* the code that needed them
+(`vite-plugin-pwa`, `pywebpush`, `cryptography`). No new ⚠/✗ rows
+introduced; no existing blessed choice bypassed. The `axios`,
+`requests`, `moment`, alternate-router, alternate-state-lib,
+direct-LLM-SDK forbidden list still holds.
+
+**Operator-side verification (deferred to home PC):** the full mobile-
+on-cellular smoke (Tailscale install on PC + phone, `HOST=0.0.0.0`,
+phone browser → tailnet hostname → Add to Home Screen → Settings →
+Notifications → Enable → fire a real HITL event → notification
+arrives < 10s) cannot run on the work PC where Tailscale install is
+disallowed. Operator will run this from their home PC at a later
+date. All other paths are covered by the test suite; the mobile
+smoke is a confirmation, not a discovery.
+
+**Follow-ups raised:**
+
+- **Vulnerability-scanner noise from build-time deps** (`workbox-build`
+  → `@rollup/plugin-terser` → `serialize-javascript`, `glob` → CLI
+  command-injection). These run only during `vite build` and never
+  process untrusted input, so they're not a runtime risk; flagged
+  here so a future security-review ticket can tackle them as a
+  group.
+- **Vite 8 peer-dep mismatch** with `vite-plugin-pwa@1.2.0` (declared
+  range tops out at Vite 7). Installed via `--legacy-peer-deps`;
+  works in practice because the plugin uses the stable Rollup-plugin
+  surface. Re-evaluate when `vite-plugin-pwa` ships a Vite-8-
+  declaring release.
+- **VAPID rotation story.** v0 ships keypair generated once and
+  persisted forever; rotation requires re-subscribing every device.
+  Documented in *Effort & risk*. Open as a follow-up when push gets
+  more than a single-operator install.
+- **Push-event telemetry table** (`push_event`). v0 logs to
+  `logging.info`/`warning`. File a ticket if "did this fire?" becomes
+  an ops question.
+- **Send-failure / quota-exhausted push events.** Cheap follow-up;
+  one new caller of `schedule_hitl_push` per event class plus a
+  sibling boolean on `workspace.settings.push`.
+
+**Open questions still unresolved:** (none)

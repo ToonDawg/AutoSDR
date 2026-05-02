@@ -5,6 +5,7 @@ import { ChevronLeft, ChevronRight, Database, Upload } from 'lucide-react';
 import { api } from '@/lib/api';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
+import { CardList, CardListItem } from '@/components/ui/CardList';
 import { FilterTabs, type FilterOption } from '@/components/ui/FilterTabs';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
@@ -147,17 +148,18 @@ export function Leads() {
         title="Leads"
         description="Import normalises phone numbers and flags landlines / toll-free numbers up front — only mobiles get messaged."
         right={
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 md:gap-3 flex-wrap md:flex-nowrap w-full md:w-auto">
             <SearchInput
               value={qDraft}
               onChange={handleSearchChange}
               placeholder="Search name, category, phone…"
-              className="w-72"
+              className="w-full md:w-72"
             />
-            <Link to="/leads/import">
+            <Link to="/leads/import" className="flex-1 md:flex-none">
               <Button
                 variant="primary"
                 iconLeft={<Upload className="h-4 w-4" strokeWidth={1.5} />}
+                className="w-full md:w-auto"
               >
                 Import
               </Button>
@@ -170,8 +172,9 @@ export function Leads() {
                 setEnrichResult(null);
                 setEnrichOpen(true);
               }}
+              className="flex-1 md:flex-none"
             >
-              Enrich stale leads
+              <span className="md:inline">Enrich stale leads</span>
             </Button>
           </div>
         }
@@ -203,7 +206,7 @@ export function Leads() {
         {isFetching && !isLoading && <span className="text-ink-faint">Refreshing…</span>}
       </div>
 
-      <div className="paper-card">
+      <div className="paper-card hidden md:block">
         <table className="t-table">
           <thead>
             <tr>
@@ -288,6 +291,64 @@ export function Leads() {
           <div className="py-14 text-center text-ink-muted text-sm">Loading leads…</div>
         )}
       </div>
+
+      <CardList className="md:hidden">
+        {leads.map((l) => (
+          <CardListItem
+            key={l.id}
+            to={`/leads/${l.id}`}
+            className={cn(l.status === LeadStatus.SKIPPED && 'stripes')}
+            title={
+              <span className="flex items-center gap-2">
+                <span className="font-mono text-[10px] text-ink-faint tabular-nums shrink-0">
+                  {String(l.import_order).padStart(3, '0')}
+                </span>
+                <span className="truncate">{l.name ?? '—'}</span>
+              </span>
+            }
+            description={
+              <>
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                  {l.contact_uri && (
+                    <span className="font-mono text-ink">{formatPhone(l.contact_uri)}</span>
+                  )}
+                  {l.category && <span>{l.category}</span>}
+                </div>
+                {l.skip_reason && l.skip_reason !== 'do_not_contact' && (
+                  <div className="text-oxblood mt-0.5">{formatSkipReason(l.skip_reason)}</div>
+                )}
+              </>
+            }
+            badges={
+              <>
+                <Badge tone={STATUS_TONE[l.status]} dot>
+                  {LEAD_STATUS_LABEL[l.status]}
+                </Badge>
+                {l.do_not_contact_at && (
+                  <Badge tone="oxblood" dot>
+                    Opted out
+                  </Badge>
+                )}
+                <PriorityBadge isPriority={l.is_priority} reason={l.priority_reason} />
+                <SocialProfileTag platform={l.is_social_website} />
+              </>
+            }
+            trailing={
+              <span className="font-mono text-[10px] text-ink-muted">{relTime(l.created_at)}</span>
+            }
+          />
+        ))}
+        {leads.length === 0 && !isLoading && (
+          <li className="paper-card py-10 text-center text-ink-muted text-sm">
+            {q || filter !== 'all'
+              ? 'No leads match this filter.'
+              : 'No leads yet — import a file to get started.'}
+          </li>
+        )}
+        {isLoading && leads.length === 0 && (
+          <li className="paper-card py-10 text-center text-ink-muted text-sm">Loading leads…</li>
+        )}
+      </CardList>
 
       {total > PAGE_SIZE && (
         <nav className="flex items-center justify-between pt-2">

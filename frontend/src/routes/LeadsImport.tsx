@@ -130,7 +130,7 @@ export function LeadsImport() {
             />
           </label>
 
-          <div className="grid grid-cols-3 gap-4 text-sm">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
             <Rule
               title="E.164 phones"
               body="All phones parsed to international format. Unparseable numbers still import but get skipped."
@@ -185,7 +185,7 @@ export function LeadsImport() {
 
           <SocialWebsiteCallout hosts={preview.social_website_hosts} />
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="border border-forest bg-forest-soft p-4">
               <div className="label text-forest mb-1">Will import</div>
               <div className="text-3xl font-medium text-forest tabular-nums">
@@ -231,7 +231,7 @@ export function LeadsImport() {
                 {preview.sample.length} of {preview.total_rows}
               </span>
             </div>
-            <div className="paper-card">
+            <div className="paper-card hidden md:block">
               <table className="t-table">
                 <thead>
                   <tr>
@@ -265,13 +265,45 @@ export function LeadsImport() {
                 </tbody>
               </table>
             </div>
+            <ul className="md:hidden flex flex-col gap-2">
+              {preview.sample.map((s, i) => (
+                <li
+                  key={i}
+                  className={cn(
+                    'paper-card px-4 py-3 flex flex-col gap-1',
+                    s.skip_reason && 'stripes',
+                  )}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-sm font-medium text-ink truncate">{s.name}</span>
+                    {s.skip_reason ? (
+                      <Badge tone="oxblood">skip</Badge>
+                    ) : (
+                      <Badge tone="forest">import</Badge>
+                    )}
+                  </div>
+                  <div className="font-mono text-xs text-ink-muted">
+                    {s.phone}
+                    {s.normalised_phone && s.normalised_phone !== s.phone && (
+                      <>
+                        {' → '}
+                        <span className="text-ink">{formatPhone(s.normalised_phone)}</span>
+                      </>
+                    )}
+                  </div>
+                  <div className="font-mono text-[10px] tracking-[0.14em] uppercase text-ink-muted">
+                    {CONTACT_TYPE_LABEL[s.contact_type]}
+                  </div>
+                </li>
+              ))}
+            </ul>
           </div>
 
-          <div className="flex items-center justify-between pt-4 border-t border-rule">
+          <div className="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 pt-4 border-t border-rule">
             <div className="text-sm text-ink-muted">
               Ready to commit <span className="text-ink">{preview.would_import}</span> leads.
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 self-end sm:self-auto">
               <Button
                 variant="ghost"
                 onClick={() => handleFile(null)}
@@ -472,7 +504,7 @@ function ColumnMappingTable({
           Dropping applies to this import only — existing records keep what they have.
         </span>
       </p>
-      <div className="paper-card">
+      <div className="paper-card hidden md:block">
         <table className="t-table">
           <thead>
             <tr>
@@ -527,6 +559,49 @@ function ColumnMappingTable({
           </tbody>
         </table>
       </div>
+
+      <ul className="md:hidden flex flex-col gap-2">
+        {columns.map((col) => (
+          <li key={col.name} className="paper-card px-4 py-3 flex flex-col gap-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-mono text-xs text-ink truncate">{col.name}</span>
+              {col.suggestion_confidence === 'none' ? (
+                <Badge tone="neutral">no guess</Badge>
+              ) : (
+                <span title={col.suggestion_reason}>
+                  <Badge tone={CONFIDENCE_TONE[col.suggestion_confidence]}>
+                    {col.suggestion_confidence}
+                  </Badge>
+                </span>
+              )}
+            </div>
+            <div
+              className="text-xs text-ink-muted line-clamp-2"
+              title={formatSampleTitle(col.sample_values)}
+            >
+              {formatSampleInline(col.sample_values)}
+            </div>
+            <label className="flex flex-col gap-1">
+              <span className="label">Map to</span>
+              <select
+                className="w-full bg-paper border border-rule-strong px-2 py-2 text-sm font-mono text-ink focus:outline-none focus:border-ink min-h-[44px]"
+                value={choices[col.name] ?? 'raw_only'}
+                onChange={(e) =>
+                  onChange(col.name, e.target.value as MappingChoice)
+                }
+              >
+                {CORE_FIELD_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    → {opt.label}
+                  </option>
+                ))}
+                <option value="raw_only">Keep in raw_data only</option>
+                <option value="drop">Drop entirely</option>
+              </select>
+            </label>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

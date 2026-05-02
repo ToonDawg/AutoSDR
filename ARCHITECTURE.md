@@ -422,7 +422,65 @@ loads `certifi` roots and tolerates corporate MITM certificates. This is
 pragmatic rather than elegant, but it's necessary to run on fresh Homebrew
 Python or behind a proxy.
 
-## 12. Kill switch and test modes
+## 12. Database concurrency rules
+
+SQLite-WAL serialises writers — only one BEGIN-IMMEDIATE transaction at
+a time can hold the writer lock. Combined with FastAPI's single-process
+asyncio model, this gives us a sharp rule that the rest of the
+pipeline architecture is built around:
+
+> **A `session_scope()` (or `db_session()`) block must never contain an
+> `await`.** Hold the writer lock for synchronous work only — read,
+> commit, release — then do the long-running async work, then open a
+> new session for the write phase.
+
+Why this matters: pre-ticket-0008 the reply pipeline held
+`session_scope()` across `await complete_text(...)` for the full
+classify → generate → evaluate sequence (30-60 seconds end-to-end). The
+LLM-call audit log also uses SQLite, and its `INSERT INTO llm_call`
+queued behind the outer transaction's writer lock — waiting up to the
+configured `PRAGMA busy_timeout`. With `busy_timeout=120000` (the old
+value) a competing writer could stall for two whole minutes, so
+`/api/status` and any other DB-touching handler appeared unresponsive
+while a pipeline was running. The audit log itself sometimes lost rows
+when the timeout actually fired.
+
+The fix has three parts:
+
+1. **Phased pipelines.** The reply pipeline (and any analogue we add)
+   is split into Phase 1 *read+persist-inbound*, Phase 2 *async LLM
+   work without a session*, Phase 3 *write outcome*. The driving entry
+   point in `autosdr/pipeline/reply.py::process_incoming_message`
+   shows the pattern. Each phase opens its own short-lived
+   `session_scope()`.
+2. **Audit-log writes happen on the loop's executor.** The LLM
+   wrapper's `_log_call` and `_update_parsed_json` dispatch their
+   SQLite work via `loop.run_in_executor(None, ...)` and `await` the
+   result. Awaiting (rather than blocking) frees the event loop to
+   service other coroutines while the executor thread waits on the
+   writer lock.
+3. **`busy_timeout` dropped to 5 000 ms.** Pre-fix we tolerated long
+   waits because they were normal; post-fix a 5-second wait is a
+   genuine writer-on-writer contention bug, and we want it to surface
+   loudly rather than be patiently absorbed.
+
+This rule is enforced by an AST lint test
+(`tests/test_no_await_in_session.py`) that walks every Python file
+under `autosdr/` and fails if it finds an `await` anywhere inside a
+`with session_scope():` or `with db_session():` block. The test ships
+with an explicit allowlist for the three legacy paths (scheduler,
+follow-up, send-draft) we haven't refactored yet — each entry has a
+sentence on why and a follow-up ticket reference. New violations fail
+CI.
+
+The runtime guarantee is asserted by
+`tests/test_reply_pipeline_concurrency.py`: while a pipeline run sits
+inside an LLM `await`, a competing writer (e.g. an `UnmatchedWebhook`
+INSERT from a different request) completes well under 500 ms, and two
+concurrent inbound calls finish in roughly the duration of one — not
+two.
+
+## 13. Kill switch and test modes
 
 The kill switch has three layers, deliberately redundant because halting
 processing in-flight matters more than elegance:
@@ -447,7 +505,7 @@ Two orthogonal test modes let the owner rehearse safely:
   owner's. Both modes compose: dry-run with override writes to the outbox
   with the override number as the recipient.
 
-## 13. Observability
+## 14. Observability
 
 Three artefacts are written for every run so the owner can review what
 happened:
@@ -477,12 +535,43 @@ messaged") are computed at the call site so the contract can't lie.
 query backs the `CampaignTimeseriesPanel` viz on `/CampaignDetail` —
 the FastAPI handler is the single source of truth for the funnel maths.
 
-## 14. What's out of scope for the POC
+## 15. What's out of scope for the POC
 
 The POC intentionally defers these pieces to v1, on the assumption that
 the AI loop is the risky part and the rest is well-understood work:
 
-- A dedicated mobile app (the operator console is a laptop-first SPA).
+- A dedicated mobile app. The operator console is an installable PWA
+  (`vite-plugin-pwa`'s `injectManifest` strategy generates a custom
+  service worker at `frontend/src/sw/sw.ts`; the plugin emits the
+  manifest at `dist/manifest.webmanifest`). The same SPA adapts to
+  mobile: an off-canvas drawer replaces the desktop sidebar below the
+  `md:` (768 px) breakpoint, list routes (Leads, Threads, Logs, Inbox,
+  Scans) fall back to a `CardList` row primitive, and `ThreadDetail`
+  stacks vertically with a sticky `ComposeBar` and a collapsed
+  `<details>` LLM trail. Touch targets are bumped to ≥ 44 px on mobile
+  and inputs render at 16 px font size to suppress iOS Safari's
+  auto-zoom.
+- A self-hosted push relay. Web Push for HITL escalations
+  (`autosdr.push`) uses the browser-vendor gateways (FCM, APNS via
+  Apple's push gateway, Mozilla autopush). The workspace owns its
+  VAPID keypair (`autosdr.push.ensure_vapid_keys`, generated on first
+  boot, persisted to `workspace.settings.push.vapid_*`). The HITL
+  hook (`autosdr.pipeline._shared.schedule_hitl_push`) fires after
+  every `pause_thread_for_hitl` flush, fan-outs run via
+  `asyncio.to_thread` so a slow gateway never blocks the reply
+  pipeline, and HTTP 404 / 410 from the gateway hard-deletes the dead
+  subscription. Notification payloads are privacy-strict by design —
+  only `{title, body, thread_id, lead_first_name, hitl_reason,
+  escalated_at, url}` ever leaves the server, pinned by
+  `tests/test_push_transport.py`.
+- Public dashboard exposure. AutoSDR is designed to live on a private
+  tailnet. The `/api/status/networking` endpoint reports the
+  configured `HOST`, the Tailscale probe state, and the resolved
+  `dashboard_origin` so the operator can spot the *PC-bind-interface
+  footgun* (binding to `127.0.0.1` while the phone is on cellular)
+  without leaving Settings → Networking. The detection runs once at
+  boot too — `autosdr.networking.log_host_bind_warning` emits a
+  single warning if `HOST=127.0.0.1` and `tailscale status` exits 0.
 - Swipe-based tone calibration (tone is provided verbatim at `init`
   time).
 - A business-data extraction agent (the raw business description is used

@@ -13,7 +13,6 @@ Two endpoints:
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -22,9 +21,9 @@ from autosdr import killswitch
 from autosdr.api.deps import db_session
 from autosdr.config import get_settings
 from autosdr.connectors import get_connector
-from autosdr.connectors.base import BaseConnector
+from autosdr.connectors.base import BaseConnector, IncomingMessage
 from autosdr.connectors.file_connector import FileConnector
-from autosdr.models import Workspace
+from autosdr.models import PausedInbound, Workspace
 from autosdr.pipeline import process_incoming_message
 
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
@@ -37,13 +36,58 @@ def _resolve_workspace_id() -> str | None:
         return workspace.id if workspace else None
 
 
+def _persist_paused_inbound(
+    *,
+    workspace_id: str,
+    connector_type: str,
+    incoming: IncomingMessage,
+) -> None:
+    """Stash one inbound in the durable replay queue.
+
+    Runs in its own short ``db_session()`` so it never holds the
+    writer lock across an ``await`` (ticket 0008's contract). The
+    INSERT is small (single row, no joins) and competes only with the
+    audit-log writer — sub-millisecond in practice.
+    """
+
+    with db_session() as session:
+        session.add(
+            PausedInbound(
+                workspace_id=workspace_id,
+                connector_type=connector_type,
+                contact_uri=incoming.contact_uri,
+                content=incoming.content,
+                provider_message_id=incoming.provider_message_id,
+                raw_payload=dict(incoming.raw_payload) if incoming.raw_payload else None,
+            )
+        )
+
+
 async def _process_in_background(
-    *, connector: BaseConnector, workspace_id: str, incoming: Any
+    *, connector: BaseConnector, workspace_id: str, incoming: IncomingMessage
 ) -> None:
     """Background task wrapper — swallows exceptions so the task runner stays alive."""
 
     if killswitch.is_paused():
-        logger.info("dropping inbound while paused: %s", incoming.contact_uri)
+        # Pre-ticket-0009 we silently dropped here; the operator's "I
+        # always see every reply" contract was violated and STOP/UNSUB
+        # keywords arriving during pause were lost (compliance bug).
+        # Now we persist to ``paused_inbound`` and let the resume path
+        # replay through ``process_incoming_message``.
+        try:
+            _persist_paused_inbound(
+                workspace_id=workspace_id,
+                connector_type=connector.connector_type,
+                incoming=incoming,
+            )
+        except Exception:
+            logger.exception(
+                "failed to persist paused inbound for %s", incoming.contact_uri
+            )
+            return
+        logger.info(
+            "killswitch on; queued inbound for replay: %s", incoming.contact_uri
+        )
         return
     try:
         result = await process_incoming_message(

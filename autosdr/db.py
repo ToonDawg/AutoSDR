@@ -74,14 +74,17 @@ def get_engine() -> Engine:
                 # Write-ahead logging reduces reader/writer contention between
                 # the scheduler and the webhook background task.
                 cur.execute("PRAGMA journal_mode=WAL")
-                # The scheduler holds a session open for the full duration of
-                # a pipeline run (several LLM calls, often 30-60s end to end),
-                # while the LLM client opens short-lived sessions to persist
-                # each llm_call row. SQLite-WAL still serialises writers, so
-                # the inner session has to wait for the outer one to commit.
-                # A 2-minute busy_timeout covers realistic pipeline durations
-                # without failing the secondary writers.
-                cur.execute("PRAGMA busy_timeout=120000")
+                # 5-second busy_timeout (down from 120s pre-ticket-0008).
+                # We used to hold an outer ``session_scope()`` across a full
+                # LLM pipeline (30-60s), so secondary writers (audit log)
+                # had to wait that long for the outer commit. Ticket 0008
+                # split every pipeline path into read → await → write
+                # phases — no session is held across an LLM ``await`` —
+                # and the AST lint test in ``tests/test_no_await_in_session
+                # .py`` keeps it that way. A real 5s wait now means a
+                # genuine writer-on-writer contention bug worth surfacing,
+                # not a pipeline patiently waiting its turn.
+                cur.execute("PRAGMA busy_timeout=5000")
                 cur.close()
 
     return _engine

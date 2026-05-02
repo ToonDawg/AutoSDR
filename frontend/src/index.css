@@ -110,9 +110,22 @@ body {
 }
 
 /* Every route's outer wrapper. Leave the gap off — each page picks its
-   own cadence via gap-4/5/6/8. */
-.page { @apply px-8 py-8 max-w-6xl mx-auto flex flex-col; }
-.page-narrow { @apply px-8 py-8 max-w-5xl mx-auto flex flex-col; }
+   own cadence via gap-4/5/6/8. The padding is tighter on mobile so a
+   320 px viewport keeps real estate for content; widescreen padding
+   kicks in at the `md:` breakpoint. */
+.page { @apply px-4 md:px-8 py-6 md:py-8 max-w-6xl mx-auto flex flex-col w-full; }
+.page-narrow { @apply px-4 md:px-8 py-6 md:py-8 max-w-5xl mx-auto flex flex-col w-full; }
+
+/* iOS Safari auto-zooms any input whose font-size is < 16 px on focus.
+   Bump everything to 16 px below the `md:` breakpoint — desktop layouts
+   keep their tighter sizing. The class-level 14 px (`text-sm`) form
+   styles still apply elsewhere on the page; this rule only targets the
+   focusable elements iOS actually zooms on. */
+@media (max-width: 767px) {
+  input, textarea, select {
+    font-size: 16px;
+  }
+}
 
 :where(button, a, input, textarea, select, [role='button']):focus-visible {
   outline: 1.5px solid var(--color-rust);

@@ -178,6 +178,28 @@ DEFAULT_WORKSPACE_SETTINGS: dict = {
     "rehearsal": {
         "override_to": None,
     },
+
+    # Web Push notifications for HITL escalations (ticket 0005).
+    #
+    # ``vapid_public`` / ``vapid_private`` are generated on first boot
+    # (see :mod:`autosdr.push`); never expose ``vapid_private`` via the
+    # API. ``vapid_subject`` is the ``mailto:``-or-URL contact handed to
+    # the push gateway as RFC 8292 voluntary application identification.
+    #
+    # ``hitl_escalations`` is the per-event v0 toggle — additional event
+    # types (send-failed, quota-exhausted, deploy-watch alerts) are filed
+    # as follow-up tickets and would each get their own boolean here.
+    #
+    # ``dashboard_origin`` overrides the deep-link origin baked into push
+    # payloads. ``None`` means "use the request Host the API saw at
+    # subscribe-time" (the same-origin default).
+    "push": {
+        "vapid_public": None,
+        "vapid_private": None,
+        "vapid_subject": "mailto:autosdr@localhost",
+        "hitl_escalations": True,
+        "dashboard_origin": None,
+    },
 }
 
 

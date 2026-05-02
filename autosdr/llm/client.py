@@ -95,6 +95,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -265,7 +266,90 @@ def _truncate(text: str | None, limit: int) -> str | None:
     return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
 
 
-def _log_call(
+def _new_audit_id() -> str:
+    """Generate the ``LlmCall.id`` synchronously so callers don't wait."""
+
+    return str(uuid.uuid4())
+
+
+def _persist_audit_row_sync(payload: dict[str, Any]) -> None:
+    """Synchronous body that runs on the loop's default executor.
+
+    Persists one ``LlmCall`` row + appends one JSONL record. Best-effort:
+    never raises; logs and returns on any failure. The ``payload`` dict
+    is built synchronously by :func:`_log_call` so this function only
+    touches data it owns — no ORM instances, no shared mutable state.
+    """
+
+    settings = get_settings()
+    if not settings.llm_log_enabled:
+        return
+
+    try:
+        with session_scope() as session:
+            row = LlmCall(
+                id=payload["id"],
+                workspace_id=payload["workspace_id"],
+                campaign_id=payload["campaign_id"],
+                thread_id=payload["thread_id"],
+                lead_id=payload["lead_id"],
+                purpose=payload["purpose"],
+                model=payload["model"],
+                prompt_version=payload["prompt_version"],
+                temperature=payload["temperature"],
+                attempt=payload["attempt"],
+                response_format=payload["response_format"],
+                system_prompt=payload["system_prompt"],
+                user_prompt=payload["user_prompt"],
+                response_text=payload["response_text"],
+                response_parsed=payload["response_parsed"],
+                tokens_in=payload["tokens_in"],
+                tokens_out=payload["tokens_out"],
+                cost_usd=payload["cost_usd"],
+                latency_ms=payload["latency_ms"],
+                error=payload["error"],
+            )
+            session.add(row)
+            session.flush()
+    except Exception:  # pragma: no cover - persistence is best-effort
+        logger.exception("failed to persist LLM call to database")
+
+    try:
+        log_dir: Path = settings.log_dir
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = payload["created_at"]
+        path = log_dir / f"llm-{stamp.strftime('%Y%m%d')}.jsonl"
+        record = {
+            "id": payload["id"],
+            "created_at": stamp.isoformat(),
+            "purpose": payload["purpose"],
+            "workspace_id": payload["workspace_id"],
+            "campaign_id": payload["campaign_id"],
+            "thread_id": payload["thread_id"],
+            "lead_id": payload["lead_id"],
+            "model": payload["model"],
+            "prompt_version": payload["prompt_version"],
+            "temperature": payload["temperature"],
+            "attempt": payload["attempt"],
+            "response_format": payload["response_format"],
+            "system_prompt": payload["system_prompt"],
+            "user_prompt": payload["user_prompt"],
+            "response_text": payload["response_text"],
+            "response_parsed": payload["response_parsed"],
+            "tokens_in": payload["tokens_in"],
+            "tokens_out": payload["tokens_out"],
+            "cost_usd": payload["cost_usd"],
+            "latency_ms": payload["latency_ms"],
+            "error": payload["error"],
+        }
+        with _LOG_FILE_LOCK:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # pragma: no cover - best effort
+        logger.exception("failed to write LLM call to JSONL log")
+
+
+async def _log_call(
     *,
     context: LlmCallContext,
     model: str,
@@ -282,7 +366,23 @@ def _log_call(
     latency_ms: int,
     error: str | None,
 ) -> str | None:
-    """Persist one LLM call to DB + JSONL. Best-effort; never raises."""
+    """Persist one LLM call to DB + JSONL on the loop's executor.
+
+    Pre-0008 this function held the asyncio event-loop thread for the
+    full duration of a SQLite INSERT. When the caller's transaction was
+    fighting for the writer lock that wait could be the full
+    ``PRAGMA busy_timeout`` — starving every other coroutine on the
+    loop. Post-0008 the synchronous body
+    (:func:`_persist_audit_row_sync`) runs on
+    ``loop.run_in_executor(None, ...)`` so the loop can service other
+    tasks while SQLite is busy, then we ``await`` the future so the
+    audit row is observable to the caller before they continue.
+    Awaiting (not blocking) is what frees the loop here.
+
+    Sync-context safety: when called outside an event loop (CLI
+    scripts, the rare unit test that drives the function directly) we
+    fall back to a synchronous persist.
+    """
 
     settings = get_settings()
     if not settings.llm_log_enabled:
@@ -302,71 +402,41 @@ def _log_call(
     user_prompt = _truncate(user_prompt, limit)
     response_text_trunc = _truncate(response_text, limit)
 
-    call_id: str | None = None
+    call_id = _new_audit_id()
+    payload: dict[str, Any] = {
+        "id": call_id,
+        "created_at": datetime.now(tz=timezone.utc),
+        "workspace_id": context.workspace_id,
+        "campaign_id": context.campaign_id,
+        "thread_id": context.thread_id,
+        "lead_id": context.lead_id,
+        "purpose": context.purpose,
+        "model": model,
+        "prompt_version": prompt_version,
+        "temperature": temperature,
+        "attempt": attempt,
+        "response_format": response_format,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "response_text": response_text_trunc,
+        "response_parsed": response_parsed,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_usd": cost_usd,
+        "latency_ms": latency_ms,
+        "error": error,
+    }
 
     try:
-        with session_scope() as session:
-            row = LlmCall(
-                workspace_id=context.workspace_id,
-                campaign_id=context.campaign_id,
-                thread_id=context.thread_id,
-                lead_id=context.lead_id,
-                purpose=context.purpose,
-                model=model,
-                prompt_version=prompt_version,
-                temperature=temperature,
-                attempt=attempt,
-                response_format=response_format,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_text=response_text_trunc,
-                response_parsed=response_parsed,
-                tokens_in=tokens_in,
-                tokens_out=tokens_out,
-                cost_usd=cost_usd,
-                latency_ms=latency_ms,
-                error=error,
-            )
-            session.add(row)
-            session.flush()
-            call_id = row.id
-    except Exception:  # pragma: no cover - persistence is best-effort
-        logger.exception("failed to persist LLM call to database")
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _persist_audit_row_sync(payload)
+        return call_id
 
     try:
-        log_dir: Path = settings.log_dir
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(tz=timezone.utc)
-        path = log_dir / f"llm-{stamp.strftime('%Y%m%d')}.jsonl"
-        record = {
-            "id": call_id,
-            "created_at": stamp.isoformat(),
-            "purpose": context.purpose,
-            "workspace_id": context.workspace_id,
-            "campaign_id": context.campaign_id,
-            "thread_id": context.thread_id,
-            "lead_id": context.lead_id,
-            "model": model,
-            "prompt_version": prompt_version,
-            "temperature": temperature,
-            "attempt": attempt,
-            "response_format": response_format,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "response_text": response_text_trunc,
-            "response_parsed": response_parsed,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-            "cost_usd": cost_usd,
-            "latency_ms": latency_ms,
-            "error": error,
-        }
-        with _LOG_FILE_LOCK:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except Exception:  # pragma: no cover - best effort
-        logger.exception("failed to write LLM call to JSONL log")
-
+        await loop.run_in_executor(None, _persist_audit_row_sync, payload)
+    except Exception:  # pragma: no cover - logged inside the executor body
+        logger.warning("audit insert future failed for %s", call_id)
     return call_id
 
 
@@ -451,7 +521,7 @@ async def _complete_with_retries(
             last_error = exc
             latency_ms = int((time.monotonic() - start) * 1000)
             status = _status_code(exc)
-            _log_call(
+            await _log_call(
                 context=context,
                 model=model,
                 prompt_version=prompt_version,
@@ -483,7 +553,7 @@ async def _complete_with_retries(
         else:
             latency_ms = int((time.monotonic() - start) * 1000)
             _record_usage(model, tokens_in, tokens_out, cost_usd)
-            call_id = _log_call(
+            call_id = await _log_call(
                 context=context,
                 model=model,
                 prompt_version=prompt_version,
@@ -705,7 +775,7 @@ async def complete_json(
     )
     try:
         parsed = _extract_json(result.text)
-        _update_parsed_json(result.llm_call_id, parsed)
+        await _update_parsed_json(result.llm_call_id, parsed)
         return parsed, result
     except (ValueError, json.JSONDecodeError) as exc:
         logger.warning("JSON parse failure from %s: %s — retrying with self-heal", model, exc)
@@ -733,17 +803,15 @@ async def complete_json(
     )
     try:
         parsed = _extract_json(retry.text)
-        _update_parsed_json(retry.llm_call_id, parsed)
+        await _update_parsed_json(retry.llm_call_id, parsed)
         return parsed, retry
     except (ValueError, json.JSONDecodeError) as exc:
         raise LLMError(f"LLM returned unparseable JSON after self-heal: {exc}") from exc
 
 
-def _update_parsed_json(call_id: str | None, parsed: dict[str, Any]) -> None:
-    """Backfill the ``response_parsed`` column once JSON parsing has succeeded."""
+def _update_parsed_json_sync(call_id: str, parsed: dict[str, Any]) -> None:
+    """Synchronous body for the ``response_parsed`` UPDATE."""
 
-    if not call_id:
-        return
     try:
         with session_scope() as session:
             row = session.get(LlmCall, call_id)
@@ -751,3 +819,31 @@ def _update_parsed_json(call_id: str | None, parsed: dict[str, Any]) -> None:
                 row.response_parsed = parsed
     except Exception:  # pragma: no cover - best effort
         logger.exception("failed to backfill response_parsed on llm_call %s", call_id)
+
+
+async def _update_parsed_json(call_id: str | None, parsed: dict[str, Any]) -> None:
+    """Backfill the ``response_parsed`` column once JSON parsing has succeeded.
+
+    Now post-0008 :func:`_log_call` awaits its INSERT before returning,
+    so by the time we get here the row already exists. We still
+    dispatch the UPDATE onto the executor so the loop isn't blocked on
+    SQLite — same pattern as the insert.
+
+    Best-effort: a failed UPDATE logs the exception in the executor
+    body and never propagates back to the caller — audit-log gaps are
+    not fatal to the request path.
+    """
+
+    if not call_id:
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - sync caller
+        _update_parsed_json_sync(call_id, parsed)
+        return
+
+    try:
+        await loop.run_in_executor(None, _update_parsed_json_sync, call_id, parsed)
+    except Exception:  # pragma: no cover - logged inside the executor body
+        logger.warning("audit update future failed for %s", call_id)

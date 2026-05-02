@@ -50,6 +50,13 @@ def test_app_boots_with_workspace_and_file_connector(
         assert body["scheduler"] == {"tick_s": 7, "poll_s": 3}
         # Cost is 0.0 on a fresh boot; the field exists and is a float.
         assert body["llm_usage"]["estimated_cost_today_usd"] == 0.0
+        # Ticket 0009: paused-inbound queue is empty on a fresh boot,
+        # but the field is still present so the frontend can render
+        # the badge unconditionally.
+        assert body["paused_inbound"] == {
+            "pending_count": 0,
+            "oldest_pending_at": None,
+        }
 
 
 def test_status_estimated_cost_reflects_in_memory_counter(

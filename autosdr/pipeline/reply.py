@@ -71,6 +71,7 @@ from autosdr.pipeline._shared import (
     hitl_context_from_send_failure,
     pause_thread_for_hitl,
     read_loop_settings,
+    schedule_hitl_push,
     thread_history,
 )
 from autosdr.pipeline.suggestions import generate_reply_variants
@@ -791,6 +792,11 @@ async def _park_with_suggestions_v2(
         )
         session.flush()
 
+    schedule_hitl_push(
+        thread_id=thread_id,
+        lead_name=lead.name,
+        hitl_reason=HITL_AWAITING_HUMAN_REPLY,
+    )
     logger.info(
         "reply parked thread=%s reason=%s intent=%s suggestions=%d",
         thread_id,
@@ -855,6 +861,11 @@ async def _run_auto_reply_v2(
                 )
             pause_thread_for_hitl(live_thread, reason=reason, context=context)
             session.flush()
+        schedule_hitl_push(
+            thread_id=thread_id,
+            lead_name=lead.name,
+            hitl_reason=reason,
+        )
         return ReplyResult(
             action="escalated_hitl",
             thread_id=thread_id,

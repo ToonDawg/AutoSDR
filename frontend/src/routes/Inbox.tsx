@@ -294,17 +294,17 @@ function HitlRow({
 
   return (
     <div
-      className={`flex items-stretch group transition-colors hover:bg-paper-deep ${
+      className={`flex flex-col sm:flex-row items-stretch group transition-colors hover:bg-paper-deep ${
         dimmed ? "opacity-75" : ""
       }`}
     >
       {variant === "active" && (
-        <label className="pl-5 pr-1 py-4 flex items-start cursor-pointer select-none">
+        <label className="pl-5 pr-1 pt-3 sm:py-4 flex items-start cursor-pointer select-none">
           <input
             type="checkbox"
             checked={selected}
             onChange={onToggleSelect}
-            className="mt-0.5 h-3.5 w-3.5 accent-ink cursor-pointer"
+            className="mt-0.5 h-4 w-4 accent-ink cursor-pointer"
             aria-label={`Select ${thread.lead_name ?? "thread"}`}
           />
         </label>
@@ -313,11 +313,11 @@ function HitlRow({
       <Link
         to={`/threads/${thread.id}`}
         className={`flex-1 min-w-0 py-4 ${
-          variant === "active" ? "pl-2 pr-3" : "px-5"
+          variant === "active" ? "pl-2 sm:pl-2 pr-4 sm:pr-3" : "px-4 sm:px-5"
         }`}
       >
-        <div className="flex items-baseline justify-between gap-4 mb-2">
-          <div className="flex items-baseline gap-3 min-w-0">
+        <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1.5 sm:gap-4 mb-2">
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 min-w-0">
             <span className="text-sm font-medium truncate">
               {thread.lead_name ?? "Unknown lead"}
             </span>
@@ -325,7 +325,7 @@ function HitlRow({
               {thread.campaign_name}
             </span>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
             <Badge tone={dimmed ? "neutral" : "rust"} uppercase={false}>
               {reasonLabel}
             </Badge>
@@ -343,7 +343,7 @@ function HitlRow({
         )}
 
         {previewDraft && (
-          <div className="flex items-start gap-3 pt-2 mt-1 border-t border-rule">
+          <div className="flex flex-col sm:flex-row items-start gap-2 sm:gap-3 pt-2 mt-1 border-t border-rule">
             <Badge tone={scoreTone} uppercase={false} className="shrink-0">
               {previewLabel}
               {previewScore != null ? ` · ${previewScore}` : ""}
@@ -352,7 +352,7 @@ function HitlRow({
               {previewDraft}
             </p>
             <ArrowRight
-              className="h-4 w-4 text-ink-muted shrink-0 mt-0.5 group-hover:translate-x-0.5 transition-transform"
+              className="hidden sm:block h-4 w-4 text-ink-muted shrink-0 mt-0.5 group-hover:translate-x-0.5 transition-transform"
               strokeWidth={1.5}
             />
           </div>
@@ -374,13 +374,13 @@ function HitlRow({
         )}
       </Link>
 
-      <div className="flex items-start py-4 pr-4 pl-2">
+      <div className="flex items-stretch sm:items-start sm:py-4 sm:pr-4 sm:pl-2 border-t sm:border-t-0 border-rule">
         {variant === "active" ? (
           <button
             type="button"
             onClick={onDismiss}
             disabled={actionPending}
-            className="text-xs text-ink-muted hover:text-rust px-2 py-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+            className="flex-1 sm:flex-none text-xs text-ink-muted hover:text-rust px-3 py-3 sm:py-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center gap-1 min-h-[44px]"
             title="Dismiss this thread"
           >
             <Trash2 className="h-3 w-3" strokeWidth={1.5} />
@@ -391,7 +391,7 @@ function HitlRow({
             type="button"
             onClick={onRestore}
             disabled={actionPending}
-            className="text-xs text-ink-muted hover:text-ink px-2 py-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+            className="flex-1 sm:flex-none text-xs text-ink-muted hover:text-ink px-3 py-3 sm:py-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center gap-1 min-h-[44px]"
             title="Restore this thread"
           >
             <RotateCcw className="h-3 w-3" strokeWidth={1.5} />

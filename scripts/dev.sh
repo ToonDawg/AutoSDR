@@ -16,6 +16,7 @@ cd "$repo_root"
 
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+HOST="${HOST:-0.0.0.0}"
 
 if [ ! -d "frontend/node_modules" ]; then
   echo "[dev] installing frontend dependencies..."
@@ -45,21 +46,23 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-echo "[dev] backend  -> http://127.0.0.1:${BACKEND_PORT}"
-echo "[dev] frontend -> http://127.0.0.1:${FRONTEND_PORT}  (proxies /api -> :${BACKEND_PORT})"
-echo "[dev] open the frontend URL; Ctrl+C stops both"
+local_ip="$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")"
+
+echo "[dev] backend  -> http://${local_ip}:${BACKEND_PORT}"
+echo "[dev] frontend -> http://${local_ip}:${FRONTEND_PORT}  (proxies /api -> :${BACKEND_PORT})"
+echo "[dev] open the frontend URL on any device on your network; Ctrl+C stops both"
 echo ""
 
 (
   exec uv run uvicorn autosdr.webhook:app \
-    --reload --host 127.0.0.1 --port "$BACKEND_PORT" 2>&1 \
+    --reload --host "$HOST" --port "$BACKEND_PORT" 2>&1 \
     | prefix "api" "36"
 ) &
 child_pgids+=("$!")
 
 (
   cd frontend
-  exec npm run dev -- --port "$FRONTEND_PORT" --strictPort 2>&1 \
+  exec npm run dev -- --host "$HOST" --port "$FRONTEND_PORT" --strictPort 2>&1 \
     | prefix "ui" "35"
 ) &
 child_pgids+=("$!")

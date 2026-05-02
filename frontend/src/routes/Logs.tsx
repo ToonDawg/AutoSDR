@@ -6,6 +6,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '@/lib/api';
 import { AngleFunnelPanel } from '@/components/domain/AngleFunnelPanel';
 import { BackLink } from '@/components/ui/BackLink';
+import { CardList, CardListItem } from '@/components/ui/CardList';
 import { FilterTabs, type FilterOption } from '@/components/ui/FilterTabs';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
@@ -149,13 +150,13 @@ export function Logs() {
         }
         description="One row per LLM attempt — analysis, generation, evaluation, classification. Click to expand the full prompt and response."
         right={
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3 md:gap-4 flex-wrap md:flex-nowrap w-full md:w-auto">
             <LlmCostTotal summary={summary} />
             <SearchInput
               value={q}
               onChange={setQ}
               placeholder="Search prompts, models…"
-              className="w-60"
+              className="w-full md:w-60"
             />
           </div>
         }
@@ -177,7 +178,7 @@ export function Logs() {
 
       <FilterTabs options={PURPOSES} active={purpose} onChange={setPurpose} counts={counts} />
 
-      <div className="paper-card font-mono">
+      <div className="paper-card font-mono hidden md:block">
         <div className="grid grid-cols-12 text-[10px] tracking-[0.14em] uppercase text-ink-muted px-3 py-2.5 border-b border-rule bg-paper-deep">
           <div className="col-span-2">Time</div>
           <div className="col-span-2">Purpose</div>
@@ -271,7 +272,7 @@ export function Logs() {
                     </button>
 
                     {isOpen && (
-                      <div className="grid grid-cols-2 gap-6 p-5 bg-paper-deep border-t border-rule font-mono text-xs">
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 p-5 bg-paper-deep border-t border-rule font-mono text-xs">
                         <div>
                           <div className="label mb-2">Response</div>
                           <pre className="whitespace-pre-wrap leading-relaxed text-ink">
@@ -368,6 +369,82 @@ export function Logs() {
           </div>
         )}
       </div>
+
+      <CardList className="md:hidden font-mono">
+        {filtered.map((c) => (
+          <CardListItem
+            key={c.id}
+            onClick={() => toggle(c.id)}
+            title={
+              <span className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    'px-1.5 py-px text-[10px] tracking-[0.14em] uppercase shrink-0',
+                    PURPOSE_TONE[c.purpose],
+                  )}
+                >
+                  {c.purpose}
+                </span>
+                <span className="text-ink truncate normal-case">{c.model}</span>
+              </span>
+            }
+            description={
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] normal-case">
+                <span>{absTime(c.created_at, 'd MMM HH:mm:ss')}</span>
+                <span className="tabular-nums">{c.tokens_in}→{c.tokens_out} tok</span>
+                <span className="tabular-nums">
+                  {c.cost_usd == null ? '—' : `$${c.cost_usd.toFixed(4)}`}
+                </span>
+                <span className="tabular-nums">{c.latency_ms}ms</span>
+                {c.attempt > 1 && <span className="tabular-nums">attempt {c.attempt}</span>}
+              </div>
+            }
+            trailing={
+              c.thread_id ? (
+                <Link
+                  to={`/threads/${c.thread_id}`}
+                  className="text-ink-muted hover:text-rust underline"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  thr {c.thread_id.slice(0, 6)}
+                </Link>
+              ) : null
+            }
+          />
+        ))}
+        {filtered.length === 0 && (
+          <li className="paper-card py-10 text-center text-ink-muted text-sm">No calls match.</li>
+        )}
+      </CardList>
+
+      {/* Mobile expansion: when a row is tapped, render the response below
+          the list. Single-tap, expanded inline below the card list keeps
+          the UX flat (no off-screen drawer). */}
+      {expanded.size > 0 && filtered.some((c) => expanded.has(c.id)) && (
+        <div className="md:hidden flex flex-col gap-3">
+          {filtered
+            .filter((c) => expanded.has(c.id))
+            .map((c) => (
+              <details key={c.id} open className="paper-card-deep p-4 font-mono text-xs">
+                <summary className="cursor-pointer text-ink font-medium normal-case">
+                  Response · {c.model}
+                </summary>
+                <pre className="whitespace-pre-wrap leading-relaxed text-ink mt-2 overflow-x-auto">
+                  {c.response_text ||
+                    (c.response_parsed
+                      ? JSON.stringify(c.response_parsed, null, 2)
+                      : '—')}
+                </pre>
+                {c.error && (
+                  <div className="mt-3 p-3 bg-oxblood-soft border border-oxblood text-oxblood">
+                    <div className="label text-oxblood mb-1">Error</div>
+                    <div className="text-xs">{c.error}</div>
+                  </div>
+                )}
+              </details>
+            ))}
+        </div>
+      )}
     </div>
   );
 }

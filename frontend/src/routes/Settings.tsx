@@ -6,6 +6,8 @@ import { LlmCard } from './settings/LlmCard';
 import { ConnectorCard } from './settings/ConnectorCard';
 import { BehaviourCard } from './settings/BehaviourCard';
 import { RehearsalCard } from './settings/RehearsalCard';
+import { NotificationsCard } from './settings/NotificationsCard';
+import { NetworkingCard } from './settings/NetworkingCard';
 import { Setup } from './Setup';
 
 /**
@@ -67,6 +69,8 @@ export function Settings() {
       <LlmCard workspace={workspace} />
       <ConnectorCard workspace={workspace} />
       <BehaviourCard workspace={workspace} />
+      <NotificationsCard workspace={workspace} />
+      <NetworkingCard />
       <RehearsalCard workspace={workspace} />
     </div>
   );

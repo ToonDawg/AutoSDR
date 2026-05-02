@@ -15,6 +15,7 @@ import { Stat } from "@/components/ui/Stat";
 import { Input, Textarea } from "@/components/ui/Input";
 import { Field } from "@/components/ui/Field";
 import { SaveRow, Toggle } from "@/routes/settings/primitives";
+import { CardList, CardListItem } from "@/components/ui/CardList";
 import { CAMPAIGN_STATUS_LABEL, relTime } from "@/lib/format";
 import {
   CampaignStatus,
@@ -107,9 +108,9 @@ export function CampaignDetail() {
     <div className="page gap-6">
       <BackLink onClick={() => navigate(-1)}>Back to campaigns</BackLink>
 
-      <header className="border-b border-rule pb-5 flex items-start justify-between gap-6">
+      <header className="border-b border-rule pb-5 flex flex-col md:flex-row md:items-start md:justify-between gap-6">
         <div className="min-w-0">
-          <div className="flex items-center gap-3 mb-2">
+          <div className="flex flex-wrap items-center gap-3 mb-2">
             <Badge
               tone={
                 isActive
@@ -159,7 +160,7 @@ export function CampaignDetail() {
         </div>
       </header>
 
-      <div className="grid grid-cols-5 border border-rule divide-x divide-rule">
+      <div className="grid grid-cols-2 md:grid-cols-5 border border-rule divide-x divide-y md:divide-y-0 divide-rule">
         <Stat size="lg" label="Leads assigned" value={campaign.lead_count} />
         {/* "Contacted" is the rollup of anyone we ever messaged — see
             ticket 0003: the API exposes per-bucket precise fields, so
@@ -255,7 +256,7 @@ function ConversationsSection({ campaignId }: { campaignId: string }) {
       open={open}
       onOpenChange={setOpen}
     >
-      <div className="paper-card">
+      <div className="paper-card hidden md:block">
         <div
           className={`${CONVERSATIONS_GRID} label px-3 py-2.5 border-b border-rule bg-paper-deep`}
         >
@@ -320,6 +321,35 @@ function ConversationsSection({ campaignId }: { campaignId: string }) {
           </div>
         )}
       </div>
+
+      <CardList className="md:hidden max-h-[60vh] overflow-y-auto">
+        {isEmpty ? (
+          <li className="paper-card py-10 text-center text-ink-muted text-sm">
+            No threads yet for this campaign.
+          </li>
+        ) : (
+          (threads ?? []).map((t) => (
+            <CardListItem
+              key={t.id}
+              to={`/threads/${t.id}`}
+              title={t.lead_name ?? "Unknown"}
+              description={
+                <>
+                  {t.lead_category && <div>{t.lead_category}</div>}
+                  {t.angle && <div className="truncate">{t.angle}</div>}
+                  <div className="font-mono">{t.auto_reply_count ?? 0} replies</div>
+                </>
+              }
+              badges={<ThreadStatusBadge status={t.status} />}
+              trailing={
+                <span className="font-mono text-[10px] text-ink-muted">
+                  {relTime(t.last_message_at)}
+                </span>
+              }
+            />
+          ))
+        )}
+      </CardList>
     </CollapsibleCard>
   );
 }
@@ -449,7 +479,7 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
         />
       }
     >
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Campaign name">
           <Input
             value={draft.name}
@@ -484,7 +514,7 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
         />
       </Field>
 
-      <div className="flex items-center justify-between gap-4 border border-rule bg-paper px-4 py-3">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4 border border-rule bg-paper px-4 py-3">
         <div>
           <div className="text-sm font-medium text-ink">Today's send count</div>
           <p className="text-xs text-ink-muted mt-1">
@@ -588,7 +618,7 @@ function FollowupSection({ campaign }: { campaign: Campaign }) {
         />
       </Field>
 
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field
           label="Delay (seconds)"
           hint="Target gap between the two messages."
@@ -715,7 +745,7 @@ function OutreachWindowSection({ campaign }: { campaign: Campaign }) {
           />
 
           {draft.enabled && (
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <Field label="Start hour" hint="0-23, server-local.">
                 <Input
                   type="number"

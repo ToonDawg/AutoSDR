@@ -33,7 +33,11 @@ import type {
   LlmCallsSummary,
   LlmPresetCatalog,
   Message,
+  NetworkingStatus,
   OutreachWindowConfig,
+  PushSubscriptionsResponse,
+  PushTestResult,
+  PushVapidPublic,
   ScanDetail,
   ScanList,
   ScanRunRequest,
@@ -185,6 +189,10 @@ export const api = {
 
   async resume(): Promise<SystemStatus> {
     return req<SystemStatus>('/status/resume', { method: 'POST' });
+  },
+
+  async getNetworkingStatus(): Promise<NetworkingStatus> {
+    return req<NetworkingStatus>('/status/networking');
   },
 
   // ---------- campaigns ----------
@@ -588,6 +596,38 @@ export const api = {
 
   async getScan(leadId: string): Promise<ScanDetail> {
     return req<ScanDetail>(`/scans/${leadId}`);
+  },
+
+  // ---------- push notifications (ticket 0005) ----------
+
+  async getPushVapidPublic(): Promise<PushVapidPublic> {
+    return req<PushVapidPublic>('/push/vapid-public');
+  },
+
+  async listPushSubscriptions(): Promise<PushSubscriptionsResponse> {
+    return req<PushSubscriptionsResponse>('/push/subscriptions');
+  },
+
+  async subscribePush(payload: {
+    endpoint: string;
+    keys: { p256dh: string; auth: string };
+    user_agent?: string | null;
+  }): Promise<PushSubscriptionsResponse['subscriptions'][number]> {
+    return req('/push/subscribe', { method: 'POST', body: payload });
+  },
+
+  async unsubscribePush(endpoint: string): Promise<void> {
+    return req<void>('/push/subscribe', {
+      method: 'DELETE',
+      body: { endpoint },
+    });
+  },
+
+  async testPushNotification(endpoint?: string): Promise<PushTestResult> {
+    return req<PushTestResult>('/push/test', {
+      method: 'POST',
+      body: endpoint ? { endpoint } : {},
+    });
   },
 };
 

@@ -156,6 +156,22 @@ class SchedulerInfo(BaseModel):
     poll_s: int
 
 
+class PausedInboundStatus(BaseModel):
+    """Depth + age of the killswitch's deferred-inbound queue.
+
+    Surfaced on ``GET /api/status`` so the killswitch banner can render
+    a "12 inbound waiting for resume" badge — the operator's only
+    visible signal that the queue exists. ``oldest_pending_at`` lets
+    the UI flag stale queues (e.g. paused for hours).
+
+    Both fields are zero / None on a fresh install. The queue itself
+    lives in ``paused_inbound`` (see :class:`autosdr.models.PausedInbound`).
+    """
+
+    pending_count: int = 0
+    oldest_pending_at: datetime | None = None
+
+
 class SystemStatusOut(BaseModel):
     paused: bool
     started_at: datetime | None
@@ -166,6 +182,7 @@ class SystemStatusOut(BaseModel):
     llm_usage: LlmUsage
     campaigns: list[CampaignQuota]
     scheduler: SchedulerInfo
+    paused_inbound: PausedInboundStatus = Field(default_factory=PausedInboundStatus)
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +929,98 @@ class ScanRunResult(ScanSummaryOut):
     status: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Push subscriptions (ticket 0005)
+# ---------------------------------------------------------------------------
+
+
+class PushVapidPublicOut(_ApiModel):
+    """Response of ``GET /api/push/vapid-public``.
+
+    The SW reads ``public_key`` to call :js:func:`PushManager.subscribe`
+    and ``dashboard_origin`` to deep-link the notification. Both can be
+    ``None`` on a fresh boot before the lifespan has generated keys —
+    the SW treats that as "push not yet enabled".
+    """
+
+    public_key: str | None
+    dashboard_origin: str | None
+
+
+class PushSubscribeKeys(BaseModel):
+    """Mirror of the JSON the browser hands back from
+    :js:func:`subscription.toJSON`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    p256dh: str
+    auth: str
+
+
+class PushSubscribeRequest(BaseModel):
+    """Body of ``POST /api/push/subscribe`` / ``DELETE /api/push/subscribe``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    endpoint: str
+    keys: PushSubscribeKeys | None = None
+    user_agent: str | None = None
+
+
+class PushSubscriptionOut(_ApiModel):
+    """One push-subscription row, surfaced on Settings → Notifications."""
+
+    id: str
+    user_agent: str | None
+    created_at: datetime
+    last_seen_at: datetime
+    last_error: str | None
+    endpoint_host: str
+
+
+class PushSubscriptionsOut(_ApiModel):
+    subscriptions: list[PushSubscriptionOut]
+    hitl_escalations: bool
+    dashboard_origin: str | None
+
+
+class PushTestRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    endpoint: str | None = None
+
+
+class PushTestResult(_ApiModel):
+    sent: int
+    gone: int
+    failed: int
+
+
+class TailscaleProbeOut(_ApiModel):
+    """Outcome of ``tailscale status`` at request time."""
+
+    state: str
+    detail: str | None = None
+
+
+class NetworkingStatusOut(_ApiModel):
+    """Snapshot of remote-access readiness (ticket 0005 unit 8).
+
+    Surfaces the configured ``HOST``/``port``, the Tailscale probe,
+    and the resolved push deep-link origin so the operator can spot
+    the *PC-bind-interface footgun* without leaving Settings.
+    """
+
+    host: str
+    port: int
+    bound_for_remote_access: bool
+    tailscale: TailscaleProbeOut
+    warning: str | None = None
+    dashboard_origin_override: str | None = None
+    dashboard_origin_resolved: str | None = None
+    request_origin: str | None = None
+
+
 __all__ = [
     "AngleFunnelOut",
     "AngleFunnelRow",
@@ -951,7 +1060,16 @@ __all__ = [
     "LlmPresetsOut",
     "LlmUsage",
     "MessageOut",
+    "NetworkingStatusOut",
+    "PushSubscribeKeys",
+    "PushSubscribeRequest",
+    "PushSubscriptionOut",
+    "PushSubscriptionsOut",
+    "PushTestRequest",
+    "PushTestResult",
+    "PushVapidPublicOut",
     "SchedulerInfo",
+    "TailscaleProbeOut",
     "SendDraftRequest",
     "SCAN_STATUS_NEVER",
     "ScanDetailOut",

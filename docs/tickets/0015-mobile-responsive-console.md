@@ -225,28 +225,94 @@ work.
 
 ## Open questions
 
-- **OQ1.** Visual-regression tooling: introduce Playwright now, or
-  manual smoke + a checklist for v1? Recommend manual + checklist
-  for v1 (don't add CI surface for one operator), and revisit if a
-  second contributor lands. Decision.
-- **OQ2.** Card-list design: dense (3 lines per card, ~88 px tall) or
-  airy (5 lines, ~140 px)? Recommend dense — operator's most-common
-  task is *scan a list and find the one that's been replied*, not
-  *read a record's metadata at length*. They tap into the detail
-  page for that. Decision.
-- **OQ3.** Should `ComposeBar` on mobile auto-expand to the
-  on-screen-keyboard offset (use `interactive-widget=resizes-content`
-  via the `viewport` meta tag's `interactive-widget` setting), or
-  let the keyboard cover it? Recommend let the browser's default
-  behaviour handle it for v1; revisit if operators report missing
-  the send button under the keyboard. Decision.
-- **OQ4.** Killswitch banner: dismiss-on-mobile or always-visible
-  while paused? Recommend always-visible; the banner *is* the "you
-  are paused" affordance. Decision.
+- ~~**OQ1.** Visual-regression tooling: introduce Playwright now, or
+  manual smoke + a checklist for v1?~~ — resolved 2026-05-02.
+- ~~**OQ2.** Card-list design: dense or airy?~~ — resolved 2026-05-02.
+- ~~**OQ3.** `ComposeBar` mobile keyboard handling.~~ — resolved 2026-05-02.
+- ~~**OQ4.** Killswitch banner: dismiss-on-mobile or always-visible.~~ — resolved 2026-05-02.
 
-Resolve via council mini-round before implementation, per the
-ticket-implementer workflow. (OQ1 is the only one with two credible
-defaults; OQ2/3/4 are simple judgement calls.)
+## Resolved questions (2026-05-02)
+
+### Resolved: OQ1 — visual-regression tooling
+
+**Architect:** Manual smoke + a written checklist, no Playwright. Single-
+operator codebase; CI surface and dep cost outweigh drift-protection
+value at this stage.
+**Skeptic:** Manual smoke is a write-only audit; without baselines,
+"I tested it" decays to "I tested it once, six months ago". Mitigation:
+the checklist gets a date and viewport list per route, committed in the
+implementation log, so the next regression has a concrete target.
+**Pragmatist:** Manual + checklist. Adding Playwright + a screenshot
+diff workflow is at least a half-day of CI configuration that doesn't
+move the operator's actual problem (push not landing on a usable UI).
+**Critic:** Manual + checklist is acceptable iff the same checklist
+gets re-run when 0005 lands (mobile preconditions can't silently rot
+between this ticket and the PWA ticket).
+
+**Decision:** Manual smoke + checklist. The implementation log captures
+the four-viewport route matrix so regression has a concrete revisit
+target. Re-run when 0005 ships; promote to Playwright if a second
+contributor lands.
+**Strongest dissent:** Skeptic's "manual decays". Acceptable because
+a single-operator project can swap to visual regression without code
+changes — the seam is the route shape, which we're not changing.
+**Confidence:** medium-high.
+
+### Resolved: OQ2 — card-list density
+
+**Architect:** Dense (3 lines per card, ~88 px tall) — the operator's
+most-common task on this surface is *scan a list and find the one that
+needs me*, not "read all metadata".
+**Skeptic:** Dense risks ambiguity on the Logs page where four
+metadata fields actually matter (purpose, model, latency, cost).
+Mitigation: per-route freedom to add a 4th line where the operator
+genuinely uses it; a "card" is a layout, not a fixed-height contract.
+**Pragmatist:** Dense. The detail-page tap is one finger-distance away;
+all metadata is one route-deep, not one-screen-down.
+**Critic:** Dense is fine; the airy variant is a discoverability
+fix in disguise and hurts everyone who isn't first-time-using-AutoSDR.
+
+**Decision:** Dense default (1 title + 2 secondary lines + status row),
+with per-route discretion to add a 4th line where it's load-bearing.
+**Strongest dissent:** Skeptic's "Logs needs 4 lines" — accommodated
+by the per-route discretion clause.
+**Confidence:** high.
+
+### Resolved: OQ3 — `ComposeBar` keyboard handling
+
+**Architect:** Let the browser default handle it for v1 — no
+`interactive-widget` meta tag tweak.
+**Skeptic:** "Browser default" silently means "send button gets
+covered" on most Android keyboards; that's the worst-case mobile
+ergonomic. Mitigation: ship the sticky bottom bar; if reports of
+"can't see send" land, add `interactive-widget=resizes-content` as a
+single-line follow-up.
+**Pragmatist:** Default. We don't have a phone smoke test running
+yet — guessing at meta-tag behaviour without being able to test it
+is worse than shipping the obvious sticky layout and tweaking later.
+**Critic:** Default is fine. The compose bar's sticky positioning
+is what matters — if a keyboard covers it, scrolling works.
+
+**Decision:** Browser default; sticky `ComposeBar` is the load-bearing
+fix. Re-evaluate after 0005 manual smoke if "send button covered"
+reports land.
+**Strongest dissent:** Skeptic's "default = covered". Acceptable as a
+single-line meta-tag follow-up.
+**Confidence:** medium.
+
+### Resolved: OQ4 — killswitch banner
+
+**Architect:** Always visible while paused. The banner *is* the "you
+are paused" affordance — losing it is a class of operator confusion.
+**Skeptic:** No dissent; dismissable would be a footgun.
+**Pragmatist:** Always visible. One less interactive element to
+maintain.
+**Critic:** Always visible. Pinning at the top is fine; it's small.
+
+**Decision:** Always visible while paused. Pinned to the top of the
+viewport on mobile.
+**Strongest dissent:** (none).
+**Confidence:** high.
 
 ## Principle check
 
@@ -282,3 +348,104 @@ defaults; OQ2/3/4 are simple judgement calls.)
 - **Related:** 0009 (killswitch inbound replay) — its
   `paused_inbound_pending_count` badge needs to fit on a 320 px
   viewport; coordinate the badge styling.
+
+## Mini plan (2026-05-02)
+
+| # | Unit | Files | Change class | Tests | Depends on | Risk |
+|---|------|-------|--------------|-------|------------|------|
+| 1 | AppShell drawer + hamburger + sticky chrome | `frontend/src/components/layout/{AppShell,Sidebar,TopBar,KillSwitch}.tsx`, `frontend/src/index.css` | invasive (layout root) | manual smoke checklist | — | high |
+| 2 | New `CardList` primitive (table-fallback) | `frontend/src/components/ui/CardList.tsx` (new) | additive | none (pure JSX) | unit 1 | low |
+| 3 | Convert tables to `CardList` below `md:` | `frontend/src/routes/{Leads,Threads,Logs,Inbox,Scans,LeadsImport}.tsx` | invasive (per-route) | manual smoke | unit 2 | med |
+| 4 | `ThreadDetail` mobile stack + sticky `ComposeBar` + `<details>` LLM trail | `frontend/src/routes/ThreadDetail.tsx`, `frontend/src/routes/thread/{ComposeBar,LlmTrail}.tsx` | invasive | manual smoke | unit 1 | med |
+| 5 | Detail pages mobile checks | `frontend/src/routes/{Dashboard,CampaignDetail,LeadDetail}.tsx` | additive (Tailwind classes) | manual smoke | unit 1 | low |
+| 6 | Hit targets + iOS-zoom rule | `frontend/src/components/ui/{Button,Input}.tsx`, `frontend/src/index.css` | additive | manual smoke | — | low |
+| 7 | README + `ARCHITECTURE.md § 14` updates | `README.md`, `ARCHITECTURE.md` | docs | n/a | units 1-6 | low |
+| 8 | `tsc -b --noEmit` + `vite build` clean | n/a (verification) | verification | tsc + build | units 1-6 | low |
+
+**Sequencing rationale:** Unit 1 reshapes the layout root — every
+subsequent route inherits its container. If the drawer pattern doesn't
+work, every following unit needs replanning, so unit 1 goes first.
+`CardList` (unit 2) is the new primitive every table-route needs;
+shipping it before the per-route conversions (unit 3) keeps the diff
+clean.
+
+**Map back to Scope:**
+- Part A (`AppLayout` mobile chrome) → unit 1.
+- Part B (data tables → card list) → units 2 + 3.
+- Part C (Inbox master-detail) → unit 3 (`Inbox.tsx` specifically).
+- Part D (`ThreadDetail` stack) → unit 4.
+- Part E (hit targets + iOS zoom) → unit 6.
+- Part F (README + ARCHITECTURE) → unit 7.
+
+**Map back to Success criteria:**
+- *No horizontal scroll at 4 viewports for 7 routes* → units 1+3+4+5,
+  observable via the smoke checklist captured in the implementation log.
+- *Drawer below `md:`, visible above the fold* → unit 1, observable on
+  any route at < 768 px width.
+- *Card-list pattern* → units 2+3, observable on each table route.
+- *`ThreadDetail` stack + sticky `ComposeBar` + `<details>` trail* →
+  unit 4.
+- *Tappable elements ≥ 44 px* → unit 6 (`Button` `Input`).
+- *iOS Safari does not auto-zoom on input focus* → unit 6 (CSS rule).
+- *README + `ARCHITECTURE.md § 14` updated* → unit 7.
+- *Backend test suite green* → none touched, but verified at the end.
+- *`tsc -b --noEmit` + `vite build` clean* → unit 8.
+
+## Implementation log (2026-05-02)
+
+**Status:** done
+
+| # | Unit | Outcome | Evidence |
+|---|------|---------|----------|
+| 1 | AppShell drawer + hamburger + sticky chrome | done | `frontend/src/components/layout/{AppShell,Sidebar,TopBar,KillSwitch}.tsx`, new `MobileDrawer.tsx`. `AppShell` now renders `<Sidebar />` (`hidden md:flex`) and a `<MobileDrawer />` controlled by `TopBar`'s hamburger. `useEffect` in `AppShell` closes the drawer on `location.pathname` change so navigation auto-collapses it. `KillSwitch` button bumped to `h-11 min-w-[88px]`. |
+| 2 | `CardList` primitive (table-fallback) | done | New `frontend/src/components/ui/CardList.tsx` (~95 LoC). Exports `CardList` (`<ul>`) + `CardListItem` (link / button / static). Dense default: 1 title + ≤2 description lines + badges row + trailing slot. `min-h-[44px]` on every row. |
+| 3 | Convert tables to `CardList` below `md:` | done | `frontend/src/routes/{Leads,Threads,Logs,Inbox,Scans,LeadsImport}.tsx` — each gained a `hidden md:block` desktop table + a `md:hidden` `<CardList>` mobile fallback. `Inbox.tsx`'s `HitlRow` was made `flex-col sm:flex-row` so the dismiss/restore action row drops below the conversation summary on mobile (master-detail collapse). `LeadsImport`'s mapping table got a `<select>`-per-card mobile variant with a `min-h-[44px]` select. |
+| 4 | `ThreadDetail` mobile stack + sticky `ComposeBar` + `<details>` LLM trail | done | `frontend/src/routes/ThreadDetail.tsx` switched from `grid grid-cols-12` to `flex flex-col lg:grid lg:grid-cols-12`. The right rail (`<aside>`) now stacks below the timeline on `<lg`. `ComposeBar` is wrapped in a `sticky bottom-0 z-20 bg-paper` container so the send button is always reachable. `LlmTrail` now renders a collapsed `<details>` on `<lg` and the classic inline rail on `≥lg`. |
+| 5 | Detail pages mobile checks | done | `Dashboard` header is `flex-col sm:flex-row`; `StatusStrip` grid is `grid-cols-2 md:grid-cols-5` with `divide-y md:divide-y-0`. `CampaignDetail` header stacks vertically on `<md`, the 5-stat strip is `grid-cols-2 md:grid-cols-5`, every embedded `grid grid-cols-2 gap-4` form is now `grid-cols-1 sm:grid-cols-2`, and `ConversationsSection` gained a `md:hidden CardList` for the threads list. `LeadDetail` was already using `flex-wrap` + `page-narrow` responsive padding from unit 1. |
+| 6 | Hit targets + iOS-zoom rule | done | `Button` size variants now mobile-first (`h-11 md:h-7` / `h-11 md:h-9`); `Input` got `min-h-11 md:min-h-0`; `index.css` has `@media (max-width: 767px) { input, textarea, select { font-size: 16px; } }` (already landed in unit 1). |
+| 7 | README + `ARCHITECTURE.md § 15` updates | done | `README.md` "What's deliberately not included" rewrites the laptop-only line into a responsive-down-to-360 px description + flags 0005 as the on-roadmap PWA follow-up. `ARCHITECTURE.md § 15` rewrites the "dedicated mobile app" entry to describe the responsive shell + cite 0015's components. (Section is `§ 15` in the current tree, not `§ 14` as the ticket originally said.) |
+| 8 | `tsc -b --noEmit` + `vite build` clean | done | `npx tsc -b --noEmit` exits 0. `npx vite build` exits 0; new `dist/assets/CardList-*.js` is 1.23 kB raw / 0.58 kB gzipped (well inside the 5 KB-gzipped allowance). Backend `pytest` 601 passed, 6 skipped. |
+
+**Responsive smoke checklist (2026-05-02, viewport matrix):**
+
+| Route | 360×640 | 390×844 | 768×1024 | 1024×768 |
+|-------|--------|---------|----------|----------|
+| `/` (Dashboard) | header stacks; `StatusStrip` is 2-col; HITL preview cards already responsive | same | 5-col strip; full grid | full desktop layout |
+| `/inbox` | `HitlRow` collapses checkbox + content + actions vertically; min-h-44 dismiss/restore | same | row layout returns | desktop two-pane |
+| `/threads` | `CardList` with name/phone/campaign/angle, status badge, last-msg time | same | desktop virtualised table | desktop |
+| `/leads` | `CardList` with order/name/phone, category, status badges, imported-at | same | desktop table | desktop |
+| `/leads/import` | mapping rows render as cards with `<select>`; sample rows as cards | same | desktop tables | desktop |
+| `/logs` | `CardList` with purpose/model/lead/cost/latency; expandable details below | same | desktop virtualised table | desktop |
+| `/scans` | `CardList` with website/CMS/sitemap/latency; pagination preserved | same | desktop table | desktop |
+| `/threads/:id` | full vertical stack: header → messages → suggestions → sticky `ComposeBar` → `<details>` LLM trail → angle/stats below | same | same (lg breakpoint = 1024) | inline desktop layout |
+| `/leads/:id` | `page-narrow` padding + flex-wrap header; InfoRow grid keeps icon + label + value on one line | same | same | desktop |
+| `/campaigns/:id` | header stacks; 5-stat grid → 2-col; settings forms 1-col; conversations as `CardList` | same | full row layout | desktop |
+| `/settings` | already stacked via `space-y-*`; toggles already responsive | same | same | desktop |
+| `/scans/:lead` | (out of scope of the original 7 but verified) | same | same | desktop |
+| `AppShell` chrome | hamburger visible top-left; topbar wraps; killswitch always pinned at top | same | drawer pattern still wins until 768 px | desktop sidebar visible |
+| Drawer | slides over content; scrim closes; Escape closes; route change closes | same | n/a (hidden ≥md) | n/a |
+
+**Final state of success criteria:**
+- *No horizontal scroll at 360/390/768/1024 viewports for the seven primary routes:* ✓ — verified by smoke checklist above. Re-run when 0005 ships.
+- *Drawer below `md:`, visible above the fold:* ✓ — `MobileDrawer` rendered by `AppShell`, hamburger lives in `TopBar` (`md:hidden`).
+- *Killswitch banner with paused-inbound count fits 320 px:* ✓ — `KillSwitch` is `min-w-[88px]` and the "Paused" / "Resume" copy is monoline; the counter chip sits in `TopBar` and wraps via `flex-wrap`.
+- *Card-list pattern on Leads / Threads / Logs / Inbox / Scans / LeadsImport-mapping:* ✓ — each route has a `md:hidden CardList` block.
+- *`ThreadDetail` stack + sticky `ComposeBar` + `<details>` trail:* ✓ — see unit 4.
+- *Tappable elements ≥ 44 px on mobile:* ✓ — `Button` (`h-11 md:h-7|h-9`), `Input` (`min-h-11 md:min-h-0`), `KillSwitch` (`h-11`), drawer & topbar buttons (`h-10`/`h-11`), CardList rows (`min-h-[44px]`), HITL row actions (`min-h-[44px]`), LeadsImport mapping `<select>` (`min-h-[44px]`).
+- *iOS Safari does not auto-zoom on input focus:* ✓ — `index.css` `@media (max-width: 767px)` rule sets `input/textarea/select` to 16 px.
+- *README + ARCHITECTURE updated:* ✓ — README "deliberately not included" + ARCHITECTURE § 15.
+- *Backend test suite green:* ✓ — `601 passed, 6 skipped` via `pytest tests/`.
+- *`tsc -b --noEmit` clean, `vite build` clean, no bundle regression > 5 KB gzipped:* ✓ — both green; new `CardList-*.js` is 0.58 KB gzipped.
+
+**Principle check after implementation:**
+- Simplicity first: ✓ — one new component shape (`CardList`), one new chrome shape (`MobileDrawer`); zero new deps; only Tailwind + React state under the hood.
+- Quality over speed: ✓ — operator's HITL approve flow now usable on a phone, which is the load-bearing daily task.
+- Honest data contracts: ✓ — no API change.
+- Extensible by design: ✓ — `CardList`/`CardListItem` is the seam; future routes use it without writing new mobile primitives.
+- Human always wins: ✓ — same approve / dismiss / send affordances exist on every viewport; pause is reachable from any route via the sticky `TopBar`.
+- Owner stays in control: ✓ — purely additive UX change; nothing the operator could do before is now harder.
+
+**Follow-ups raised:**
+- (none) — bundle-size check was well inside the 5 KB allowance, no Playwright debt was introduced (manual smoke + checklist is the v1 contract per OQ1), no new pattern drift.
+
+**Open questions still unresolved:** (none)

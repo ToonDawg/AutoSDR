@@ -441,6 +441,105 @@ class UnmatchedWebhook(Base):
     )
 
 
+class PausedInbound(Base):
+    """Durable queue for inbound webhooks that arrive while the killswitch is on.
+
+    Pre-ticket-0009 the webhook handler dropped inbounds when paused;
+    we lost ``Message`` rows, audit trail, and worst — STOP/UNSUBSCRIBE
+    keywords (which ticket 0001 promises to honour deterministically).
+    Post-fix the handler persists every inbound here, and
+    ``POST /api/status/resume`` walks the table oldest-first and feeds
+    each row back through ``process_incoming_message``.
+
+    Lifecycle
+    ---------
+    - Inserted by :mod:`autosdr.api.webhooks` when ``killswitch.is_paused()``.
+    - Read + replayed by :mod:`autosdr.api.status` (resume hook).
+    - On successful replay, ``replayed_at`` is stamped non-NULL. Failed
+      rows are left with NULL so the next resume retries them.
+
+    Why a separate table from ``unmatched_webhook``: the two have
+    different lifecycles. ``unmatched_webhook`` captures *unrouted*
+    inbounds (no matching lead, can't be replayed automatically) and
+    is forensic. ``paused_inbound`` captures *deferred* inbounds that
+    will be replayed on the next resume. Mixing them would force the
+    drain function to filter on ``reason``, which is fragile.
+    """
+
+    __tablename__ = "paused_inbound"
+    __table_args__ = (
+        Index(
+            "idx_paused_inbound_workspace",
+            "workspace_id",
+            "created_at",
+        ),
+        Index(
+            "idx_paused_inbound_pending",
+            "replayed_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    workspace_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("workspace.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    connector_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    contact_uri: Mapped[str] = mapped_column(String(128), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    raw_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    replayed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class PushSubscription(Base):
+    """Per-device Web Push subscription for HITL escalations.
+
+    One row per (workspace, browser-issued endpoint) tuple. The endpoint
+    URL is unique per browser/profile/device, so it's the natural key —
+    re-subscribing from the same device upserts. ``last_error`` is set
+    when the push gateway returns a non-410 failure (transport bug,
+    auth issue, etc.) so the operator can surface it on Settings →
+    Notifications without scraping logs. HTTP 404 / 410 are treated as
+    *gone* and the row is hard-deleted by the transport — see ticket
+    0005's "subscription delete strategy" resolution.
+    """
+
+    __tablename__ = "push_subscription"
+    __table_args__ = (
+        UniqueConstraint("endpoint", name="push_subscription_endpoint_unique"),
+        Index(
+            "idx_push_subscription_workspace",
+            "workspace_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    workspace_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("workspace.id"), nullable=False
+    )
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    p256dh: Mapped[str] = mapped_column(Text, nullable=False)
+    auth: Mapped[str] = mapped_column(Text, nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dashboard_origin: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

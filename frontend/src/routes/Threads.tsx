@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import { useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { ThreadStatusBadge } from "@/components/domain/ThreadStatusBadge";
+import { CardList, CardListItem } from "@/components/ui/CardList";
 import { FilterTabs, type FilterOption } from "@/components/ui/FilterTabs";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { SearchInput } from "@/components/ui/SearchInput";
@@ -79,14 +80,14 @@ export function Threads() {
             value={q}
             onChange={setQ}
             placeholder="Search threads…"
-            className="w-72"
+            className="w-full md:w-72"
           />
         }
       />
 
       <FilterTabs options={FILTERS} active={filter} onChange={setFilter} counts={counts} />
 
-      <div className="paper-card">
+      <div className="paper-card hidden md:block">
         <div
           className={`${ROW_GRID} label px-3 py-2.5 border-b border-rule bg-paper-deep`}
         >
@@ -160,6 +161,34 @@ export function Threads() {
           </div>
         )}
       </div>
+
+      <CardList className="md:hidden">
+        {filtered.map((t) => (
+          <CardListItem
+            key={t.id}
+            to={`/threads/${t.id}`}
+            title={t.lead_name ?? 'Unknown lead'}
+            description={
+              <>
+                <div className="font-mono text-ink">{formatPhone(t.lead_phone)}</div>
+                <div className="truncate">{t.campaign_name}</div>
+                {t.angle && <div className="text-ink truncate">{t.angle}</div>}
+              </>
+            }
+            badges={<ThreadStatusBadge status={t.status} />}
+            trailing={
+              <span className="font-mono text-[10px] text-ink-muted">
+                {relTime(t.last_message_at)}
+              </span>
+            }
+          />
+        ))}
+        {filtered.length === 0 && (
+          <li className="paper-card py-10 text-center text-ink-muted text-sm">
+            No threads match the current filter.
+          </li>
+        )}
+      </CardList>
     </div>
   );
 }

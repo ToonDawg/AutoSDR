@@ -264,6 +264,67 @@ Resolve via council mini-round before implementation.
 - **Cheap before grand.** Tiny table + tiny drain function;
   defers per-row UI actions and auto-expiry to v2. ✓
 
+## Resolved questions (2026-05-02)
+
+The four open questions all have strong documented defaults; none has two credible alternatives of similar weight. Resolutions accept the defaults with explicit reasoning. No full council round was run — see the [`council`](../../.claude/skills/council/SKILL.md) "When NOT to council" guidance (questions with an obvious answer once linked code is read).
+
+### Resolved: connector-mismatch-on-replay (OQ1)
+
+**Decision:** If the active connector at resume-time differs from the connector that captured the inbound (e.g. operator switched from SMSGate to TextBee while paused), log a warning, skip the row, leave `replayed_at` NULL. The operator can either switch the connector back to drain or DELETE the row by hand. This matches the defensive "don't surprise-burst" tone of the rest of the resume path; a connector swap during pause is a user action with intent and the inbound isn't lost.
+**Confidence:** high.
+
+### Resolved: drain-blocking-vs-async (OQ2)
+
+**Decision:** Fire-and-forget via `asyncio.create_task(_drain_paused_inbounds())`. The status endpoint exposes `pending_count` so the operator can watch progress. Blocking the resume request would tie it up for as long as the queue takes to walk (each inbound is a full classify + suggestion fan-out).
+**Confidence:** high.
+
+### Resolved: simulator-honors-killswitch (OQ3)
+
+**Decision:** Yes — the `/api/webhooks/sim` path honours the killswitch and queues, identical to `/api/webhooks/sms`. The simulator's whole purpose is to mimic real inbound behaviour for rehearsals; bypassing the killswitch would create a confusing "real inbounds queue but simulated ones don't" asymmetry.
+**Confidence:** high.
+
+### Resolved: log-message-wording (OQ4)
+
+**Decision:** Change the log line from `"dropping inbound while paused: %s"` to `"killswitch on; queued inbound for replay: %s"`. The new message is now true (we no longer drop), and grep-compatibility with the old phrasing is not load-bearing — there are no production log scrapers asserting on the string.
+**Confidence:** high.
+
 ## Decisions log
 
-(Empty — populated during implementation.)
+- **2026-05-02** — Resolved OQ1–OQ4 by accepting documented defaults. Connector mismatch → log+skip+leave NULL; resume → fire-and-forget drain; sim → same code path; log line → "queued inbound for replay".
+
+## Implementation log (2026-05-02)
+
+**Status:** done
+
+| # | Unit | Outcome | Evidence |
+|---|------|---------|----------|
+| 1 | New `PausedInbound` model + index pair (`workspace_id+created_at`, `replayed_at+created_at`) | done | `autosdr/models.py:PausedInbound`; `Base.metadata.create_all` picks it up on legacy DBs, indexes ride along; full suite green |
+| 2 | Webhook handler queues instead of dropping | done | `autosdr/api/webhooks.py:_persist_paused_inbound` + `_process_in_background` log line is now `"killswitch on; queued inbound for replay: %s"`; `tests/test_killswitch_inbound_durability.py::test_webhook_sim_queues_paused_inbound_when_killswitch_on` and `…_sms_…` confirm both routes |
+| 3 | Resume drain function | done | `autosdr/pipeline/replay.py::drain_paused_inbounds` walks unreplayed rows oldest-first, dispatches each through `process_incoming_message`, stamps `replayed_at` on success, leaves NULL on failure / connector-mismatch; `tests/test_killswitch_inbound_durability.py::test_resume_drains_queue_into_reply_pipeline` and `…_drain_skips_connector_mismatch` cover both paths |
+| 4 | `GET /api/status` exposes `paused_inbound.{pending_count, oldest_pending_at}` | done | `autosdr/api/schemas.py:PausedInboundStatus` + `autosdr/api/status.py:_paused_inbound_status` aggregate via the new index; `tests/test_killswitch_inbound_durability.py::test_status_endpoint_surfaces_pending_count` confirms three queued inbounds surface as `pending_count=3` and a non-null `oldest_pending_at`; `tests/test_api_smoke.py::test_app_boots_with_workspace_and_file_connector` pins the empty-on-fresh-boot shape |
+| 5 | Frontend types + KillSwitch banner badge | done | `frontend/src/lib/types.ts:SystemStatus.paused_inbound` mirrors the backend schema; `frontend/src/components/layout/KillSwitch.tsx` renders an `N inbound(s) waiting` chip in the mustard-soft palette next to the toggle when `pending_count > 0`, with a tooltip surfacing `oldest_pending_at`; `npx tsc -b --noEmit` clean |
+| 6 | Killswitch durability + opt-out-during-pause tests | done | `tests/test_killswitch_inbound_durability.py` (6 passed) — covers: queue-not-drop on `/sim` and `/sms`, drain-on-resume reaches expected thread state, STOP-during-pause flips `lead.do_not_contact_at` on resume, connector-mismatch is a skip-not-replay, status endpoint surfaces `pending_count` |
+
+**Final state of success criteria:**
+- `paused_inbound` table exists; additive migration tested. ✓ — `autosdr/models.py:PausedInbound`; `Base.metadata.create_all` is idempotent and the new indexes ride along.
+- Webhook handler queues instead of dropping when paused; unit test covers both `/api/webhooks/sms` and `/api/webhooks/sim`. ✓ — `tests/test_killswitch_inbound_durability.py::test_webhook_sim_queues_paused_inbound_when_killswitch_on` and `…_sms_…`.
+- `POST /api/status/resume` triggers a drain that walks the queue oldest-first; the drain doesn't block the response (`asyncio.create_task`). ✓ — `autosdr/api/status.py:resume_system` is now `async` and wraps `drain_paused_inbounds()` in `asyncio.create_task(...)`; the snapshot loader in `replay.py` orders by `created_at.asc()`.
+- `tests/test_killswitch_inbound_durability.py` (new) green — three required cases. ✓ — 6 / 6 cases pass (the three required + connector mismatch + status surface + sms route).
+- STOP during pause results in `lead.do_not_contact_at` set on resume. ✓ — `tests/test_killswitch_inbound_durability.py::test_stop_during_pause_marks_do_not_contact_on_resume`; the deterministic opt-out shortcut runs unchanged inside `process_incoming_message`, fired by the replay path.
+- `GET /api/status` exposes `paused_inbound.pending_count`. ✓ — `tests/test_api_smoke.py::test_app_boots_with_workspace_and_file_connector` and the durability test above.
+- Frontend killswitch banner renders the count. ✓ — `frontend/src/components/layout/KillSwitch.tsx` chip with mustard-soft styling, screen-reader label, tooltip with `oldest_pending_at`.
+- Backend test suite green; frontend `tsc -b --noEmit` clean. ✓ — **610 passed, 6 skipped**; tsc exit 0.
+
+**Principle check after implementation:**
+- Owner stays in control: ✓✓ — pause is now a *processing* pause, not a *durability* pause; the badge tells the operator the queue exists.
+- Honest contracts: ✓ — `paused_inbound.pending_count` + `oldest_pending_at` surface on the status endpoint and the badge; the resume log line is now factually true (`"queued inbound for replay"`, not `"dropping inbound while paused"`).
+- Human always wins: ✓✓ — the HITL "I see every reply" promise is restored across pause windows.
+- AI loop is the moat: ✓ — no AI-surface change.
+- Cheap before grand: ✓ — tiny table + tiny drain function; explicitly defers the per-row "drop this paused inbound" UI action and queue auto-expiry to v2.
+
+**Follow-ups raised:**
+- **Modal listing pending paused inbounds.** The ticket scope mentions a modal opened from the badge that lists `contact_uri / content / created_at`. Shipped only the badge in this round (the v1 ship-bar was "render the count"). A list modal needs a new `GET /api/paused-inbounds` endpoint and a small modal component. File when the queue routinely has > 10 entries on resume and operator wants to triage before draining.
+- **CLI `autosdr status` extension.** The ticket scope mentions the CLI; there's no CLI in the repo today (no `[project.scripts]` entry, no `autosdr/__main__.py`). When the CLI lands (separate ticket), surface `paused_inbound.pending_count` in its summary.
+- **Per-row delete UI.** The ticket lists this as out-of-scope and the pattern stands.
+
+**Open questions still unresolved:** (none)

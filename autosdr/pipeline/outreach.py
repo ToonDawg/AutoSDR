@@ -41,6 +41,7 @@ from autosdr.pipeline._shared import (
     hitl_context_from_send_failure,
     pause_thread_for_hitl,
     read_loop_settings,
+    schedule_hitl_push,
     thread_history,
 )
 from autosdr.pipeline.followup import schedule_followup_send
@@ -445,6 +446,11 @@ async def run_outreach_for_campaign_lead(
         )
         campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
         session.flush()
+        schedule_hitl_push(
+            thread_id=thread.id,
+            lead_name=lead.name,
+            hitl_reason="eval_failed_after_max_attempts",
+        )
         logger.warning(
             "outreach escalated lead=%s thread=%s reason=eval_failed attempts=%d last_overall=%.3f",
             lead.id,
@@ -558,6 +564,11 @@ async def run_outreach_for_campaign_lead(
         )
         campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
         session.flush()
+        schedule_hitl_push(
+            thread_id=thread.id,
+            lead_name=lead.name,
+            hitl_reason="connector_send_failed",
+        )
         logger.error(
             "outreach connector failed lead=%s thread=%s error=%s",
             lead.id,

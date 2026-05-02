@@ -266,9 +266,67 @@ per the ticket-implementer workflow.
   migration. The smallest-fix-that-closes-the-bug is exactly
   the executor wrap + transaction split. ✓
 
+## Resolved questions (2026-05-02)
+
+### Resolved: pending-classification-flag (OQ1)
+
+**Architect:** Don't add `pending_classification` in this ticket. The current code already commits the inbound `Message` row in Phase 1; the crash-mid-LLM-call gap is a rare edge case that self-heals via the Inbox view (the thread has an unprocessed lead message visible to the operator). Adding a flag without a reconciliation worker is drift; adding both expands scope.
+**Skeptic:** Reject the Phase 1 commit entirely; use a staging/outbox row that promotes transactionally with classification. A boolean plus startup-only sweep is weaker than the no-orphaned-business-row guarantee.
+**Pragmatist:** Ship `pending_classification` + a startup reconciliation worker now — cheapest credible gap-closer that keeps the phased pipeline. Reconciliation must be idempotent (treat the flag as a lease, not "retry everything").
+**Critic:** Adding `pending_classification` is the wrong abstraction: it creates a parallel state machine layered on top of `Thread.status` / `CampaignLead.status` / 0009's `paused_inbound`, and a single bit can't distinguish "never classified" from "classified but Phase 3 didn't finish". Load-bearing flag with silent-omission failure modes.
+
+**Decision:** Phase 1 commit of the inbound `Message` row stays as-is (already shipped). No `pending_classification` boolean. File a follow-up ticket for crash-time reconciliation if a stuck-ACTIVE-with-unprocessed-inbound case is observed in practice; the right abstraction at that point is likely a "claim/lease/complete" enum or 0009-style queue rather than a single boolean.
+**Strongest dissent:** Pragmatist — leaves a real (if rare) failure mode where a process crash during the 5–15s LLM window strands an inbound on a thread without HITL escalation.
+**Confidence:** medium
+**Why this is acceptable:** The crash window is small (single-process, single-worker, well-behaved on SIGTERM via killswitch hard-stop), the operator can find the thread via the Inbox, and we avoid both schema drift and a half-built reconciliation pathway.
+
+### Resolved: executor-bounding (OQ2)
+
+**Decision:** Use the default `loop.run_in_executor(None, ...)`. The default `ThreadPoolExecutor` cap (`min(32, os.cpu_count() + 4)`) far exceeds AutoSDR's worst-case audit-row throughput (≤ 1 LLM call/sec/inbound × at most a handful of inbounds in flight). Switch to a bounded `ThreadPoolExecutor(max_workers=4)` only if we ever observe audit rows backing up.
+**Confidence:** high — pragmatic obvious answer, no council required.
+
+### Resolved: busy-timeout-callers (OQ3)
+
+**Decision:** Drop `busy_timeout` to 5000 ms globally on the engine `connect` event. Audit confirms the only legitimate long-write callers are `_apply_additive_column_migrations` / `_apply_additive_index_migrations` (single ALTER / CREATE INDEX statements that finish in milliseconds against a quiet DB at startup) and a handful of `scripts/*.py` batch jobs. Scripts that genuinely need a longer wait can scope it per-session via `connection.execute("PRAGMA busy_timeout=…")` rather than burdening the API request path with a 2-minute writer-lock-killer. No script today exhibits this need.
+**Confidence:** high — factual audit, no council required.
+
 ## Decisions log
 
-(Empty — populated during implementation.)
+- **2026-05-02** — Resolved OQ1/OQ2/OQ3 (see above). Phase 1 commit stays; no `pending_classification` flag this round; default unbounded executor for `_log_call`; `busy_timeout` 120000 → 5000.
+
+## Implementation log (2026-05-02)
+
+**Status:** done
+
+| # | Unit | Outcome | Evidence |
+|---|------|---------|----------|
+| 1 | AST lint test for `await` inside `with session_scope()` / `with db_session()` | done | `tests/test_no_await_in_session.py` (51 passed, 6 skipped — 6 pre-existing violations explicitly allowlisted with follow-up notes) |
+| 2 | Move `_log_call` + `_update_parsed_json` writes onto `loop.run_in_executor` | done | `autosdr/llm/client.py:_persist_audit_row_sync` + `_log_call` (now `async`) dispatch via the loop's default executor and `await` the future; `tests/test_llm_call_log.py` (10 passed) verifies row + JSONL persistence; `tests/test_reply_pipeline_concurrency.py::test_competing_writer_not_blocked_during_pipeline_llm_call` confirms the loop isn't blocked |
+| 3 | Tighten `PRAGMA busy_timeout` from 120 000 ms → 5 000 ms | done | `autosdr/db.py:_enable_sqlite_fk` — comment now says a real 5 s wait is a contention bug worth surfacing; full backend suite still green |
+| 4 | Concurrency tests: competing-writer-during-LLM-await + concurrent inbounds | done | `tests/test_reply_pipeline_concurrency.py` (2 passed) — competing writer median < 50 ms during a 0.4 s LLM await; two concurrent inbounds finish under 1 s vs 5 s+ pre-fix |
+| 5 | `ARCHITECTURE.md` concurrency rules subsection | done | New `## 12. Database concurrency rules` section explains the "no `await` inside `session_scope()`" invariant, the three-part fix, and the runtime test that asserts it; subsequent sections renumbered |
+
+**Final state of success criteria:**
+- `process_incoming_message` no longer holds `session_scope()` across `await`. ✓ — `tests/test_no_await_in_session.py::test_no_await_inside_session_scope[autosdr/pipeline/reply.py]` is green; the file is *not* on the `_KNOWN_VIOLATIONS` allowlist.
+- `_log_call` writes are issued via the loop's default executor; no event-loop blocking. ✓ — `autosdr/llm/client.py:_log_call` dispatches via `loop.run_in_executor(None, _persist_audit_row_sync, payload)` then `await`s; `tests/test_reply_pipeline_concurrency.py::test_competing_writer_not_blocked_during_pipeline_llm_call` proves the loop services other writers during the await.
+- `tests/test_reply_pipeline_concurrency.py` passes both responsive-status and concurrent-inbounds cases. ✓ — 2 / 2 green.
+- `data/autosdr.db-wal` stays under 32 MB during a rehearsal of 5 inbounds. ⚠ — not measured in this implementation pass; the responsive-status test indirectly validates it (no competing-writer starvation means WAL gets a chance to checkpoint), but a real rehearsal pass is operator-side. Logged in implementation log; treat as a follow-up smoke during the next manual rehearsal.
+- `ARCHITECTURE.md` has a "Concurrency rules" subsection. ✓ — `ARCHITECTURE.md § 12`.
+- Backend test suite green. ✓ — `python -m pytest tests/` → **610 passed, 6 skipped** (the 6 skips are the pre-existing-violation allowlist).
+
+**Principle check after implementation:**
+- Owner stays in control: ✓ — `/api/status` is responsive during pipeline runs; competing writer median < 50 ms during a 0.4 s LLM await (was waiting full `busy_timeout` pre-fix).
+- Honest contracts: ✓ — `_log_call` no longer silently drops audit rows under contention; the executor `await` propagates failures into the logger rather than `OperationalError: database is locked`.
+- Human always wins: ✓ — Phase 1 commits the inbound `Message` row before the LLM call; the operator's "I always see every reply" promise no longer depends on the LLM call succeeding.
+- AI loop is the moat: ✓ — no AI-surface change.
+- Cheap before grand: ✓ — no worker queue (Celery/RQ); no Postgres migration; the smallest fix that closes the bug.
+
+**Follow-ups raised:**
+- `tests/test_no_await_in_session.py` allowlist: `scheduler.py`, `api/threads.py`, `pipeline/followup.py`, `api/campaigns.py`, `api/leads.py`, `api/scans.py` all still hold a session across an `await`. Each carries an explanatory note in `_KNOWN_VIOLATIONS` and a "follow-up ticket" reference. None is a webhook hot path; the volume / contention profile lets them ride for now. File six small port-to-phased-pattern follow-up tickets when the operator complains about any of those paths feeling sluggish under load.
+- WAL size measurement under a real 5-inbound rehearsal — operator-side smoke, not coverable in pytest.
+- Crash-mid-LLM-call reconciliation (OQ1's strongest dissent): if a stuck-ACTIVE-with-unprocessed-inbound case is observed in practice, file a ticket for a "claim/lease/complete" enum or a 0009-style reconciliation queue rather than a single `pending_classification` boolean.
+
+**Open questions still unresolved:** (none)
 
 ## Reference: failure trace from 2026-04-27 evening rehearsal
 

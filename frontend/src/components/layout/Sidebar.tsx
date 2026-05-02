@@ -18,6 +18,10 @@ import { useHitlCount } from "@/lib/useHitlThreads";
 /**
  * Primary navigation. Flat list, no section markers. The "needs your eye"
  * count re-queries every 10s so the badge stays roughly live.
+ *
+ * Below `md:` the desktop `<aside>` is hidden; the same `NavList` is
+ * rendered inside `MobileDrawer` instead, so there is exactly one
+ * source of truth for the nav links + HITL badge.
  */
 
 interface NavItem {
@@ -38,57 +42,68 @@ const NAV: NavItem[] = [
   { label: "Settings", to: "/settings", icon: Settings },
 ];
 
-export function Sidebar() {
+export function NavList({ onNavigate }: { onNavigate?: () => void } = {}) {
   const { data: hitl } = useHitlCount();
+  const hitlCount = hitl?.active ?? 0;
+
+  return (
+    <nav className="flex flex-col gap-0.5 flex-1">
+      {NAV.map((item) => (
+        <NavLink
+          key={item.to}
+          to={item.to}
+          end={item.to === "/"}
+          onClick={onNavigate}
+          className={({ isActive }) =>
+            cn(
+              "group flex items-center gap-2.5 px-2.5 py-2 border border-transparent text-sm transition-colors min-h-[44px]",
+              isActive
+                ? "bg-ink text-paper border-ink"
+                : "text-ink-muted hover:text-ink hover:bg-paper-deep",
+            )
+          }
+        >
+          <item.icon className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+          <span className="flex-1">{item.label}</span>
+          {item.badge === "hitl" && hitlCount > 0 && (
+            <span className="px-1.5 h-5 inline-flex items-center justify-center font-mono text-[10px] bg-rust text-paper">
+              {hitlCount}
+            </span>
+          )}
+        </NavLink>
+      ))}
+    </nav>
+  );
+}
+
+export function NavBranding() {
   const { data: workspace } = useQuery({
     queryKey: ["workspace"],
     queryFn: () => api.getWorkspace(),
   });
-
-  const hitlCount = hitl?.active ?? 0;
-
   return (
-    <aside className="sticky top-0 z-20 self-start flex flex-col gap-6 h-screen w-56 shrink-0 border-r border-rule bg-paper px-4 py-5 overflow-y-auto">
-      <div className="flex items-center gap-2">
-        <div className="h-7 w-7 bg-ink text-paper flex items-center justify-center font-mono text-xs font-semibold">
-          AS
-        </div>
-        <div className="flex flex-col leading-tight min-w-0">
-          <span className="text-sm font-medium truncate">
-            {workspace?.business_name ?? "AutoSDR"}
-          </span>
-          <span className="text-[10px] text-ink-muted uppercase tracking-wide">
-            Operator console
-          </span>
-        </div>
+    <div className="flex items-center gap-2">
+      <div className="h-7 w-7 bg-ink text-paper flex items-center justify-center font-mono text-xs font-semibold">
+        AS
       </div>
+      <div className="flex flex-col leading-tight min-w-0">
+        <span className="text-sm font-medium truncate">
+          {workspace?.business_name ?? "AutoSDR"}
+        </span>
+        <span className="text-[10px] text-ink-muted uppercase tracking-wide">
+          Operator console
+        </span>
+      </div>
+    </div>
+  );
+}
 
-      <nav className="flex flex-col gap-0.5 flex-1">
-        {NAV.map((item) => (
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end={item.to === "/"}
-            className={({ isActive }) =>
-              cn(
-                "group flex items-center gap-2.5 px-2.5 py-2 border border-transparent text-sm transition-colors",
-                isActive
-                  ? "bg-ink text-paper border-ink"
-                  : "text-ink-muted hover:text-ink hover:bg-paper-deep",
-              )
-            }
-          >
-            <item.icon className="h-3.5 w-3.5" strokeWidth={1.5} />
-            <span className="flex-1">{item.label}</span>
-            {item.badge === "hitl" && hitlCount > 0 && (
-              <span className="px-1.5 h-5 inline-flex items-center justify-center font-mono text-[10px] bg-rust text-paper">
-                {hitlCount}
-              </span>
-            )}
-          </NavLink>
-        ))}
-      </nav>
-
+/** Desktop sidebar, hidden below the `md:` breakpoint. */
+export function Sidebar() {
+  return (
+    <aside className="hidden md:flex sticky top-0 z-20 self-start flex-col gap-6 h-screen w-56 shrink-0 border-r border-rule bg-paper px-4 py-5 overflow-y-auto">
+      <NavBranding />
+      <NavList />
       <div className="text-[10px] text-ink-faint font-mono">AutoSDR · v0.4</div>
     </aside>
   );

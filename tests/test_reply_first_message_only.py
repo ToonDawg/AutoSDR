@@ -115,11 +115,11 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch, responses: dict[str, Any]) -> No
     # ``generation-v7``. Alias one to the other so existing test
     # fixtures keep working without per-test edits.
     _PROMPT_ALIASES = {
-        "followup-reply-v1": "generation-v7",
+        "followup-reply-v1": "generation-v8",
     }
 
     async def _fake_complete_text(
-        *, system, user, model, prompt_version, temperature, context=None
+        *, system, user, model, prompt_version, temperature, context=None, **_kwargs
     ):
         key = prompt_version if prompt_version in responses else _PROMPT_ALIASES.get(
             prompt_version, prompt_version
@@ -133,7 +133,7 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch, responses: dict[str, Any]) -> No
         )
 
     async def _fake_complete_json(
-        *, system, user, model, prompt_version, temperature=0.0, context=None
+        *, system, user, model, prompt_version, temperature=0.0, context=None, **_kwargs
     ):
         payload = responses.get(prompt_version)
         if isinstance(payload, list):
@@ -179,13 +179,13 @@ async def test_positive_reply_goes_to_hitl_with_suggestions(
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "positive",
                 "confidence": 0.92,
                 "reason": "Lead wants to know more.",
             },
-            "generation-v7": list(drafts),
-            "evaluation-v4.3": [eval_payload, eval_payload, eval_payload],
+            "generation-v8": list(drafts),
+            "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
 
@@ -264,13 +264,13 @@ async def test_negative_intent_still_parks_for_hitl(
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "negative",
                 "confidence": 0.95,
                 "reason": "lead is not interested",
             },
-            "generation-v7": list(drafts),
-            "evaluation-v4.3": [eval_payload, eval_payload, eval_payload],
+            "generation-v8": list(drafts),
+            "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
     connector = FileConnector(outbox_path=first_message_only_thread["outbox_path"])
@@ -321,13 +321,13 @@ async def test_goal_achieved_intent_still_parks_for_hitl(
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "goal_achieved",
                 "confidence": 0.95,
                 "reason": "booked",
             },
-            "generation-v7": list(drafts),
-            "evaluation-v4.3": [eval_payload, eval_payload, eval_payload],
+            "generation-v8": list(drafts),
+            "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
     connector = FileConnector(outbox_path=first_message_only_thread["outbox_path"])
@@ -452,13 +452,13 @@ async def test_third_party_stop_does_not_trigger_shortcut(
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "unclear",
                 "confidence": 0.5,
                 "reason": "ambiguous",
             },
-            "generation-v7": ["draft"],
-            "evaluation-v4.3": {
+            "generation-v8": ["draft"],
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.8,
                     "personalisation": 0.8,
@@ -595,13 +595,13 @@ async def test_two_inbounds_same_thread_no_double_park(
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "positive",
                 "confidence": 0.9,
                 "reason": "interested",
             },
-            "generation-v7": list(drafts),
-            "evaluation-v4.3": [eval_payload, eval_payload, eval_payload],
+            "generation-v8": list(drafts),
+            "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
 
@@ -712,16 +712,16 @@ async def test_inbound_dedupes_on_provider_message_id(
     from autosdr.llm.client import CompletionResult
 
     async def _tracking_complete_json(
-        *, system, user, model, prompt_version, temperature=0.0, context=None
+        *, system, user, model, prompt_version, temperature=0.0, context=None, **_kwargs
     ):
         classifier_calls.append(prompt_version)
-        if prompt_version == "classification-v1":
+        if prompt_version == "classification-v1.1":
             payload = {
                 "intent": "positive",
                 "confidence": 0.92,
                 "reason": "interested",
             }
-        elif prompt_version == "evaluation-v4.3":
+        elif prompt_version == "evaluation-v4.7":
             payload = eval_payload
         else:
             payload = {}
@@ -736,7 +736,7 @@ async def test_inbound_dedupes_on_provider_message_id(
         )
 
     async def _tracking_complete_text(
-        *, system, user, model, prompt_version, temperature, context=None
+        *, system, user, model, prompt_version, temperature, context=None, **_kwargs
     ):
         classifier_calls.append(prompt_version)
         return CompletionResult(
@@ -837,13 +837,13 @@ async def test_inbound_message_uses_received_at_for_created_at(
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "negative",
                 "confidence": 0.95,
                 "reason": "not interested",
             },
-            "generation-v7": ["d1", "d2", "d3"],
-            "evaluation-v4.3": [eval_payload, eval_payload, eval_payload],
+            "generation-v8": ["d1", "d2", "d3"],
+            "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
 

@@ -85,7 +85,7 @@ def _categories_of(picks: list[tuple[CampaignLead, Lead]]) -> list[str | None]:
 def _seed_contact(session, campaign_lead: CampaignLead) -> Thread:
     """Attach a thread + a single AI message so the lead reads as 'contacted'.
 
-    The picker's "ever contacted" / "sent_24h" signals are derived from
+    The picker's "ever contacted" / "sent_today" signals are derived from
     the first AI message per thread; one message is enough to flip both.
     """
 
@@ -145,7 +145,7 @@ def test_avoids_consecutive_same_category(fresh_db, workspace_factory):
 
 
 def test_biases_away_from_already_contacted_categories(fresh_db, workspace_factory):
-    """If P has 24h history and E has none, E goes first regardless of FIFO.
+    """If P has today's history and E has none, E goes first regardless of FIFO.
 
     Queue is [P (pos1), P (pos2), E (pos3)] but a previous tick already
     contacted a Plumber on this campaign. The "untouched-categories

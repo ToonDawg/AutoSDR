@@ -3,8 +3,9 @@
 Two concurrent concerns run inside the scheduler:
 
 * **Outreach tick** — every ``scheduler_tick_s`` seconds, scan active campaigns,
-  enforce the rolling 24h quota, and send the next batch of queued leads
-  through the outreach pipeline (:func:`run_outreach_for_campaign_lead`).
+  enforce the daily quota (calendar-day, resets at server-local midnight), and
+  send the next batch of queued leads through the outreach pipeline
+  (:func:`run_outreach_for_campaign_lead`).
 * **Inbound poll** — every ``inbound_poll_s`` seconds, ask the connector for
   any new inbound messages (``connector.poll_incoming``) and push each through
   the reply pipeline. For TextBee this is how replies arrive — no public URL
@@ -47,9 +48,10 @@ from autosdr.pacing import (
     window_allowance,
 )
 from autosdr.pipeline import process_incoming_message, run_outreach_for_campaign_lead
+from autosdr.pipeline.priority import is_priority_lead
 from autosdr.quota import (
-    count_outreach_contacts_last_24h,
-    count_outreach_contacts_per_category_24h,
+    count_outreach_contacts_per_category_today,
+    count_outreach_contacts_today,
 )
 from autosdr.workspace_settings import load_workspace_settings_or_empty
 
@@ -135,8 +137,27 @@ def _categories_ever_contacted(
     return {row[0] for row in session.execute(stmt).all()}
 
 
+def _resolve_priority_enabled(workspace_settings: dict | None) -> bool:
+    """Read ``priority.enabled`` from a workspace settings blob.
+
+    Defaults to ``True`` for missing / partial blobs so new installs and
+    pre-0013 workspace rows behave like the post-0013 default. The
+    setup wizard backfills the full sub-tree on first launch via
+    :func:`autosdr.config.merge_workspace_settings`.
+    """
+
+    if not workspace_settings:
+        return True
+    cfg = workspace_settings.get("priority") or {}
+    return bool(cfg.get("enabled", True))
+
+
 def _next_queued_leads(
-    session: Session, campaign_id: str, limit: int
+    session: Session,
+    campaign_id: str,
+    limit: int,
+    *,
+    priority_enabled: bool = True,
 ) -> list[tuple[CampaignLead, Lead]]:
     """Pick the next N queued campaign-lead assignments with category rotation.
 
@@ -150,13 +171,25 @@ def _next_queued_leads(
     2. Prefer categories that have never been contacted in this
        campaign — first the untouched buckets, then the rest.
     3. Within "already contacted", prefer the *least* recently contacted
-       (24h count + intra-batch picks).
+       (today's count + intra-batch picks).
     4. Tie-break on ``queue_position`` so import order still wins inside
        a category.
 
     The intent is light interleaving, not a strict cap: degenerates to
     pure FIFO when only one category is queued, and won't ever skip a
     lead that the old picker would have sent.
+
+    Send-order priority (ticket 0013): when ``priority_enabled`` is
+    ``True`` (the workspace default), candidates are first split into a
+    **priority tier** (``is_priority_lead(lead)`` = True, e.g.
+    ``enrichment_status == "not_found"``) and a **normal tier**. The
+    priority tier is drained completely under the same 4-key scorer
+    before the normal tier starts; ``last_sent_cat`` and the
+    ``intra_batch`` counter carry across the tier boundary so we still
+    avoid back-to-back same-category sends and balance today's counts
+    even when a tier transition happens mid-batch. With
+    ``priority_enabled = False``, both tiers collapse into a single
+    bucket dict and behaviour is byte-identical to pre-0013.
 
     All quota / outreach-window enforcement happens upstream in
     :func:`run_campaign_outreach_batch`; we only reorder within the
@@ -184,39 +217,61 @@ def _next_queued_leads(
     if not all_candidates:
         return []
 
-    sent_24h = count_outreach_contacts_per_category_24h(session, campaign_id)
+    sent_today = count_outreach_contacts_per_category_today(session, campaign_id)
     ever_contacted = _categories_ever_contacted(session, campaign_id)
     last_sent_cat = _most_recent_contact_category(session, campaign_id)
 
-    # Group candidates by category, keeping each bucket FIFO. Popping
-    # from the head of each bucket is O(1) and makes the per-pick scan
-    # O(num_categories) rather than O(num_queued).
-    buckets: dict[str | None, list[tuple[CampaignLead, Lead]]] = {}
+    # Two-tier bucketing. With ``priority_enabled=False`` everything
+    # lands in the normal tier and the picker collapses to its
+    # pre-0013 single-pass shape — exercised by
+    # ``test_priority_toggle_off_is_byte_identical`` so the regression
+    # bar stays observable.
+    priority_buckets: dict[str | None, list[tuple[CampaignLead, Lead]]] = {}
+    normal_buckets: dict[str | None, list[tuple[CampaignLead, Lead]]] = {}
     for cl, lead in all_candidates:
-        buckets.setdefault(lead.category, []).append((cl, lead))
+        target = (
+            priority_buckets
+            if priority_enabled and is_priority_lead(lead)
+            else normal_buckets
+        )
+        target.setdefault(lead.category, []).append((cl, lead))
 
     intra_batch: dict[str | None, int] = {}
     picked: list[tuple[CampaignLead, Lead]] = []
 
-    while len(picked) < limit:
-        non_empty_cats = [cat for cat, rows in buckets.items() if rows]
-        if not non_empty_cats:
+    # Drain the priority tier first, then the normal tier. The
+    # rotation state (``last_sent_cat``, ``intra_batch``) carries
+    # across the boundary so the picker never stacks two same-category
+    # sends just because one was the last priority pick and the other
+    # is the first normal pick.
+    for buckets in (priority_buckets, normal_buckets):
+        while len(picked) < limit:
+            non_empty_cats = [cat for cat, rows in buckets.items() if rows]
+            if not non_empty_cats:
+                break
+
+            def score(
+                cat: str | None,
+                _buckets: dict[
+                    str | None, list[tuple[CampaignLead, Lead]]
+                ] = buckets,
+            ) -> tuple[int, int, int, int]:
+                head = _buckets[cat][0]
+                return (
+                    1 if cat == last_sent_cat else 0,
+                    1 if cat in ever_contacted else 0,
+                    sent_today.get(cat, 0) + intra_batch.get(cat, 0),
+                    head[0].queue_position,
+                )
+
+            chosen_cat = min(non_empty_cats, key=score)
+            cl, lead = buckets[chosen_cat].pop(0)
+            picked.append((cl, lead))
+            intra_batch[chosen_cat] = intra_batch.get(chosen_cat, 0) + 1
+            last_sent_cat = chosen_cat
+
+        if len(picked) >= limit:
             break
-
-        def score(cat: str | None) -> tuple[int, int, int, int]:
-            head = buckets[cat][0]
-            return (
-                1 if cat == last_sent_cat else 0,
-                1 if cat in ever_contacted else 0,
-                sent_24h.get(cat, 0) + intra_batch.get(cat, 0),
-                head[0].queue_position,
-            )
-
-        chosen_cat = min(non_empty_cats, key=score)
-        cl, lead = buckets[chosen_cat].pop(0)
-        picked.append((cl, lead))
-        intra_batch[chosen_cat] = intra_batch.get(chosen_cat, 0) + 1
-        last_sent_cat = chosen_cat
 
     return picked
 
@@ -254,7 +309,7 @@ async def run_campaign_outreach_batch(
     """Send up to ``max_count`` queued leads for one campaign.
 
     The scheduler uses ``respect_quota=True``; manual operator kick-offs use
-    ``False`` so they can intentionally spend beyond the rolling cap.
+    ``False`` so they can intentionally spend beyond today's daily cap.
     ``respect_quota`` also gates the working-hours window — kickoff bypasses
     both because the operator pressed the button on purpose.
 
@@ -268,25 +323,29 @@ async def run_campaign_outreach_batch(
     if requested <= 0:
         return summary
 
+    # Single clock read for the whole tick so the daily-quota cutoff and
+    # the working-window gate can't disagree about what "today" means
+    # across a midnight rollover mid-tick.
+    clock = now_local or datetime.now().astimezone()
+
     batch_limit = requested
     if respect_quota:
-        sent_last_24h = count_outreach_contacts_last_24h(session, campaign.id)
-        remaining_quota = max(0, campaign.outreach_per_day - sent_last_24h)
+        sent_today = count_outreach_contacts_today(
+            session, campaign.id, now_local=clock
+        )
+        remaining_quota = max(0, campaign.outreach_per_day - sent_today)
         if remaining_quota < batch_limit:
             summary.capped_by_quota = True
             batch_limit = remaining_quota
         if batch_limit == 0:
             logger.debug(
-                "campaign %s at daily cap (%d sent in last 24h)",
+                "campaign %s at daily cap (%d sent today)",
                 campaign.name,
-                sent_last_24h,
+                sent_today,
             )
             return summary
 
-        # Working-hours window pacing — stacks under the 24h cap. ``None``
-        # local clock means "use the OS clock with its current tz"; tests
-        # inject a fixed datetime to keep the gate deterministic.
-        clock = now_local or datetime.now().astimezone()
+        # Working-hours window pacing — stacks under the daily cap.
         window = resolve_window(
             campaign_window=campaign.outreach_window,
             workspace_settings=workspace.settings,
@@ -315,7 +374,12 @@ async def run_campaign_outreach_batch(
             )
             return summary
 
-    candidates = _next_queued_leads(session, campaign.id, batch_limit)
+    candidates = _next_queued_leads(
+        session,
+        campaign.id,
+        batch_limit,
+        priority_enabled=_resolve_priority_enabled(workspace.settings),
+    )
     for campaign_lead, lead in candidates:
         if killswitch.is_paused():
             raise killswitch.KillSwitchTripped()

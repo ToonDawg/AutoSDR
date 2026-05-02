@@ -134,6 +134,14 @@ export interface WorkspaceSettings {
   // ``autosdr/api/schemas.py::EnrichmentConfig`` and ticket 0011.
   enrichment: EnrichmentConfig;
 
+  // Send-order priority — when ``enabled`` is true (the default), the
+  // scheduler picker drains a priority tier (today: leads whose
+  // website returned 404 on scan) before the normal tier on every
+  // tick. The category-mix interleave runs unchanged within each
+  // tier. Toggling off restores the pre-0013 single-tier behaviour.
+  // See ticket 0013.
+  priority: PriorityConfig;
+
   llm: {
     provider_api_keys: {
       gemini?: string | null;
@@ -146,6 +154,7 @@ export interface WorkspaceSettings {
     model_classification: string;
     temperature_main?: number;
     temperature_eval?: number;
+    reasoning_classification?: 'disable' | 'low' | 'medium' | 'high';
   };
 
   connector: {
@@ -201,6 +210,34 @@ export interface Lead {
   /** Stable ``opt_out:<KEYWORD>`` string or operator-supplied free text. */
   do_not_contact_reason: string | null;
   created_at: ISODate;
+  /**
+   * ``true`` when the scheduler will send this lead before normal-tier
+   * leads on the next pass. Fires on either
+   * ``enrichment_status == "not_found"`` (ticket 0013) or
+   * ``Lead.website`` being a social-profile URL (ticket 0014). See
+   * ``autosdr/pipeline/priority.py::is_priority_lead``.
+   */
+  is_priority: boolean;
+  /**
+   * Literal token explaining the priority tier:
+   * - ``"not_found"`` — server returned 404/410 on the website scan.
+   * - ``"social_profile_website"`` — ``website`` is a Facebook / IG /
+   *   LinkedIn / etc. URL.
+   * ``null`` when ``is_priority`` is false. Single deterministic
+   * winner: ``not_found`` outranks ``social_profile_website`` when
+   * both fire on the same lead.
+   */
+  priority_reason: string | null;
+  /**
+   * Informational platform token (``"facebook"``, ``"instagram"``,
+   * ``"linkedin"``, ``"twitter"``, ``"x"``, ``"tiktok"``,
+   * ``"youtube"``) when ``website`` is itself a social-profile URL,
+   * else ``null``. Set independently of priority — a 404'd Facebook
+   * URL has ``priority_reason="not_found"`` (precedence) but still
+   * exposes ``is_social_website="facebook"`` so the
+   * ``SocialProfileTag`` chip renders. Ticket 0014.
+   */
+  is_social_website: string | null;
 }
 
 /**
@@ -295,6 +332,20 @@ export interface EnrichmentConfig {
   budget_s: number;
   cache_ttl_days: number;
   respect_robots: boolean;
+}
+
+/**
+ * Per-workspace knobs for the send-order priority tier (ticket 0013).
+ *
+ * - ``enabled``: master switch. When ``false`` the scheduler picker
+ *   collapses to the pre-0013 single-tier behaviour — exactly what
+ *   operators saw before priority shipped.
+ *
+ * The vocabulary widens to platform filters in ticket 0014; this
+ * interface gains additional keys then.
+ */
+export interface PriorityConfig {
+  enabled: boolean;
 }
 
 /**
@@ -474,6 +525,13 @@ export interface Campaign {
   created_at: ISODate;
   lead_count: number;
   queued_count: number;
+  /**
+   * Subset of ``queued_count`` whose leads will be sent ahead of the
+   * rest by the scheduler picker (ticket 0013). Always
+   * ``<= queued_count``. Used by ``CampaignDetail`` to render
+   * "X of Y queued are priority" next to the queued tile.
+   */
+  queued_priority_count: number;
   sending_count: number;
   paused_for_hitl_count: number;
   contacted_count: number;
@@ -481,7 +539,13 @@ export interface Campaign {
   won_count: number;
   lost_count: number;
   skipped_count: number;
-  sent_24h: number;
+  /**
+   * Outreach contacts opened *today* (calendar day, server-local
+   * midnight reset). One contact = one thread whose first AI message
+   * landed at-or-after today's midnight; follow-ups and auto-replies
+   * don't count. Resets again at server-local midnight.
+   */
+  sent_today: number;
 }
 
 /**
@@ -593,8 +657,10 @@ export interface HitlContext {
   classification_llm_call_id?: string | null;
   suggestions?: Suggestion[];
   attempts?: DraftAttempt[];
-  last_scores?: EvalScores;
+  last_drafts?: string[];
+  last_scores?: { overall?: number; feedback?: string | null; breakdown?: EvalScores }[];
   last_feedback?: string | null;
+  connector_error?: string | null;
   last_intent?: ReplyIntentT;
   last_confidence?: number;
   note?: string;
@@ -744,7 +810,7 @@ export interface SystemStatus {
   campaigns: {
     id: UUID;
     name: string;
-    sent_24h: number;
+    sent_today: number;
     quota: number;
   }[];
   scheduler: {
@@ -801,6 +867,13 @@ export interface ImportPreview {
     skip_reason: string | null;
   }[];
   columns: ImportPreviewColumn[];
+  /**
+   * Per-platform tally of rows whose ``website`` is a social-profile
+   * URL. Empty object when no social URLs were detected — frontend
+   * renders nothing in that case. Sample shape:
+   * ``{ "facebook": 12, "instagram": 3 }``. Ticket 0014.
+   */
+  social_website_hosts?: Record<string, number>;
 }
 
 /**

@@ -619,6 +619,13 @@ async def _classify_reply(
         model=settings_llm.get("model_classification", settings_llm["model_main"]),
         prompt_version=classification.PROMPT_VERSION,
         temperature=float(settings_llm.get("temperature_eval", 0.0)),
+        # Cap thinking budget — see ``reasoning_classification`` in
+        # ``autosdr/config.py`` for the long form. Default
+        # ``"disable"`` matches Flash-Lite's current behaviour
+        # exactly (verified via ``scripts/replay_classifier_smoke.py``)
+        # and pins it so a future provider change can't silently
+        # inflate per-classification cost.
+        reasoning_effort=settings_llm.get("reasoning_classification", "disable"),
         context=LlmCallContext(
             purpose=LlmCallPurpose.CLASSIFICATION,
             workspace_id=workspace.id,

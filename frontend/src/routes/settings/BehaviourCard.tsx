@@ -12,6 +12,7 @@ const _DEFAULT_ENRICHMENT = {
   cache_ttl_days: 30,
   respect_robots: true,
 };
+const _DEFAULT_PRIORITY = { enabled: true };
 
 function _clampHour(value: string, fallback: number): number {
   const n = Number(value);
@@ -23,6 +24,7 @@ export function BehaviourCard({ workspace }: { workspace: Workspace }) {
   const s = workspace.settings;
   const window = s.outreach_window ?? _DEFAULT_WINDOW;
   const enrichment = s.enrichment ?? _DEFAULT_ENRICHMENT;
+  const priority = s.priority ?? _DEFAULT_PRIORITY;
 
   const form = usePatchForm({
     resetKey: workspace.updated_at,
@@ -42,6 +44,7 @@ export function BehaviourCard({ workspace }: { workspace: Workspace }) {
       enrichment_budget_s: String(enrichment.budget_s),
       enrichment_cache_ttl_days: String(enrichment.cache_ttl_days),
       enrichment_respect_robots: enrichment.respect_robots,
+      priority_enabled: priority.enabled,
     }),
     save: (v) => {
       const startHour = _clampHour(v.outreach_window_start_hour, 8);
@@ -74,6 +77,9 @@ export function BehaviourCard({ workspace }: { workspace: Workspace }) {
           budget_s: budgetS,
           cache_ttl_days: cacheTtl,
           respect_robots: v.enrichment_respect_robots,
+        },
+        priority: {
+          enabled: v.priority_enabled,
         },
       } as Partial<WorkspaceSettings>);
     },
@@ -207,6 +213,21 @@ export function BehaviourCard({ workspace }: { workspace: Workspace }) {
             </Field>
           </div>
         )}
+      </div>
+
+      <div className="mt-5 pt-5 border-t border-rule">
+        <Toggle
+          label="Send priority leads first"
+          description={
+            form.state.priority_enabled
+              ? 'Leads whose website returned a 404 on the latest scan are sent before normal-tier leads on every scheduler tick. Category mix is preserved within each tier.'
+              : 'Disabled — the scheduler picks in queue + category-mix order without elevating broken-site leads.'
+          }
+          checked={form.state.priority_enabled}
+          onToggle={() =>
+            form.set('priority_enabled', !form.state.priority_enabled)
+          }
+        />
       </div>
 
       <div className="mt-5 pt-5 border-t border-rule">

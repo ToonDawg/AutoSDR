@@ -40,12 +40,43 @@ from autosdr.api.schemas import (
     LeadOut,
     MappingConfigIn,
 )
-from autosdr.enrichment import enrich_lead, persist_enrichment
+from autosdr.enrichment import enrich_lead, is_social_website, persist_enrichment
 from autosdr.importer import import_file, preview_import_file
 from autosdr.models import CampaignLead, Lead
+from autosdr.pipeline.priority import is_priority_lead, priority_reason
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 logger = logging.getLogger(__name__)
+
+
+def _lead_to_out(lead: Lead) -> LeadOut:
+    """Build the public lead schema, computing the priority fields.
+
+    The ORM-direct ``LeadOut.model_validate(lead, from_attributes=True)``
+    path doesn't pick up derived signals because the predicates
+    live in :mod:`autosdr.pipeline.priority` and
+    :mod:`autosdr.enrichment` rather than on the :class:`Lead`
+    model itself (keeps the model thin and the pipeline-side
+    concern out of the schema layer). Folding the derivation into
+    one helper keeps every ``LeadOut`` response — list page,
+    detail, opt-out, clear-opt-out — in sync.
+
+    Three derived fields:
+
+    * ``is_priority`` / ``priority_reason`` — fires on either
+      ``not_found`` or ``social_profile_website`` (precedence:
+      ``not_found`` first; ticket 0014).
+    * ``is_social_website`` — informational platform token
+      (``"facebook"``, etc.) when ``Lead.website`` is itself a
+      social-profile URL. Independent of priority so a 404'd
+      Facebook URL still tags as ``"facebook"``.
+    """
+
+    out = LeadOut.model_validate(lead, from_attributes=True)
+    out.is_priority = is_priority_lead(lead)
+    out.priority_reason = priority_reason(lead)
+    out.is_social_website = is_social_website(lead.website)
+    return out
 
 
 def _parse_mapping_config(raw: str | None) -> dict[str, Any] | None:
@@ -191,7 +222,7 @@ def list_leads(
             ).scalars()
         )
         return LeadListOut(
-            leads=[LeadOut.model_validate(r, from_attributes=True) for r in rows],
+            leads=[_lead_to_out(r) for r in rows],
             total=total,
             limit=limit,
             offset=offset,
@@ -271,6 +302,7 @@ async def preview_import(
                 )
                 for col in preview.columns
             ],
+            social_website_hosts=dict(preview.social_website_hosts),
         )
     finally:
         try:
@@ -457,7 +489,7 @@ def opt_out_lead(
             lead.do_not_contact_at = datetime.now(timezone.utc)
             lead.do_not_contact_reason = reason
             session.flush()
-        return LeadOut.model_validate(lead, from_attributes=True)
+        return _lead_to_out(lead)
 
 
 @router.delete("/{lead_id}/opt-out", response_model=LeadOut)
@@ -480,7 +512,7 @@ def clear_lead_opt_out(lead_id: str) -> LeadOut:
             lead.do_not_contact_at = None
             lead.do_not_contact_reason = None
             session.flush()
-        return LeadOut.model_validate(lead, from_attributes=True)
+        return _lead_to_out(lead)
 
 
 # Static sub-paths ``/import/*``, ``/enrich``, and ``/{lead_id}/opt-out`` are
@@ -499,7 +531,7 @@ def get_lead(lead_id: str) -> LeadOut:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"error": "lead_not_found", "lead_id": lead_id},
             )
-        return LeadOut.model_validate(lead, from_attributes=True)
+        return _lead_to_out(lead)
 
 
 __all__ = ["router"]

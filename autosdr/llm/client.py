@@ -116,7 +116,6 @@ except Exception:  # pragma: no cover - best effort
 from autosdr import killswitch
 from autosdr.config import get_settings
 from autosdr.db import session_scope
-from autosdr.llm.pricing import cost_for
 from autosdr.models import LlmCall, LlmCallPurpose
 
 logger = logging.getLogger(__name__)
@@ -201,17 +200,20 @@ _usage = _Usage()
 _usage_lock = Lock()
 
 
-def _record_usage(model: str, tokens_in: int, tokens_out: int) -> None:
+def _record_usage(
+    model: str,
+    tokens_in: int,
+    tokens_out: int,
+    cost_usd: float,
+) -> None:
     """Accumulate one successful LLM call into the in-memory counter.
 
-    Cost is computed at write-time *into the counter* (not into the
-    DB row) using the current pricing snapshot. Unknown models
-    contribute zero cost — see ``cost_for`` semantics — so the
-    aggregate stays summable, while per-call surfaces still get a
-    ``None`` from the same pricing module.
+    Cost comes from LiteLLM's ``response_cost`` and is passed through
+    from the completion response, so this counter always mirrors what
+    we persisted on the ``llm_call`` row for the same call.
     """
 
-    cost = cost_for(model, tokens_in, tokens_out) or 0.0
+    cost = float(cost_usd or 0.0)
     with _usage_lock:
         _usage.total_calls += 1
         _usage.total_tokens_in += tokens_in
@@ -276,6 +278,7 @@ def _log_call(
     response_parsed: dict | None,
     tokens_in: int,
     tokens_out: int,
+    cost_usd: float,
     latency_ms: int,
     error: str | None,
 ) -> str | None:
@@ -320,6 +323,7 @@ def _log_call(
                 response_parsed=response_parsed,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
+                cost_usd=cost_usd,
                 latency_ms=latency_ms,
                 error=error,
             )
@@ -353,6 +357,7 @@ def _log_call(
             "response_parsed": response_parsed,
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            "cost_usd": cost_usd,
             "latency_ms": latency_ms,
             "error": error,
         }
@@ -379,8 +384,9 @@ async def _do_completion(
     messages: list[dict[str, Any]],
     temperature: float,
     response_format: dict | None,
-) -> tuple[str, int, int]:
-    """Single dispatch — returns (text, tokens_in, tokens_out)."""
+    reasoning_effort: str | None,
+) -> tuple[str, int, int, float]:
+    """Single dispatch — returns (text, tokens_in, tokens_out, cost_usd)."""
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -389,15 +395,27 @@ async def _do_completion(
     }
     if response_format is not None:
         kwargs["response_format"] = response_format
+    if reasoning_effort is not None:
+        # ``reasoning_effort`` is LiteLLM's unified knob for thinking
+        # budgets — accepted values ``"disable" | "low" | "medium" |
+        # "high"``. LiteLLM translates it to the provider-specific
+        # field (``thinking_budget`` for Gemini, ``reasoning`` for
+        # OpenAI o-series). For providers that don't support it the
+        # kwarg is silently ignored. Use ``"disable"`` for short
+        # structured outputs (classification) so we don't pay for
+        # reasoning the model doesn't need.
+        kwargs["reasoning_effort"] = reasoning_effort
 
     response = await litellm.acompletion(**kwargs)
 
     text = response["choices"][0]["message"]["content"] or ""
     usage = response.get("usage") or {}
+    cost_usd = float(response.get("response_cost") or 0.0)
     return (
         text,
         int(usage.get("prompt_tokens") or 0),
         int(usage.get("completion_tokens") or 0),
+        cost_usd,
     )
 
 
@@ -410,6 +428,7 @@ async def _complete_with_retries(
     context: LlmCallContext,
     response_format: dict | None = None,
     response_format_name: str = "text",
+    reasoning_effort: str | None = None,
     attempt_offset: int = 0,
     max_attempts: int = 3,
 ) -> CompletionResult:
@@ -421,11 +440,12 @@ async def _complete_with_retries(
         start = time.monotonic()
         attempt_absolute = attempt_offset + relative_attempt
         try:
-            text, tokens_in, tokens_out = await _do_completion(
+            text, tokens_in, tokens_out, cost_usd = await _do_completion(
                 model=model,
                 messages=messages,
                 temperature=temperature,
                 response_format=response_format,
+                reasoning_effort=reasoning_effort,
             )
         except Exception as exc:  # pragma: no cover - provider-specific
             last_error = exc
@@ -443,6 +463,7 @@ async def _complete_with_retries(
                 response_parsed=None,
                 tokens_in=0,
                 tokens_out=0,
+                cost_usd=0.0,
                 latency_ms=latency_ms,
                 error=f"{type(exc).__name__}: {exc}",
             )
@@ -461,7 +482,7 @@ async def _complete_with_retries(
             raise LLMError(f"LLM call to {model} failed: {exc}") from exc
         else:
             latency_ms = int((time.monotonic() - start) * 1000)
-            _record_usage(model, tokens_in, tokens_out)
+            _record_usage(model, tokens_in, tokens_out, cost_usd)
             call_id = _log_call(
                 context=context,
                 model=model,
@@ -474,6 +495,7 @@ async def _complete_with_retries(
                 response_parsed=None,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
+                cost_usd=cost_usd,
                 latency_ms=latency_ms,
                 error=None,
             )
@@ -517,8 +539,16 @@ async def complete_text(
     prompt_version: str,
     temperature: float = 1.0,
     context: LlmCallContext | None = None,
+    reasoning_effort: str | None = None,
 ) -> CompletionResult:
-    """Free-form text completion."""
+    """Free-form text completion.
+
+    ``reasoning_effort``: ``"disable" | "low" | "medium" | "high"`` —
+    LiteLLM's unified knob for thinking-budget capping. ``None`` (default)
+    leaves the provider's default in place. Pass ``"disable"`` for short
+    structured outputs where reasoning is wasted budget; the audit at
+    ``docs/prompt-audit-2026-05-02.md`` Phase 4 #13 covers the rationale.
+    """
 
     ctx = context or LlmCallContext()
     messages = [
@@ -532,6 +562,7 @@ async def complete_text(
         prompt_version=prompt_version,
         context=ctx,
         response_format_name="text",
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -563,6 +594,37 @@ def _extract_json(text: str) -> dict[str, Any]:
     return json.loads(match.group(0))
 
 
+def _supports_json_object_response_format(model: str) -> bool:
+    """Whether this provider accepts ``response_format={"type": "json_object"}``.
+
+    LM Studio's OpenAI-compatible server explicitly rejects ``json_object``
+    and only accepts ``text`` or ``json_schema`` per their docs (and per
+    direct experimentation: see ``docs/prompt-audit-2026-05-02.md`` §9).
+    Sending it crashes the call. For those providers we drop the
+    ``response_format`` field entirely and rely on the prompt + the
+    existing self-heal JSON extract to coerce the response.
+    """
+
+    return not model.startswith("lm_studio/")
+
+
+def _supports_json_schema_response_format(model: str) -> bool:
+    """Whether this provider accepts ``response_format={"type": "json_schema",
+    ...}``.
+
+    Delegates to LiteLLM's ``supports_response_schema`` lookup which knows
+    about every provider in ``model_prices_and_context_window.json``. Wraps
+    in a try/except because the lookup raises on unknown model strings —
+    treat unknown as "no, fall back to json_object". See
+    ``docs/prompt-audit-2026-05-02.md`` Phase 4 #11+12 for context.
+    """
+
+    try:
+        return bool(litellm.supports_response_schema(model=model))
+    except Exception:  # pragma: no cover - defensive: unknown / new model strings
+        return False
+
+
 async def complete_json(
     *,
     system: str,
@@ -571,13 +633,65 @@ async def complete_json(
     prompt_version: str,
     temperature: float = 1.0,
     context: LlmCallContext | None = None,
+    reasoning_effort: str | None = None,
+    json_schema: dict | None = None,
 ) -> tuple[dict[str, Any], CompletionResult]:
-    """JSON-structured completion with one self-heal retry on parse failure."""
+    """JSON-structured completion with one self-heal retry on parse failure.
+
+    ``reasoning_effort``: see :func:`complete_text`. Passed through to
+    both the initial call and the self-heal retry.
+
+    ``json_schema``: optional JSON Schema (the inner ``schema`` body, NOT
+    the wrapped ``response_format`` object). When supplied AND the model
+    supports ``response_format={"type": "json_schema", ...}`` (per
+    LiteLLM's ``supports_response_schema``), the call uses
+    schema-constrained decoding. For providers that don't support it we
+    silently fall back to ``json_object`` (or text + injected prompt for
+    LM Studio etc.) so the contract is "best available constraint, never
+    worse than today". See ``docs/prompt-audit-2026-05-02.md`` Phase 4
+    #11+12.
+    """
 
     ctx = context or LlmCallContext()
+    # Pick the strongest response_format the provider actually supports.
+    # Order of preference:
+    #   1. json_schema (only if a schema was supplied AND provider supports
+    #      it) — strict shape, kills a class of self-heal retries entirely.
+    #   2. json_object — broad provider support, "any valid JSON object".
+    #   3. text + injected JSON-only instruction (LM Studio path).
+    use_json_schema = json_schema is not None and _supports_json_schema_response_format(model)
+    use_json_object = not use_json_schema and _supports_json_object_response_format(model)
+
+    if use_json_schema:
+        response_format: dict | None = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response",
+                "strict": True,
+                "schema": json_schema,
+            },
+        }
+        response_format_name = "json_schema"
+        user_message = user
+    elif use_json_object:
+        response_format = {"type": "json_object"}
+        response_format_name = "json"
+        user_message = user
+    else:
+        response_format = None
+        response_format_name = "text"
+        # Belt-and-braces JSON-only instruction so the model can't hide
+        # content in markdown fences when no schema/object constraint is
+        # available.
+        user_message = (
+            user.rstrip()
+            + "\n\nIMPORTANT: respond with a single valid JSON object and nothing else. "
+            "Do NOT wrap it in markdown code fences."
+        )
+
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": user},
+        {"role": "user", "content": user_message},
     ]
     result = await _complete_with_retries(
         model=model,
@@ -585,8 +699,9 @@ async def complete_json(
         temperature=temperature,
         prompt_version=prompt_version,
         context=ctx,
-        response_format={"type": "json_object"},
-        response_format_name="json",
+        response_format=response_format,
+        response_format_name=response_format_name,
+        reasoning_effort=reasoning_effort,
     )
     try:
         parsed = _extract_json(result.text)
@@ -611,8 +726,9 @@ async def complete_json(
         temperature=temperature,
         prompt_version=prompt_version,
         context=ctx,
-        response_format={"type": "json_object"},
-        response_format_name="json",
+        response_format=response_format,
+        response_format_name=response_format_name,
+        reasoning_effort=reasoning_effort,
         attempt_offset=result.attempts,
     )
     try:

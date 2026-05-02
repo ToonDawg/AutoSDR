@@ -21,8 +21,9 @@ The maths is deliberately simple: target sends so far in the window
 ``= ceil(daily_quota * elapsed_fraction)``. If actual sends are
 already at or above the target, return zero. Otherwise return
 ``target - actual`` — capped at ``daily_quota`` (defensive). The
-scheduler stacks this with ``max_batch_per_tick`` and the rolling 24h
-quota, so a late activation can't burst.
+scheduler stacks this with ``max_batch_per_tick`` and the daily
+calendar-day quota (resets at server-local midnight), so a late
+activation can't burst.
 
 Server-local time is the reference (``datetime.now().astimezone()``)
 because the POC is single-tenant on the operator's laptop. If AutoSDR
@@ -188,8 +189,9 @@ def window_allowance(
     ``target_sent = ceil(daily_quota * elapsed_fraction)``.
 
     The scheduler stacks this with ``max_batch_per_tick`` and the
-    rolling 24h quota; both gates apply, so a campaign that activated
-    late in the day can't burst its full quota in the last hour.
+    calendar-day quota (resets at server-local midnight); all gates
+    apply, so a campaign that activated late in the day can't burst
+    its full quota in the last hour.
     """
 
     if daily_quota <= 0:
@@ -221,14 +223,14 @@ def count_outreach_contacts_since(
 ) -> int:
     """Count *new outreach contacts* this campaign opened since ``since_dt_utc``.
 
-    Mirrors :func:`autosdr.quota.count_outreach_contacts_last_24h`
+    Mirrors :func:`autosdr.quota.count_outreach_contacts_today`
     semantics: one contact = one thread whose first AI message landed
     after ``since_dt_utc``. Follow-up beats and auto-replies are extra
     messages on a thread that's already been contacted, so they don't
     count — keeps pacing aligned with the daily-quota meaning of
     ``outreach_per_day``.
 
-    ``Campaign.quota_reset_at`` is honoured the same way as the 24h
+    ``Campaign.quota_reset_at`` is honoured the same way as the daily
     quota helper: a reset starts a fresh window, so threads contacted
     before it don't consume pacing budget either.
     """

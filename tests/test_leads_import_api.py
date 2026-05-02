@@ -197,3 +197,99 @@ def test_commit_without_mapping_config_is_backward_compatible(
         )
     assert resp.status_code == 200
     assert resp.json()["imported_count"] == 1
+
+
+def test_preview_counts_social_website_hosts(fresh_db, workspace_factory):
+    """Preview returns per-platform tally of social-as-website rows.
+
+    Six rows: 2× Facebook URLs, 1× Instagram URL, 1× LinkedIn URL,
+    1× plain corporate URL, 1× ``acme.com/about/our-facebook-page``
+    (path mention only, must NOT count). Pins
+    ``social_website_hosts == {"facebook": 2, "instagram": 1, "linkedin": 1}``
+    so the frontend callout copy lines up with truth.
+    """
+
+    workspace_factory()
+    body = _ndjson(
+        [
+            {
+                "name": "FB-1",
+                "phone": "0413 100 001",
+                "website": "https://facebook.com/Acme",
+            },
+            {
+                "name": "FB-2",
+                "phone": "0413 100 002",
+                "website": "https://www.facebook.com/Acme2",
+            },
+            {
+                "name": "IG-1",
+                "phone": "0413 100 003",
+                "website": "https://www.instagram.com/acme",
+            },
+            {
+                "name": "LI-1",
+                "phone": "0413 100 004",
+                "website": "https://linkedin.com/company/acme",
+            },
+            {
+                "name": "Real",
+                "phone": "0413 100 005",
+                "website": "https://realcorp.com.au",
+            },
+            {
+                "name": "Path-only",
+                "phone": "0413 100 006",
+                "website": "https://acme.com/about/our-facebook-page",
+            },
+        ]
+    )
+
+    with _client() as client:
+        resp = client.post(
+            "/api/leads/import/preview",
+            files={"file": ("leads.json", body, "application/json")},
+        )
+    assert resp.status_code == 200, resp.text
+    j = resp.json()
+    assert j["total_rows"] == 6
+    assert j["social_website_hosts"] == {
+        "facebook": 2,
+        "instagram": 1,
+        "linkedin": 1,
+    }
+
+
+def test_preview_no_social_websites_returns_empty_dict(
+    fresh_db, workspace_factory,
+):
+    """Empty social-host dict when the upload has zero social URLs.
+
+    Frontend renders nothing in that case — the callout is opt-in
+    on a non-empty dict. Pins the absent-signal path so a regression
+    in the importer can't silently start tagging clean uploads.
+    """
+
+    workspace_factory()
+    body = _ndjson(
+        [
+            {
+                "name": "Real-1",
+                "phone": "0413 200 001",
+                "website": "https://acme.com.au",
+            },
+            {
+                "name": "Real-2",
+                "phone": "0413 200 002",
+                # No website at all is fine — predicate returns None.
+            },
+        ]
+    )
+
+    with _client() as client:
+        resp = client.post(
+            "/api/leads/import/preview",
+            files={"file": ("leads.json", body, "application/json")},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["social_website_hosts"] == {}

@@ -122,7 +122,7 @@ def _patch_complete_text(monkeypatch, responses: list[str], capture: list[dict[s
     queue = list(responses)
 
     async def _fake(
-        *, system, user, model, prompt_version, temperature, context=None
+        *, system, user, model, prompt_version, temperature, context=None, **_kwargs
     ):
         capture.append(
             {
@@ -268,7 +268,7 @@ async def test_followup_drops_failed_and_empty_variants(
     queue = ["a real draft", "   ", "another good one"]
 
     async def _fake(
-        *, system, user, model, prompt_version, temperature, context=None
+        *, system, user, model, prompt_version, temperature, context=None, **_kwargs
     ):
         text = queue.pop(0)
         return CompletionResult(

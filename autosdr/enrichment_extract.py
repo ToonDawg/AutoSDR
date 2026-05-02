@@ -25,6 +25,8 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from autosdr.enrichment_vocab import SOCIAL_HOSTS
+
 # Maximum stripped body chars we keep in the snippet. The analysis
 # prompt doesn't want raw HTML; a 300-char taste of the homepage is
 # usually enough to disambiguate a real business from a placeholder.
@@ -74,8 +76,15 @@ _CMS_HTML_FINGERPRINTS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+# Built from :data:`autosdr.enrichment_vocab.SOCIAL_HOSTS` so the page-
+# body extractor and the ``Lead.website`` predicate at
+# :func:`autosdr.enrichment.is_social_website` cannot disagree on
+# which platforms count. Sorting keeps regex source stable across
+# Python set hash randomisation. See ticket 0014.
 _SOCIAL_RE = re.compile(
-    r"https?://(?:www\.)?(facebook|instagram|linkedin|twitter|x|tiktok|youtube)\.com/[^\s\"'<>]+",
+    r"https?://(?:www\.)?("
+    + "|".join(re.escape(h) for h in sorted(SOCIAL_HOSTS))
+    + r")\.com/[^\s\"'<>]+",
     re.IGNORECASE,
 )
 _WHITESPACE_RE = re.compile(r"\s+")

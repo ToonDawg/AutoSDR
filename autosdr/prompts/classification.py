@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PROMPT_VERSION = "classification-v1"
+PROMPT_VERSION = "classification-v1.1"
 
 INTENTS = {
     "positive",

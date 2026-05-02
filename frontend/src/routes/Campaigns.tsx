@@ -37,8 +37,8 @@ export function Campaigns() {
         <div>
           <h1 className="text-2xl font-medium">Campaigns</h1>
           <p className="text-sm text-ink-muted mt-1 max-w-prose">
-            Each campaign has its own goal, lead queue, and daily send quota. Sends are capped
-            per rolling 24 hours.
+            Each campaign has its own goal, lead queue, and daily send quota. The send count
+            resets at midnight each day.
           </p>
         </div>
         <Button
@@ -136,9 +136,9 @@ function CampaignRow({ campaign }: { campaign: Campaign }) {
 
         <div className="col-span-12 md:col-span-3 flex flex-col justify-center min-w-0">
           <QuotaMeter
-            sent={campaign.sent_24h}
+            sent={campaign.sent_today}
             quota={campaign.outreach_per_day}
-            label="24H SENT"
+            label="TODAY"
             compact
           />
         </div>

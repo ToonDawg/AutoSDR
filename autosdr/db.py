@@ -136,6 +136,7 @@ _ADDITIVE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("lead", "enrichment_status", "VARCHAR(32)"),
     ("lead", "enrichment_fetched_at", "DATETIME"),
     ("message", "provider_message_id", "VARCHAR(128)"),
+    ("llm_call", "cost_usd", "FLOAT"),
 )
 
 

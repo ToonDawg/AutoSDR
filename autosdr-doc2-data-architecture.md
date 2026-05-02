@@ -225,10 +225,10 @@ CREATE TABLE campaign (
 );
 ```
 
-**Daily quota enforcement (rolling 24h):**
+**Daily quota enforcement (calendar day, server-local midnight reset):**
 
-`outreach_per_day` is enforced as a rolling 24-hour window, not a calendar day.
-On every scheduler tick, the system queries:
+`outreach_per_day` is enforced as a **calendar day** that resets at
+server-local midnight. On every scheduler tick, the system queries:
 
 ```sql
 SELECT COUNT(*)
@@ -237,16 +237,31 @@ SELECT COUNT(*)
   JOIN campaign_lead cl   ON cl.id = t.campaign_lead_id
  WHERE cl.campaign_id = :campaign_id
    AND m.role = 'ai'
-   AND m.created_at >= now() - INTERVAL '24 hours';
+   AND m.created_at >= :today_local_midnight_utc;
 ```
 
-The scheduler sends at most `outreach_per_day - sent_last_24h` new first-contact
-messages per campaign per tick, subject to the per-tick batch cap and the
-minimum inter-send delay defined in `workspace.settings`. Reply messages are not
-counted toward the daily quota — only first-contact outreach is rate-limited.
+`today_local_midnight_utc` is computed in Python with
+`datetime.now().astimezone().replace(hour=0, ...).astimezone(UTC)` so the
+cutoff tracks the operator's local timezone the same way the
+working-hours pacer does (see `autosdr/pacing.py`).
 
-Rolling 24h is chosen over calendar-day to avoid midnight burst behaviour and to
-make the limit predictable regardless of when the owner activates the campaign.
+The scheduler sends at most `outreach_per_day - sent_today` new
+first-contact messages per campaign per tick, subject to the per-tick
+batch cap, the working-hours pacer, and the minimum inter-send delay
+defined in `workspace.settings`. Reply messages are not counted toward
+the daily quota — only first-contact outreach is rate-limited.
+
+Calendar-day is chosen over the previous rolling-24h window so the
+counter visibly resets each day in the operator's mental model — a
+campaign that hit cap at 4pm yesterday can resume at midnight, and the
+dashboard's "X / Y" counter aligns with the operator's day. The
+working-hours pacer (default 8am–5pm) caps any midnight-burst risk by
+gating sends to the active window.
+
+`Campaign.quota_reset_at` remains as a manual override: setting it to
+`now()` forces the counter to ignore any sends made before the reset,
+useful for an operator who bumped their carrier limit mid-day and
+wants a fresh budget.
 
 ---
 
@@ -679,7 +694,7 @@ Decisions recorded here so future contributors understand the reasoning.
 | Messages are immutable (no soft delete) | Full audit trail; safe HITL handoff; needed for future model evaluation |
 | `mapping_config` saved on ImportJob | Allows agent to reuse prior mappings for similar files; reduces confirmation friction over time |
 | CSV and JSON only | Unstructured text has no reliable schema extraction path; honest constraint |
-| Daily quota is rolling 24h, not calendar day | Avoids midnight burst behaviour; predictable regardless of when the campaign starts; a single query against `message` is the source of truth (no separate counter to drift) |
+| Daily quota is calendar day with server-local midnight reset | Matches the operator's mental model — each scheduled day starts fresh and the dashboard counter visibly resets at midnight; a single query against `message` against today's midnight cutoff is the source of truth (no separate counter to drift); midnight-burst risk is bounded by the working-hours pacer (default 8am–5pm) |
 | Phone numbers stored in E.164 only | One canonical representation; deduplication survives input-format differences; `phonenumbers.number_type` lets us detect landline vs mobile deterministically |
 | Non-mobile leads skipped at import by default | Landlines and toll-free numbers burn gateway quota and time without succeeding; surfaces the problem in the import summary where the owner can act on it |
 | Reply routing prefers most-recent outbound | When a lead is in multiple campaigns, the owner's latest touch is the most likely context for the reply; deterministic tie-break on thread.id |

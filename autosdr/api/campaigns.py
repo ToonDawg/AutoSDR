@@ -11,7 +11,7 @@ from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import ColumnElement, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from autosdr import killswitch
@@ -30,6 +30,7 @@ from autosdr.api.schemas import (
     OutreachWindowConfig,
 )
 from autosdr.connectors import ConnectorError, get_connector
+from autosdr.enrichment_vocab import SOCIAL_HOSTS
 from autosdr.models import (
     Campaign,
     CampaignLead,
@@ -46,7 +47,8 @@ from autosdr.models import (
 )
 from autosdr.pacing import resolve_window
 from autosdr.pipeline.followup import DEFAULT_FOLLOWUP_TEMPLATE
-from autosdr.quota import count_outreach_contacts_last_24h_bulk
+from autosdr.pipeline.priority import PRIORITY_REASON_NOT_FOUND
+from autosdr.quota import count_outreach_contacts_today_bulk
 from autosdr.scheduler import _count_queued_leads, run_campaign_outreach_batch
 
 router = APIRouter(prefix="/api/campaigns", tags=["campaigns"])
@@ -168,11 +170,102 @@ def _campaign_totals_bulk(
     return totals
 
 
+def _social_website_sql_predicate() -> ColumnElement[bool]:
+    """Boolean SQL clause: ``Lead.website`` host is a tracked social platform.
+
+    Mirrors the Python predicate
+    :func:`autosdr.enrichment.is_social_website` in SQL space so the
+    campaign-bulk count and the picker stay in agreement on which
+    leads count as priority. Implementation: case-insensitive
+    ``LIKE`` against the two prefix shapes the importer is
+    guaranteed to leave on ``Lead.website`` after
+    :func:`autosdr.enrichment.normalise_website_url`:
+
+    * ``http(s)://platform.com/...``
+    * ``http(s)://www.platform.com/...``
+
+    Other host variants (``m.facebook.com``, ``mobile.x.com``) are
+    deliberately NOT matched here — leads land on
+    ``Lead.website`` from operator imports, which overwhelmingly
+    use the bare host. The Python predicate is the source of
+    truth for tier membership; this SQL is just an estimator for
+    the dashboard count. Drift between estimator and truth is
+    bounded to "we under-count" and surfaces as a missing
+    callout, not a wrong send order.
+
+    ``func.lower`` keeps the comparison portable between SQLite
+    (case-sensitive default) and Postgres. Sorting the platform
+    list keeps generated SQL deterministic in tests.
+    """
+
+    clauses: list[ColumnElement[bool]] = []
+    for platform in sorted(SOCIAL_HOSTS):
+        suffix = f"{platform}.com/%"
+        # Two prefix shapes: bare host and `www.`. Both are reachable
+        # after `normalise_website_url` runs; the importer doesn't
+        # deduplicate them.
+        clauses.append(
+            func.lower(Lead.website).like(f"http://{suffix}")
+        )
+        clauses.append(
+            func.lower(Lead.website).like(f"https://{suffix}")
+        )
+        clauses.append(
+            func.lower(Lead.website).like(f"http://www.{suffix}")
+        )
+        clauses.append(
+            func.lower(Lead.website).like(f"https://www.{suffix}")
+        )
+    return or_(*clauses)
+
+
+def _campaign_queued_priority_bulk(
+    session: Session, campaign_ids: Iterable[str]
+) -> dict[str, int]:
+    """Per-campaign count of queued leads whose enrichment is priority.
+
+    A queued lead counts as priority when EITHER:
+
+    * ``Lead.enrichment_status == "not_found"`` (ticket 0013, the
+      strongest broken-website signal — uses the existing composite
+      index).
+    * ``Lead.website`` is a tracked social-profile URL (ticket 0014;
+      see :func:`_social_website_sql_predicate`).
+
+    Single grouped query (no per-campaign round trip) so the
+    campaign list endpoint keeps its constant query budget. The
+    ``OR`` widens the row scan, but it's bounded to queued
+    ``CampaignLead`` rows only, which is small per-campaign.
+    """
+
+    ids = list(dict.fromkeys(campaign_ids))
+    counts: dict[str, int] = {cid: 0 for cid in ids}
+    if not ids:
+        return counts
+    rows = session.execute(
+        select(CampaignLead.campaign_id, func.count(CampaignLead.id))
+        .join(Lead, Lead.id == CampaignLead.lead_id)
+        .where(
+            CampaignLead.campaign_id.in_(ids),
+            CampaignLead.status == CampaignLeadStatus.QUEUED,
+            or_(
+                Lead.enrichment_status == PRIORITY_REASON_NOT_FOUND,
+                _social_website_sql_predicate(),
+            ),
+        )
+        .group_by(CampaignLead.campaign_id)
+    ).all()
+    for campaign_id, count in rows:
+        counts[campaign_id] = int(count)
+    return counts
+
+
 def _build_out(
     campaign: Campaign,
     totals: dict[str, int],
-    sent_24h: int,
+    sent_today: int,
     workspace_settings: dict | None,
+    queued_priority: int = 0,
 ) -> CampaignOut:
     """Map per-status counts to the public schema.
 
@@ -185,6 +278,12 @@ def _build_out(
     expose ``effective_outreach_window`` (the window the scheduler will
     actually use after merging the per-campaign override with the
     workspace default).
+
+    ``queued_priority`` is the subset of ``totals["queued"]`` whose
+    leads are priority-tier — broken websites (ticket 0013) plus
+    social-profile-as-website (ticket 0014). Defaulted to zero so
+    legacy callers that haven't been updated still produce a valid
+    response.
     """
 
     lead_count = sum(totals.values())
@@ -204,6 +303,7 @@ def _build_out(
         created_at=campaign.created_at,
         lead_count=lead_count,
         queued_count=totals["queued"],
+        queued_priority_count=queued_priority,
         sending_count=totals["sending"],
         paused_for_hitl_count=totals["paused_for_hitl"],
         contacted_count=totals["contacted"],
@@ -211,18 +311,23 @@ def _build_out(
         won_count=totals["won"],
         lost_count=totals["lost"],
         skipped_count=totals["skipped"],
-        sent_24h=sent_24h,
+        sent_today=sent_today,
     )
 
 
 def _to_out(session: Session, campaign: Campaign) -> CampaignOut:
     totals = _campaign_totals_bulk(session, [campaign.id])[campaign.id]
-    sent_24h = count_outreach_contacts_last_24h_bulk(session, [campaign.id]).get(
-        campaign.id, 0
-    )
+    sent_today = count_outreach_contacts_today_bulk(
+        session, [campaign.id]
+    ).get(campaign.id, 0)
+    queued_priority = _campaign_queued_priority_bulk(
+        session, [campaign.id]
+    ).get(campaign.id, 0)
     workspace = session.query(Workspace).first()
     workspace_settings = workspace.settings if workspace else None
-    return _build_out(campaign, totals, sent_24h, workspace_settings)
+    return _build_out(
+        campaign, totals, sent_today, workspace_settings, queued_priority
+    )
 
 
 @router.get("", response_model=list[CampaignOut])
@@ -238,14 +343,16 @@ def list_campaigns() -> list[CampaignOut]:
             return []
         ids = [c.id for c in rows]
         totals_by_campaign = _campaign_totals_bulk(session, ids)
-        sent_24h_by_campaign = count_outreach_contacts_last_24h_bulk(session, ids)
+        sent_today_by_campaign = count_outreach_contacts_today_bulk(session, ids)
+        queued_priority_by_campaign = _campaign_queued_priority_bulk(session, ids)
         ws_settings = workspace.settings
         return [
             _build_out(
                 c,
                 totals_by_campaign[c.id],
-                sent_24h_by_campaign.get(c.id, 0),
+                sent_today_by_campaign.get(c.id, 0),
                 ws_settings,
+                queued_priority_by_campaign.get(c.id, 0),
             )
             for c in rows
         ]

@@ -30,6 +30,7 @@ import phonenumbers
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from autosdr.enrichment import is_social_website
 from autosdr.models import (
     ContactType,
     ImportJob,
@@ -536,6 +537,13 @@ class ImportPreview:
     rows — enough to eyeball without blowing up big-file previews. ``columns``
     is the union of keys observed across the sampled rows, with one
     ``ColumnPreview`` entry per distinct name.
+
+    ``social_website_hosts`` is a per-platform tally of rows whose
+    ``website`` column is a social-profile URL (ticket 0014).
+    Platforms with zero matches are omitted; an empty dict means the
+    upload has no social-as-website rows. The frontend renders a
+    callout from this so the operator sees how many leads will land
+    in the priority tier before they commit.
     """
 
     file_type: str
@@ -544,6 +552,7 @@ class ImportPreview:
     would_skip: list[tuple[str, int]]
     sample: list[PreviewRow]
     columns: list[ColumnPreview] = field(default_factory=list)
+    social_website_hosts: dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -804,12 +813,22 @@ def preview_import_file(
     skip_counter: Counter[str] = Counter()
     sample: list[PreviewRow] = []
     sampled_rows: list[dict[str, Any]] = []
+    # Tally of platform tokens for rows whose mapped ``website`` is a
+    # social-profile URL (ticket 0014). Counted across the *entire*
+    # file, not just the sample, so the operator's pre-commit
+    # callout reflects the true priority-tier hit rate. Hostname-only
+    # match (``acme.com/about-our-facebook`` does not count) — see
+    # :func:`autosdr.enrichment.is_social_website`.
+    social_website_counter: Counter[str] = Counter()
 
     for row in iterator:
         total += 1
         if len(sampled_rows) < _PREVIEW_SAMPLE_LIMIT:
             sampled_rows.append(row)
         core, _raw = _split_core_and_raw(row, mapping_config=mapping_config)
+        platform = is_social_website(core.get("website"))
+        if platform is not None:
+            social_website_counter[platform] += 1
         raw_phone = core.get("phone")
 
         if not raw_phone:
@@ -855,4 +874,5 @@ def preview_import_file(
         would_skip=list(skip_counter.most_common()),
         sample=sample,
         columns=_build_columns_preview(sampled_rows),
+        social_website_hosts=dict(social_website_counter),
     )

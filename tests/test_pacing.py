@@ -145,7 +145,7 @@ def test_allowance_zero_outside_window_evening():
 
 
 def test_allowance_disabled_window_returns_full_quota():
-    """``enabled=False`` is the escape hatch — pace nothing, just gate on 24h quota."""
+    """``enabled=False`` is the escape hatch — pace nothing, just gate on the daily quota."""
 
     window = OutreachWindow(enabled=False, start_hour=8, end_hour=17)
     allowance = window_allowance(

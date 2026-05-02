@@ -345,7 +345,7 @@ async def test_pacing_blocks_when_already_at_target(fresh_db):
 
 
 async def test_disabled_window_short_circuits_pacing(fresh_db, monkeypatch):
-    """``enabled=false`` is the escape hatch — no time gating, just 24h quota."""
+    """``enabled=false`` is the escape hatch — no time gating, just the daily quota."""
 
     sent_calls: list[str] = []
 

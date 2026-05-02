@@ -1,22 +1,44 @@
-"""Message generation prompt — drafts an outreach SMS."""
+"""Message generation prompt — drafts an outreach SMS.
+
+The system prompt is composed from named blocks so future ablation
+experiments stay surgical (Phase 3 #9 of
+``docs/prompt-audit-2026-05-02.md``):
+
+* :data:`_DEFAULT_TONE` — fallback voice block when the workspace tone
+  snapshot is empty.
+* :data:`_RULES` — the executable spec: openers, recipient identifier,
+  truthfulness, product language, GBP-vs-website, turnaround, empathy,
+  credential, CTA, format, punctuation. The bulk of the prompt and the
+  contract the evaluator scores against.
+* :data:`_REFERENCE_EXAMPLES` — six worked SMS examples in the target
+  voice. Cheap to ablate / replace independently of the rules.
+
+Composing them in :func:`build_system_prompt` keeps the rendered prompt
+byte-for-byte identical to the previous monolith — pinned by a SHA
+snapshot in ``tests/test_prompts.py``.
+"""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-PROMPT_VERSION = "generation-v7"
+from autosdr.prompts._tone import cap_tone_snapshot
+
+PROMPT_VERSION = "generation-v8"
 
 
-def build_system_prompt(tone_snapshot: str | None) -> str:
-    tone_block = tone_snapshot.strip() if tone_snapshot else (
-        "Write in a casual, direct tone. Keep sentences short. Avoid corporate "
-        "language. Open with a grounded observation about the recipient's "
-        "situation; close with a single low-pressure question."
-    )
-    return f"""\
-{tone_block}
+_DEFAULT_TONE = (
+    "Write in a casual, direct tone. Keep sentences short. Avoid corporate "
+    "language. Open with a grounded observation about the recipient's "
+    "situation; close with a single low-pressure question."
+)
 
+
+# ---------------------------------------------------------------------------
+# RULES — the executable spec (everything the evaluator scores against).
+# ---------------------------------------------------------------------------
+_RULES = """\
 You are writing a short outreach SMS on behalf of a small independent web
 studio owner. The message is going to a local Australian business owner who
 has never heard of them.
@@ -89,11 +111,43 @@ OPENING
   Recipient block, work it naturally into the opener. This is important
   when the contact number is a personal or home phone — the person
   receiving the text needs to immediately know which business you're
-  referring to. Use the short name the way a local would say it:
+  referring to. Use the short name the way a local would say it.
+
+  Two cases — read the short name carefully before choosing:
+
+  CASE 1 — BRAND-STYLE short name (a real trading name a local would
+  say: "Skybound", "Jacaranda Cafe", "Hanley Browne Plumbing", "Matt's
+  Plumbing"). These read like a business someone built. You may:
     * possessive in the observation: "saw Skybound's reviews mention..."
     * address the business: "hey Skybound," (when no owner name)
     * question that lands the observation: "is this Skybound? saw you
       have..."
+
+  CASE 2 — COMMON-NOUN PLACE short name (a public asset / generic place
+  name: "Lions Park", "Apex Reserve", "Wattle Beach", "Sunset Lookout",
+  "Pioneer Jetty", "Memorial Hall", "Civic Centre", "Mooloolaba Oval",
+  community gardens, public toilets, boat ramps, lookouts, ovals, halls,
+  reserves, parks). Heuristic: if the name reads like a place on a map
+  rather than a business someone runs, treat it as CASE 2. Tell-tale
+  suffixes: Park, Reserve, Lookout, Beach, Jetty, Oval, Hall, Centre
+  (when civic/community), Gardens, Foreshore, Boat Ramp.
+
+  For CASE 2 you MUST NOT address the place. "hey Lions Park,"
+  reads as greeting the park itself — it's the dead giveaway of an
+  AI-generated message. Instead:
+    * Use a generic greeting ("hey,", "hey mate,") and refer to the
+      place in the THIRD PERSON inside the observation:
+        - "hey mate, noticed Lions Park's listing link 404s"
+        - "hey, the Google listing for Apex Reserve points to a dead
+          page"
+    * Possessive third-person is fine: "Lions Park's Google listing
+      still shows..." — that's referring to the place, not greeting it.
+
+  FORBIDDEN for CASE 2:
+    * "hey Lions Park,"  — greeting a park
+    * "hey Apex Reserve,"  — greeting a reserve
+    * "is this Memorial Hall?" — a hall can't answer
+
   Use the short name field, not the full Google business name — the
   full name often carries a category suffix ("- Kids Volleyball") that
   reads like a database field, not a real conversation.
@@ -350,8 +404,14 @@ punctuation, not the words.
 SHAPE — the target beat pattern for a first-contact message is:
 
   [greeting] — [observation] — [optional empathy] — [credential +
-  offer with turnaround where it fits] — [one clean CTA]
+  offer with turnaround where it fits] — [one clean CTA]"""
 
+
+# ---------------------------------------------------------------------------
+# EXAMPLES — six worked SMS examples spanning the angle types. Cheap to
+# ablate / swap independently of the rules.
+# ---------------------------------------------------------------------------
+_REFERENCE_EXAMPLES = """\
 Reference examples in the target voice (NOT to be copied verbatim —
 write your own using the recipient's actual specifics):
 
@@ -395,14 +455,49 @@ write your own using the recipient's actual specifics):
   The recipient can verify everything in the message and find it
   all true.
 
+  Example 6 (place-style listing — Lions Park; do NOT greet the place,
+  refer to it in the third person):
+    "hey mate, noticed Lions Park's Google listing link is throwing a
+    404 — bit of a shame for families looking for the BBQs and the
+    Mooloolaba views. I build websites and manage Google listings for
+    a living, I can fix the listing today. Shoot me a text and I'll
+    sort it."
+  Notice the opener is "hey mate," (generic greeting) and "Lions
+  Park" appears as a third-person reference inside the observation.
+  Never "hey Lions Park," — a park can't answer a text.
+
 Notice in each: a short friendly greeting BEFORE the observation, a
 concrete recipient-specific detail, credential before the offer, a
 specific turnaround ("today" for GBP / updates, "a week" for a full
 site) where the angle justifies it, and ONE clean CTA. No staff
-names, no hype, no vendor language, no stacked asks.
+names, no hype, no vendor language, no stacked asks."""
 
-- Output ONLY the message text. No quotes, no labels, no explanation, no preamble.
-"""
+
+# Final instruction lives outside RULES + EXAMPLES so the model sees it
+# as the closing directive regardless of whether examples are ablated.
+_OUTPUT_INSTRUCTION = (
+    "- Output ONLY the message text. "
+    "No quotes, no labels, no explanation, no preamble."
+)
+
+
+def build_system_prompt(tone_snapshot: str | None) -> str:
+    """Compose the system prompt: tone block + RULES + EXAMPLES + closing.
+
+    The tone block is bounded via :func:`cap_tone_snapshot` because the same
+    snapshot is also injected into ``evaluation.build_user_prompt`` — an
+    unbounded tone block doubles its cost per round-trip. See
+    ``autosdr/prompts/_tone.py``.
+    """
+
+    tone_block = cap_tone_snapshot(tone_snapshot) if tone_snapshot else None
+    tone_block = tone_block or _DEFAULT_TONE
+    return (
+        f"{tone_block}\n\n"
+        f"{_RULES}\n\n"
+        f"{_REFERENCE_EXAMPLES}\n\n"
+        f"{_OUTPUT_INSTRUCTION}\n"
+    )
 
 
 def build_user_prompt(

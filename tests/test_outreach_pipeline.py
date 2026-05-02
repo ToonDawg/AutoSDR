@@ -93,13 +93,13 @@ def _install_mock_llm(monkeypatch: pytest.MonkeyPatch, *, responses: dict[str, A
       analysis-v1:      dict (the parsed JSON)
       generation-v1:    str or list[str] (the drafts, one per attempt)
       evaluation-v1:    dict or list[dict] (the eval JSONs)
-      classification-v1: dict
+      classification-v1.1: dict
     """
 
     calls: list[dict] = []
 
     async def _fake_complete_text(
-        *, system, user, model, prompt_version, temperature, context=None
+        *, system, user, model, prompt_version, temperature, context=None, **_kwargs
     ):
         from autosdr.llm.client import CompletionResult
 
@@ -135,7 +135,7 @@ def _install_mock_llm(monkeypatch: pytest.MonkeyPatch, *, responses: dict[str, A
         )
 
     async def _fake_complete_json(
-        *, system, user, model, prompt_version, temperature=0.0, context=None
+        *, system, user, model, prompt_version, temperature=0.0, context=None, **_kwargs
     ):
         from autosdr.llm.client import CompletionResult
 
@@ -185,14 +185,14 @@ async def test_outreach_happy_path(prepared_campaign, fresh_db, monkeypatch):
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "Rating of 3 from 10 reviews suggests room to improve service perception.",
                 "angle_type": "review_theme",
                 "signal": "rating=3, reviews=10",
                 "confidence": 0.7,
             },
-            "generation-v7": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
-            "evaluation-v4.3": {
+            "generation-v8": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -265,16 +265,16 @@ async def test_outreach_retries_then_passes(prepared_campaign, fresh_db, monkeyp
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "Rating 3 — opportunity to stand out",
                 "signal": "rating",
                 "confidence": 0.6,
             },
-            "generation-v7": [
+            "generation-v8": [
                 "Hello valued customer! Let's discuss synergies.",  # bad
                 "Hey — noticed your ratings slipped recently. Quick chat about it?",  # good
             ],
-            "evaluation-v4.3": [
+            "evaluation-v4.7": [
                 {
                     "scores": {
                         "tone_match": 0.3,
@@ -333,14 +333,14 @@ async def test_outreach_persists_fallback_angle_type_when_llm_omits_it(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "Rating 3 — opportunity",
                 # angle_type intentionally omitted to exercise the fallback.
                 "signal": "rating",
                 "confidence": 0.6,
             },
-            "generation-v7": "Hey — quick chat about your reviews?",
-            "evaluation-v4.3": {
+            "generation-v8": "Hey — quick chat about your reviews?",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -379,9 +379,9 @@ async def test_outreach_escalates_after_max_attempts(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {"angle": "x", "signal": "y", "confidence": 0.5},
-            "generation-v7": "Hi hi hi hi hi hi hi hi.",
-            "evaluation-v4.3": {
+            "analysis-v3.6": {"angle": "x", "signal": "y", "confidence": 0.5},
+            "generation-v8": "Hi hi hi hi hi hi hi hi.",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.3,
                     "personalisation": 0.3,
@@ -433,9 +433,9 @@ async def test_outreach_rejects_message_over_max_length(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {"angle": "y", "signal": "z", "confidence": 0.6},
-            "generation-v7": long_draft,
-            "evaluation-v4.3": {
+            "analysis-v3.6": {"angle": "y", "signal": "z", "confidence": 0.6},
+            "generation-v8": long_draft,
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 1.0,
                     "personalisation": 1.0,
@@ -644,9 +644,9 @@ async def test_outreach_pauses_campaign_lead_when_connector_send_fails(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {"angle": "x", "signal": "y", "confidence": 0.7},
-            "generation-v7": "hey, quick chat?",
-            "evaluation-v4.3": {
+            "analysis-v3.6": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v8": "hey, quick chat?",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -695,9 +695,9 @@ async def test_outreach_skips_if_contact_uri_changes_before_send(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {"angle": "x", "signal": "y", "confidence": 0.7},
-            "generation-v7": "unused",
-            "evaluation-v4.3": {
+            "analysis-v3.6": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v8": "unused",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -811,13 +811,13 @@ async def test_outreach_aborts_when_lead_opts_out_during_pipeline(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "Rating 3 — opportunity",
                 "signal": "rating",
                 "confidence": 0.7,
             },
-            "generation-v7": "hey, quick one?",
-            "evaluation-v4.3": {
+            "generation-v8": "hey, quick one?",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -968,14 +968,14 @@ async def test_outreach_reads_cached_enrichment(
     captured_calls = _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "WordPress site, 24/7 callouts hook.",
                 "angle_type": "signature_detail",
                 "signal": "wordpress generator + h1",
                 "confidence": 0.7,
             },
-            "generation-v7": "Hey — quick chat?",
-            "evaluation-v4.3": {
+            "generation-v8": "Hey — quick chat?",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -1078,14 +1078,14 @@ async def test_outreach_surfaces_cached_failure_status(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "Fallback, site did not respond in time.",
                 "angle_type": "fallback",
                 "signal": "no website signal",
                 "confidence": 0.4,
             },
-            "generation-v7": "Hey there, quick question.",
-            "evaluation-v4.3": {
+            "generation-v8": "Hey there, quick question.",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -1142,14 +1142,14 @@ async def test_outreach_with_no_enrichment_blob_records_missing_status(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "Fallback while we wait for the scan worker.",
                 "angle_type": "fallback",
                 "signal": "no enrichment yet",
                 "confidence": 0.5,
             },
-            "generation-v7": "Hey, quick chat?",
-            "evaluation-v4.3": {
+            "generation-v8": "Hey, quick chat?",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,
@@ -1217,14 +1217,14 @@ async def test_enrichment_disabled_short_circuits(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.5": {
+            "analysis-v3.6": {
                 "angle": "Disabled — fallback hook.",
                 "angle_type": "fallback",
                 "signal": "no enrichment",
                 "confidence": 0.4,
             },
-            "generation-v7": "Hey, brief intro.",
-            "evaluation-v4.3": {
+            "generation-v8": "Hey, brief intro.",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
                     "personalisation": 0.9,

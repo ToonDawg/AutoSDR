@@ -67,8 +67,7 @@ def test_status_estimated_cost_reflects_in_memory_counter(
     workspace_factory()
     reset_usage()
     try:
-        # 1M in + 1M out on Flash-Lite = $0.10 + $0.40 = $0.50
-        _record_usage("gemini/gemini-2.5-flash-lite", 1_000_000, 1_000_000)
+        _record_usage("gemini/gemini-2.5-flash-lite", 1_000_000, 1_000_000, 0.50)
 
         with _client() as client:
             body = client.get("/api/status").json()

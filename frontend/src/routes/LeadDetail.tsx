@@ -7,6 +7,8 @@ import { Badge } from '@/components/ui/Badge';
 import { BackLink } from '@/components/ui/BackLink';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
+import { PriorityBadge } from '@/components/domain/PriorityBadge';
+import { SocialProfileTag } from '@/components/domain/SocialProfileTag';
 import {
   CONTACT_TYPE_LABEL,
   LEAD_STATUS_LABEL,
@@ -149,6 +151,11 @@ export function LeadDetail() {
                 Opted out
               </Badge>
             )}
+            <PriorityBadge
+              isPriority={lead.is_priority}
+              reason={lead.priority_reason}
+            />
+            <SocialProfileTag platform={lead.is_social_website} />
             {lead.contact_type && (
               <Badge tone="outline">
                 {CONTACT_TYPE_LABEL[lead.contact_type] ?? lead.contact_type}

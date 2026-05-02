@@ -9,6 +9,8 @@ import { FilterTabs, type FilterOption } from '@/components/ui/FilterTabs';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { Input } from '@/components/ui/Input';
+import { PriorityBadge } from '@/components/domain/PriorityBadge';
+import { SocialProfileTag } from '@/components/domain/SocialProfileTag';
 import { useDebouncedValue } from '@/lib/useDebouncedValue';
 import {
   CONTACT_TYPE_LABEL,
@@ -237,6 +239,11 @@ export function Leads() {
                         Opted out
                       </Badge>
                     )}
+                    <PriorityBadge
+                      isPriority={l.is_priority}
+                      reason={l.priority_reason}
+                    />
+                    <SocialProfileTag platform={l.is_social_website} />
                   </div>
                   {l.address && (
                     <div className="text-[11px] text-ink-muted mt-0.5">{l.address}</div>

@@ -110,6 +110,16 @@ DEFAULT_WORKSPACE_SETTINGS: dict = {
         "respect_robots": True,
     },
 
+    # Send-order priority — when ``enabled`` is true (default), the
+    # scheduler's ``_next_queued_leads`` drains a priority tier
+    # (today: leads whose website returned 404) before the normal
+    # tier on every tick, while preserving the existing category-mix
+    # rotation within each tier. See ticket 0013. The toggle is the
+    # operator's "back to FIFO + category mix" escape hatch.
+    "priority": {
+        "enabled": True,
+    },
+
     # LLM
     "llm": {
         "provider_api_keys": {
@@ -123,6 +133,27 @@ DEFAULT_WORKSPACE_SETTINGS: dict = {
         "model_classification": "gemini/gemini-3.1-flash-lite-preview",
         "temperature_main": 1.0,
         "temperature_eval": 0.0,
+        # ``reasoning_classification``: thinking-budget cap for the
+        # classification call. Accepts ``"disable" | "low" | "medium"
+        # | "high"``. Classification has a 60-token output (one of 8
+        # intent labels + a one-line reason); reasoning is wasted
+        # spend / latency.
+        #
+        # Default is ``"disable"`` based on a 5-thread live replay
+        # (see ``scripts/replay_classifier_smoke.py``):
+        #   - no override: ~60 tokens_out, ~1.5s latency
+        #   - "low":      ~180 tokens_out, ~3s latency, 1/5 intent
+        #                  flip (OLD objection → NEW negative on a
+        #                  thumbs-up to a closing message)
+        #   - "disable":   ~55 tokens_out, ~1.1s latency, 0/5 flips
+        # i.e. setting ``"low"`` *enables* thinking that Flash-Lite
+        # was skipping by default, costing ~3x tokens and inflating
+        # latency without improving accuracy. ``"disable"`` is
+        # effectively a no-op against today's defaults but pins the
+        # behaviour so a future provider change (Flash-Lite quietly
+        # turning thinking on) doesn't silently inflate cost.
+        # See ``docs/prompt-audit-2026-05-02.md`` Phase 4 #13.
+        "reasoning_classification": "disable",
     },
 
     # Connector

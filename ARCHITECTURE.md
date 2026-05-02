@@ -358,9 +358,13 @@ FastAPI lifespan.
 **The outreach tick** runs every `scheduler_tick_s` seconds. On each tick
 it loops over every active campaign and:
 
-- Computes a **rolling 24-hour send count** for the campaign by counting
-  AI messages on its threads in the last 24 hours. This is the campaign's
-  quota budget for this tick.
+- Computes a **calendar-day send count** for the campaign by counting
+  AI messages on its threads since today's server-local midnight. This
+  is the campaign's quota budget for this tick; the counter resets at
+  midnight each day so the operator's mental model ("each scheduled
+  day starts fresh") matches what the dashboard shows. Manual
+  reset (`POST /campaigns/{id}/reset-send-count`) is still available
+  for mid-day re-baselines via `Campaign.quota_reset_at`.
 - Resolves the **outreach window** (per-campaign override on
   `campaign.outreach_window`, falling back to
   `workspace.settings.outreach_window`, default `{enabled, 8..17}` in
@@ -368,8 +372,8 @@ it loops over every active campaign and:
   Inside, `pacing.window_allowance(...)` returns
   `ceil(outreach_per_day * elapsed_fraction) - sent_in_window` so a
   50-lead/day campaign trickles out at roughly one send every 11
-  minutes instead of bursting in the first 25 minutes. Both the 24h
-  cap and the pacing allowance apply — `min(allowance, remaining_24h,
+  minutes instead of bursting in the first 25 minutes. Both the daily
+  cap and the pacing allowance apply — `min(allowance, remaining_today,
   max_batch_per_tick)` is the per-tick budget. Manual kickoff
   (`respect_quota=False`) bypasses both. Reply pipeline, follow-up
   beat, and inbound poll are unaffected.

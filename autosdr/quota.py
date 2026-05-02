@@ -1,27 +1,37 @@
-"""Rolling-24h outreach-quota accounting.
+"""Calendar-day outreach-quota accounting.
 
-``outreach_per_day`` is enforced as a rolling window, not a calendar day, to
-avoid midnight-burst behaviour and keep the limit predictable regardless of
-when an owner activates the campaign. The scheduler, the status endpoint,
-the campaigns endpoint, and the CLI all need the same count — previously
-each had its own identical private helper, which made it too easy for them
-to drift (different cutoff, different role filter, etc.).
+``outreach_per_day`` is enforced as a **calendar day** that resets at
+server-local midnight. The previous shape was a rolling 24-hour window;
+operators reported it as confusing because the counter never visibly
+"resets" at the start of a working day — a campaign that hit cap at
+4pm yesterday was still capped at 8am today. The midnight reset makes
+the daily budget match the operator's mental model: each scheduled day
+in the working-hours window starts fresh.
 
-Semantics: one **outreach contact** is one *new conversation started*, i.e.
-the first AI message on a thread. Follow-up beats and auto-reply messages
-are extra texts on a thread that's already been contacted, so they don't
-consume a second quota slot. Pre-1.x revisions of this module counted every
-outbound AI message — which silently halved the effective daily cap as soon
-as the operator turned the follow-up beat on.
+Trade-off vs. the old rolling-24h shape: a campaign with the
+working-hours pacer disabled could now stack a full day's quota
+shortly after midnight and another full day's quota during the
+following day. With the default pacer enabled (8am–5pm window) the
+quota gate effectively resets when the window opens, so the practical
+behaviour matches what the operator sees on the dashboard.
 
-Keep this module stateless and import-light so it can be used from both
-request handlers and the scheduler tick without pulling in heavy deps.
+Semantics: one **outreach contact** is one *new conversation started*,
+i.e. the first AI message on a thread. Follow-up beats and auto-reply
+messages are extra texts on a thread that's already been contacted, so
+they don't consume a second quota slot. Pre-1.x revisions of this
+module counted every outbound AI message — which silently halved the
+effective daily cap as soon as the operator turned the follow-up beat
+on.
+
+Keep this module stateless and import-light so it can be used from
+both request handlers and the scheduler tick without pulling in heavy
+deps.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -29,43 +39,75 @@ from sqlalchemy.orm import Session
 from autosdr.models import Campaign, CampaignLead, Lead, Message, MessageRole, Thread
 
 
-def count_outreach_contacts_last_24h(session: Session, campaign_id: str) -> int:
-    """Return how many *new outreach contacts* the campaign opened in the last 24h.
+def today_start_utc(now_local: datetime | None = None) -> datetime:
+    """Return today's server-local midnight, expressed in UTC.
 
-    A contact is one thread whose first AI message landed inside the
-    rolling window — so a follow-up beat that fires 10s after the
-    initial send still only counts as one contact, and an auto-reply
-    sent days later doesn't re-charge the lead's quota slot.
+    The cutoff is anchored to the OS's local timezone — the same
+    convention :mod:`autosdr.pacing` uses for the working-hours
+    window. AutoSDR is single-tenant on the operator's laptop so
+    "local" is unambiguous; the day a workspace IANA timezone setting
+    becomes a thing, this helper is the only place that needs to
+    consult it.
+
+    ``now_local`` is injectable so tests can drive the rollover at a
+    fixed clock; production callers leave it ``None`` and the OS
+    clock is used.
     """
 
-    counts = count_outreach_contacts_last_24h_bulk(session, [campaign_id])
+    clock = now_local or datetime.now().astimezone()
+    if clock.tzinfo is None:
+        clock = clock.astimezone()
+    midnight_local = clock.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(timezone.utc)
+
+
+def count_outreach_contacts_today(
+    session: Session,
+    campaign_id: str,
+    *,
+    now_local: datetime | None = None,
+) -> int:
+    """Return how many *new outreach contacts* the campaign opened today.
+
+    A contact is one thread whose first AI message landed at-or-after
+    today's server-local midnight — so a follow-up beat that fires 10s
+    after the initial send still only counts as one contact, and an
+    auto-reply sent days later doesn't re-charge the lead's quota
+    slot.
+    """
+
+    counts = count_outreach_contacts_today_bulk(
+        session, [campaign_id], now_local=now_local
+    )
     return counts.get(campaign_id, 0)
 
 
-def count_outreach_contacts_last_24h_bulk(
-    session: Session, campaign_ids: Iterable[str]
+def count_outreach_contacts_today_bulk(
+    session: Session,
+    campaign_ids: Iterable[str],
+    *,
+    now_local: datetime | None = None,
 ) -> dict[str, int]:
-    """Batched variant of :func:`count_outreach_contacts_last_24h`.
+    """Batched variant of :func:`count_outreach_contacts_today`.
 
     Returns ``{campaign_id: count}`` for every id asked for — including
-    zero entries for campaigns that opened no new threads in the window.
-    The status endpoint and campaign list previously ran one query per
+    zero entries for campaigns that opened no new threads today. The
+    status endpoint and campaign list previously ran one query per
     active campaign, which scales linearly with the workspace.
 
     Implementation: per thread, take the timestamp of the first AI
     message (``MIN(message.created_at) WHERE role='ai'``); the thread
-    counts iff that timestamp is inside the window. Follow-up sends and
-    auto-replies sit later in the thread by definition, so they're
-    naturally excluded.
+    counts iff that timestamp is at-or-after today's local midnight.
+    Follow-up sends and auto-replies sit later in the thread by
+    definition, so they're naturally excluded.
     """
 
     ids = list(dict.fromkeys(campaign_ids))
     if not ids:
         return {}
 
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+    cutoff = today_start_utc(now_local)
 
-    # Per-thread first-AI timestamp, scoped to campaigns we care about.
     first_ai = (
         select(
             Thread.id.label("thread_id"),
@@ -99,25 +141,29 @@ def count_outreach_contacts_last_24h_bulk(
     return counts
 
 
-def count_outreach_contacts_per_category_24h(
-    session: Session, campaign_id: str
+def count_outreach_contacts_per_category_today(
+    session: Session,
+    campaign_id: str,
+    *,
+    now_local: datetime | None = None,
 ) -> dict[str | None, int]:
-    """Return ``{Lead.category: contacts_in_last_24h}`` for one campaign.
+    """Return ``{Lead.category: contacts_today}`` for one campaign.
 
-    Same definition of "contact" as :func:`count_outreach_contacts_last_24h`
-    (one thread per first AI message, respecting ``quota_reset_at``) but
-    bucketed by the lead's ``category``. Used by the scheduler's
-    category-rotation picker to bias toward under-represented buckets so
-    a plumber-heavy queue doesn't burn the whole day on plumbers.
+    Same definition of "contact" as :func:`count_outreach_contacts_today`
+    (one thread per first AI message, respecting today's local midnight
+    cutoff and ``quota_reset_at``) but bucketed by the lead's
+    ``category``. Used by the scheduler's category-rotation picker to
+    bias toward under-represented buckets so a plumber-heavy queue
+    doesn't burn the whole day on plumbers.
 
-    Categories with zero contacts are simply absent from the dict — the
-    caller treats a missing key as ``0``. ``Lead.category`` may be
+    Categories with zero contacts are simply absent from the dict —
+    the caller treats a missing key as ``0``. ``Lead.category`` may be
     ``None``; that is preserved as a distinct ``None`` bucket so
     uncategorised leads rotate among themselves rather than collapsing
     into another category's count.
     """
 
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+    cutoff = today_start_utc(now_local)
 
     first_ai = (
         select(
@@ -155,18 +201,9 @@ def count_outreach_contacts_per_category_24h(
     return counts
 
 
-# Back-compat aliases — the previous public names referenced "ai_messages"
-# but the semantics changed to "outreach contacts" (one per thread, not one
-# per AI send). Callers can migrate at their leisure; both names point at
-# the same implementation.
-count_ai_messages_last_24h = count_outreach_contacts_last_24h
-count_ai_messages_last_24h_bulk = count_outreach_contacts_last_24h_bulk
-
-
 __all__ = [
-    "count_ai_messages_last_24h",
-    "count_ai_messages_last_24h_bulk",
-    "count_outreach_contacts_last_24h",
-    "count_outreach_contacts_last_24h_bulk",
-    "count_outreach_contacts_per_category_24h",
+    "count_outreach_contacts_today",
+    "count_outreach_contacts_today_bulk",
+    "count_outreach_contacts_per_category_today",
+    "today_start_utc",
 ]

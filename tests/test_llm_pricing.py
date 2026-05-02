@@ -223,8 +223,12 @@ def test_record_usage_accumulates_cost_into_total_and_per_model() -> None:
 
     reset_usage()
     try:
-        _record_usage("gemini/gemini-2.5-flash-lite", 1_000_000, 1_000_000)
-        _record_usage("gemini/gemini-2.5-flash-lite", 500_000, 500_000)
+        _record_usage(
+            "gemini/gemini-2.5-flash-lite", 1_000_000, 1_000_000, 0.50
+        )
+        _record_usage(
+            "gemini/gemini-2.5-flash-lite", 500_000, 500_000, 0.25
+        )
 
         snap = get_usage_snapshot()
         assert snap["total_calls"] == 2
@@ -249,7 +253,7 @@ def test_record_usage_unknown_model_contributes_zero_cost() -> None:
 
     reset_usage()
     try:
-        _record_usage("openai/gpt-99-imaginary", 1000, 1000)
+        _record_usage("openai/gpt-99-imaginary", 1000, 1000, 0.0)
         snap = get_usage_snapshot()
         assert snap["total_calls"] == 1
         assert snap["total_cost_usd"] == 0.0
@@ -263,7 +267,7 @@ def test_reset_usage_clears_cost_too() -> None:
 
     from autosdr.llm.client import _record_usage, get_usage_snapshot, reset_usage
 
-    _record_usage("gemini/gemini-3-flash-preview", 2000, 1000)
+    _record_usage("gemini/gemini-3-flash-preview", 2000, 1000, 0.004)
     reset_usage()
     snap = get_usage_snapshot()
     assert snap["total_calls"] == 0

@@ -172,7 +172,7 @@ async def test_kickoff_bypasses_quota_but_counts_afterward(
     result = await kickoff_campaign(campaign_id, CampaignKickoffRequest(count=3))
 
     assert result.sent == 3
-    assert result.campaign.sent_24h == 4
+    assert result.campaign.sent_today == 4
     assert result.campaign.outreach_per_day == 1
 
 

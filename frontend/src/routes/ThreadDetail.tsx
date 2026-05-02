@@ -1,45 +1,51 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Link, useParams, useNavigate } from 'react-router-dom';
-import { useCallback, useState } from 'react';
-import { AlertTriangle, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
-import { api, ApiError } from '@/lib/api';
-import { MessageBubble } from '@/components/domain/MessageBubble';
-import { AngleTag } from '@/components/domain/AngleTag';
-import { ThreadStatusBadge } from '@/components/domain/ThreadStatusBadge';
-import { Badge } from '@/components/ui/Badge';
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useParams, useNavigate } from "react-router-dom";
+import { useCallback, useState } from "react";
+import { AlertTriangle, ArrowLeft, RotateCcw, Trash2 } from "lucide-react";
+import { api, ApiError } from "@/lib/api";
+import { MessageBubble } from "@/components/domain/MessageBubble";
+import { AngleTag } from "@/components/domain/AngleTag";
+import { ThreadStatusBadge } from "@/components/domain/ThreadStatusBadge";
+import { Badge } from "@/components/ui/Badge";
 import {
   HITL_LABEL,
   absTime,
   formatDoNotContactReason,
   formatPhone,
   relTime,
-} from '@/lib/format';
-import { MessageRole, ThreadStatus, type Suggestion } from '@/lib/types';
-import { SuggestedReplies } from './thread/SuggestedReplies';
-import { ComposeBar } from './thread/ComposeBar';
-import { LlmTrail } from './thread/LlmTrail';
+} from "@/lib/format";
+import {
+  HitlReason,
+  MessageRole,
+  ThreadStatus,
+  type Suggestion,
+} from "@/lib/types";
+import { SuggestedReplies } from "./thread/SuggestedReplies";
+import { HitlActionPanel } from "./thread/HitlActionPanel";
+import { ComposeBar } from "./thread/ComposeBar";
+import { LlmTrail } from "./thread/LlmTrail";
 
 /** Turn the structured API error payload into an operator-friendly line. */
 function sendDraftErrorMessage(err: unknown): string {
   if (err instanceof ApiError) {
     const body = err.payload as { error?: string; reason?: string } | null;
     const code = body?.error;
-    if (code === 'system_shutting_down') {
-      return 'AutoSDR is shutting down — your message was not sent.';
+    if (code === "system_shutting_down") {
+      return "AutoSDR is shutting down — your message was not sent.";
     }
-    if (code === 'connector_send_failed') {
-      return `Connector rejected the send${body?.reason ? `: ${body.reason}` : '.'}`;
+    if (code === "connector_send_failed") {
+      return `Connector rejected the send${body?.reason ? `: ${body.reason}` : "."}`;
     }
-    if (code === 'empty_draft') {
-      return 'Nothing to send — the draft is empty.';
+    if (code === "empty_draft") {
+      return "Nothing to send — the draft is empty.";
     }
-    if (code === 'lead_missing_contact_uri') {
-      return 'This lead has no phone number on file.';
+    if (code === "lead_missing_contact_uri") {
+      return "This lead has no phone number on file.";
     }
-    if (code) return code.replace(/_/g, ' ');
+    if (code) return code.replace(/_/g, " ");
     return err.message;
   }
-  return err instanceof Error ? err.message : 'Send failed.';
+  return err instanceof Error ? err.message : "Send failed.";
 }
 
 /**
@@ -57,34 +63,34 @@ function sendDraftErrorMessage(err: unknown): string {
  * and `LlmTrail`.
  */
 export function ThreadDetail() {
-  const { id = '' } = useParams();
+  const { id = "" } = useParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
-  const [manualDraft, setManualDraft] = useState('');
+  const [manualDraft, setManualDraft] = useState("");
 
   const { data: thread } = useQuery({
-    queryKey: ['thread', id],
+    queryKey: ["thread", id],
     queryFn: () => api.getThread(id),
     enabled: !!id,
   });
   const { data: messages } = useQuery({
-    queryKey: ['messages', id],
+    queryKey: ["messages", id],
     queryFn: () => api.listMessages(id),
     refetchInterval: 8_000,
     enabled: !!id,
   });
   const { data: campaign } = useQuery({
-    queryKey: ['campaign', thread?.campaign_id],
+    queryKey: ["campaign", thread?.campaign_id],
     queryFn: () => (thread ? api.getCampaign(thread.campaign_id) : null),
     enabled: !!thread,
   });
   const { data: lead } = useQuery({
-    queryKey: ['lead', thread?.lead_id],
+    queryKey: ["lead", thread?.lead_id],
     queryFn: () => (thread ? api.getLead(thread.lead_id) : null),
     enabled: !!thread?.lead_id,
   });
   const { data: llmCalls } = useQuery({
-    queryKey: ['llm-calls', id],
+    queryKey: ["llm-calls", id],
     queryFn: () => api.listLlmCalls({ threadId: id, limit: 12 }),
     enabled: !!id,
   });
@@ -92,36 +98,40 @@ export function ThreadDetail() {
   // Invalidate the specific thread record + the user-facing list views.
   // The campaign-scoped list and HITL list both move when a thread sends/closes.
   const invalidateAffectedThreadLists = () => {
-    qc.invalidateQueries({ queryKey: ['thread', id] });
-    qc.invalidateQueries({ queryKey: ['threads'], exact: true });
-    qc.invalidateQueries({ queryKey: ['threads', 'hitl'] });
+    qc.invalidateQueries({ queryKey: ["thread", id] });
+    qc.invalidateQueries({ queryKey: ["threads"], exact: true });
+    qc.invalidateQueries({ queryKey: ["threads", "hitl"] });
     if (thread?.campaign_id) {
       qc.invalidateQueries({
-        queryKey: ['threads', 'campaign', thread.campaign_id],
+        queryKey: ["threads", "campaign", thread.campaign_id],
       });
     }
   };
 
   const sendDraft = useMutation({
-    mutationFn: (payload: { draft: string; source: 'ai_suggested' | 'manual' }) =>
-      api.sendDraft(id, payload),
+    mutationFn: (payload: {
+      draft: string;
+      source: "ai_suggested" | "manual";
+    }) => api.sendDraft(id, payload),
     onSuccess: () => {
-      setManualDraft('');
-      qc.invalidateQueries({ queryKey: ['messages', id] });
+      setManualDraft("");
+      qc.invalidateQueries({ queryKey: ["messages", id] });
       invalidateAffectedThreadLists();
     },
   });
-  const sendError = sendDraft.isError ? sendDraftErrorMessage(sendDraft.error) : null;
+  const sendError = sendDraft.isError
+    ? sendDraftErrorMessage(sendDraft.error)
+    : null;
 
   const regenerate = useMutation({
     mutationFn: () => api.regenerateSuggestions(id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['thread', id] });
+      qc.invalidateQueries({ queryKey: ["thread", id] });
     },
   });
 
   const close = useMutation({
-    mutationFn: (outcome: 'won' | 'lost') => api.closeThread(id, outcome),
+    mutationFn: (outcome: "won" | "lost") => api.closeThread(id, outcome),
     onSuccess: () => {
       invalidateAffectedThreadLists();
     },
@@ -146,7 +156,7 @@ export function ThreadDetail() {
 
   const sendMutate = sendDraft.mutate;
   const handleSendSuggestion = useCallback(
-    (draft: string) => sendMutate({ draft, source: 'ai_suggested' }),
+    (draft: string) => sendMutate({ draft, source: "ai_suggested" }),
     [sendMutate],
   );
   const handleEditSuggestion = useCallback(
@@ -165,7 +175,33 @@ export function ThreadDetail() {
 
   const suggestions: Suggestion[] = thread.hitl_context?.suggestions ?? [];
   const pausedForHitl = thread.status === ThreadStatus.PAUSED_FOR_HITL;
-  const showSuggestions = pausedForHitl || suggestions.length > 0;
+
+  // For paused threads with a stashed failed draft (connector error or
+  // eval-exhausted), surface a one-click Retry / Edit / Dismiss panel
+  // instead of the empty AI-suggestions strip — those reasons don't
+  // populate `suggestions`, so the strip would otherwise just say
+  // "no drafts on file".
+  const failureReasons = new Set<string>([
+    HitlReason.CONNECTOR_SEND_FAILED,
+    HitlReason.EVAL_FAILED_AFTER_MAX_ATTEMPTS,
+    HitlReason.REPLY_EVAL_FAILED,
+  ]);
+  const lastDrafts = thread.hitl_context?.last_drafts ?? [];
+  const failedDraft =
+    pausedForHitl &&
+    !thread.hitl_dismissed_at &&
+    thread.hitl_reason &&
+    failureReasons.has(thread.hitl_reason) &&
+    lastDrafts.length > 0
+      ? lastDrafts[lastDrafts.length - 1]
+      : null;
+  const lastScores = thread.hitl_context?.last_scores ?? [];
+  const lastScoreEntry =
+    lastScores.length > 0 ? lastScores[lastScores.length - 1] : null;
+
+  const showActionPanel = !!failedDraft;
+  const showSuggestions =
+    !showActionPanel && (pausedForHitl || suggestions.length > 0);
 
   // When the thread was closed because the lead opted out, surface the
   // matched inbound + keyword instead of the generic "Closed lost" frame.
@@ -189,11 +225,18 @@ export function ThreadDetail() {
             Back
           </button>
           <div className="flex items-baseline justify-between gap-4 mb-2">
-            <h1 className="text-xl font-medium">{thread.lead_name ?? 'Unknown lead'}</h1>
+            <Link to={`/leads/${thread.lead_id}`} className="hover:text-ink">
+              <h1 className="text-xl font-medium">
+                {thread.lead_name ?? "Unknown lead"}
+              </h1>
+            </Link>
             <ThreadStatusBadge status={thread.status} />
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-muted">
-            <Link to={`/campaigns/${thread.campaign_id}`} className="hover:text-ink">
+            <Link
+              to={`/campaigns/${thread.campaign_id}`}
+              className="hover:text-ink"
+            >
               {thread.campaign_name}
             </Link>
             <span className="text-ink-faint">·</span>
@@ -219,7 +262,7 @@ export function ThreadDetail() {
                 {formatDoNotContactReason(lead?.do_not_contact_reason ?? null)}
                 {lead?.do_not_contact_at && (
                   <span className="text-ink-muted">
-                    {' '}
+                    {" "}
                     · {absTime(lead.do_not_contact_at)}
                   </span>
                 )}
@@ -235,20 +278,21 @@ export function ThreadDetail() {
 
         {pausedForHitl && thread.hitl_reason && (
           <div className="px-8 py-3 border-b border-rust/40 bg-rust-soft/60 flex items-start gap-4">
-            <Badge tone={thread.hitl_dismissed_at ? 'neutral' : 'rust'} dot>
-              {thread.hitl_dismissed_at ? 'Dismissed' : 'Paused for you'}
+            <Badge tone={thread.hitl_dismissed_at ? "neutral" : "rust"} dot>
+              {thread.hitl_dismissed_at ? "Dismissed" : "Paused for you"}
             </Badge>
             <div className="flex-1 text-sm text-ink">
               {HITL_LABEL[thread.hitl_reason] ?? thread.hitl_reason}
               {thread.hitl_dismissed_at && (
                 <span className="text-ink-muted">
-                  {' '}
+                  {" "}
                   · set aside {relTime(thread.hitl_dismissed_at)}
                 </span>
               )}
               {thread.hitl_context?.incoming_message && (
                 <div className="mt-1 text-sm text-ink-muted">
-                  Last from lead: &ldquo;{thread.hitl_context.incoming_message}&rdquo;
+                  Last from lead: &ldquo;{thread.hitl_context.incoming_message}
+                  &rdquo;
                 </div>
               )}
             </div>
@@ -281,19 +325,40 @@ export function ThreadDetail() {
         <div className="flex-1 overflow-y-auto px-8 py-6">
           <div className="flex flex-col gap-6">
             {messages?.map((m) => (
-              <MessageBubble key={m.id} message={m} leadName={thread.lead_name ?? 'Lead'} />
+              <MessageBubble
+                key={m.id}
+                message={m}
+                leadName={thread.lead_name ?? "Lead"}
+              />
             ))}
             {(!messages || messages.length === 0) && (
               <div className="mx-auto max-w-md text-center py-16 flex flex-col items-center gap-3">
-                <div className="text-sm font-medium">Nothing has gone out yet.</div>
+                <div className="text-sm font-medium">
+                  Nothing has gone out yet.
+                </div>
                 <p className="text-sm text-ink-muted leading-relaxed">
-                  The scheduler will pick this lead up on its next tick, or you can draft a
-                  message below.
+                  The scheduler will pick this lead up on its next tick, or you
+                  can draft a message below.
                 </p>
               </div>
             )}
           </div>
         </div>
+
+        {showActionPanel && failedDraft && thread.hitl_reason && (
+          <HitlActionPanel
+            reason={thread.hitl_reason}
+            failedDraft={failedDraft}
+            connectorError={thread.hitl_context?.connector_error ?? null}
+            lastScore={lastScoreEntry?.overall ?? null}
+            lastFeedback={lastScoreEntry?.feedback ?? null}
+            onRetry={(draft) => sendDraft.mutate({ draft, source: "manual" })}
+            onEdit={handleEditSuggestion}
+            onDismiss={() => dismiss.mutate()}
+            sending={sendDraft.isPending}
+            dismissing={dismiss.isPending}
+          />
+        )}
 
         {showSuggestions && (
           <SuggestedReplies
@@ -312,7 +377,10 @@ export function ThreadDetail() {
             role="alert"
             className="border-t border-oxblood/30 bg-oxblood-soft px-8 py-3 flex items-start gap-2 text-sm text-oxblood"
           >
-            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" strokeWidth={1.75} />
+            <AlertTriangle
+              className="h-4 w-4 mt-0.5 shrink-0"
+              strokeWidth={1.75}
+            />
             <div>
               <div className="font-medium">Send failed</div>
               <div className="text-xs mt-0.5">{sendError}</div>
@@ -323,7 +391,9 @@ export function ThreadDetail() {
         <ComposeBar
           draft={manualDraft}
           onDraftChange={setManualDraft}
-          onSendManual={() => sendDraft.mutate({ draft: manualDraft, source: 'manual' })}
+          onSendManual={() =>
+            sendDraft.mutate({ draft: manualDraft, source: "manual" })
+          }
           onClose={(outcome) => close.mutate(outcome)}
           sending={sendDraft.isPending}
         />
@@ -336,7 +406,9 @@ export function ThreadDetail() {
           {campaign && (
             <div className="mt-4 pt-4 border-t border-rule">
               <div className="label mb-1.5">Campaign goal</div>
-              <p className="text-sm text-ink leading-relaxed">{campaign.goal}</p>
+              <p className="text-sm text-ink leading-relaxed">
+                {campaign.goal}
+              </p>
             </div>
           )}
         </section>

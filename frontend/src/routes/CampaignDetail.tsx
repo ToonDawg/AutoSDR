@@ -185,9 +185,9 @@ export function CampaignDetail() {
         <div className="p-4 flex flex-col gap-2">
           <div className="label">Daily capacity</div>
           <QuotaMeter
-            sent={campaign.sent_24h}
+            sent={campaign.sent_today}
             quota={campaign.outreach_per_day}
-            label="24H"
+            label="TODAY"
           />
         </div>
       </div>
@@ -347,8 +347,18 @@ function ManualKickoffSection({ campaign }: { campaign: Campaign }) {
   return (
     <CollapsibleCard
       title="Manual kick-off"
-      description="Send the next queued leads now. This bypasses the 24-hour cap, but every send still counts afterward."
+      description="Send the next queued leads now. This bypasses today's daily cap, but every send still counts afterward."
     >
+      {campaign.queued_priority_count > 0 && (
+        <div className="border border-oxblood/30 bg-oxblood-soft/40 px-4 py-3 text-xs text-ink">
+          <span className="label text-oxblood mr-2">Priority queue</span>
+          {campaign.queued_priority_count} of {campaign.queued_count} queued
+          lead{campaign.queued_count === 1 ? "" : "s"} have a priority signal
+          (broken website or social profile in lieu of website) — they will be
+          sent first.
+        </div>
+      )}
+
       <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
         <Field
           label="Send next N"
@@ -430,7 +440,7 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
   return (
     <CollapsibleCard
       title="Campaign settings"
-      description="Edit the campaign brief and daily send capacity. Resetting the send count starts a fresh 24-hour quota window for this campaign."
+      description="Edit the campaign brief and daily send capacity. The count resets at midnight; use the manual reset to start a fresh budget mid-day."
       footer={
         <SaveRow
           dirty={dirty}
@@ -448,7 +458,7 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
         </Field>
         <Field
           label="Daily send capacity"
-          hint="Rolling 24-hour limit on new outreach contacts. Follow-up beats and inbound replies don't consume quota."
+          hint="Daily cap on new outreach contacts; the count resets at midnight. Follow-up beats and inbound replies don't consume quota."
         >
           <Input
             type="number"
@@ -476,11 +486,12 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
 
       <div className="flex items-center justify-between gap-4 border border-rule bg-paper px-4 py-3">
         <div>
-          <div className="text-sm font-medium text-ink">24-hour send count</div>
+          <div className="text-sm font-medium text-ink">Today's send count</div>
           <p className="text-xs text-ink-muted mt-1">
-            Current count is {campaign.sent_24h}/{campaign.outreach_per_day}.
+            Current count is {campaign.sent_today}/{campaign.outreach_per_day}.
+            {" "}Resets automatically at midnight.
             {campaign.quota_reset_at
-              ? ` Last reset ${relTime(campaign.quota_reset_at)}.`
+              ? ` Last manual reset ${relTime(campaign.quota_reset_at)}.`
               : ""}
           </p>
         </div>
@@ -489,12 +500,12 @@ function CampaignSettingsSection({ campaign }: { campaign: Campaign }) {
           iconLeft={<RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />}
           onClick={() => {
             if (
-              window.confirm("Reset the 24-hour send count for this campaign?")
+              window.confirm("Reset today's send count for this campaign?")
             ) {
               resetSendCount.mutate();
             }
           }}
-          disabled={resetSendCount.isPending || campaign.sent_24h === 0}
+          disabled={resetSendCount.isPending || campaign.sent_today === 0}
         >
           {resetSendCount.isPending ? "Resetting…" : "Reset send count"}
         </Button>

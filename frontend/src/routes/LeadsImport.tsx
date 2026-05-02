@@ -183,6 +183,8 @@ export function LeadsImport() {
             </button>
           </div>
 
+          <SocialWebsiteCallout hosts={preview.social_website_hosts} />
+
           <div className="grid grid-cols-2 gap-4">
             <div className="border border-forest bg-forest-soft p-4">
               <div className="label text-forest mb-1">Will import</div>
@@ -315,6 +317,60 @@ function Rule({ title, body }: { title: string; body: string }) {
  * splits these into ``mapping`` / ``include_in_raw_only`` /
  * ``drop_from_raw``; this UI-side enum keeps the radio model simple.
  */
+/**
+ * Pre-commit callout: how many of the upload's rows have a social
+ * profile in the ``website`` column. Renders nothing when no social
+ * URLs were detected. Operators see this *before* committing so
+ * they can decide whether to clean the data or just let those rows
+ * land in the priority tier. Ticket 0014.
+ */
+
+const SOCIAL_PLATFORM_LABEL: Record<string, string> = {
+  facebook: 'Facebook',
+  instagram: 'Instagram',
+  linkedin: 'LinkedIn',
+  twitter: 'Twitter',
+  x: 'X',
+  tiktok: 'TikTok',
+  youtube: 'YouTube',
+};
+
+function SocialWebsiteCallout({
+  hosts,
+}: {
+  hosts: Record<string, number> | undefined;
+}) {
+  if (!hosts) return null;
+  const entries = Object.entries(hosts).filter(([, count]) => count > 0);
+  if (entries.length === 0) return null;
+  // Stable platform order so the callout doesn't reflow if the
+  // server renders the dict in a different key order between
+  // requests.
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  return (
+    <div className="border border-mustard/40 bg-mustard-soft/50 px-4 py-3 text-xs text-ink">
+      <div className="label text-mustard mb-1">Priority on import</div>
+      <div className="flex flex-col gap-1">
+        {entries.map(([platform, count]) => (
+          <div key={platform} className="flex items-center justify-between gap-3">
+            <span className="text-ink">
+              {count} lead{count === 1 ? '' : 's'} have{' '}
+              {SOCIAL_PLATFORM_LABEL[platform] ?? platform} as their website
+            </span>
+            <span className="font-mono text-ink-muted tabular-nums shrink-0">
+              {count}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="mt-2 text-[11px] text-ink-muted">
+        These leads will be flagged as priority — sent before normal-tier leads
+        in any campaign you assign them to.
+      </div>
+    </div>
+  );
+}
+
 type MappingChoice = CoreFieldName | 'raw_only' | 'drop';
 
 const CORE_FIELD_OPTIONS: { value: CoreFieldName; label: string }[] = [

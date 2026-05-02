@@ -1,19 +1,14 @@
 """Gemini pricing table, alias resolver, cost helper, and named presets.
 
-This is the **single source of truth** for translating an LLM call's
-``(model, tokens_in, tokens_out)`` into a USD cost estimate, plus the
-canonical "MAX / BALANCED / CHEAP" Gemini blends the operator can apply
-from the Settings page.
+This is the pricing fallback and preset source for Gemini models.
 
-Per ticket 0006 we compute cost at read time rather than persisting it
-on ``llm_call``. Trade-off accepted: a pricing-map edit retroactively
-reprices historical Logs rows. We label every cost surface "estimated"
-and surface :data:`PRICING_VERIFIED_AT` so the operator knows the
-snapshot date.
+Runtime LLM-call cost is now persisted at write time from LiteLLM's
+``response_cost`` on ``llm_call.cost_usd``. This module remains useful
+for:
 
-If/when a real spend-audit consumer appears (monthly close, tax export)
-add a nullable ``llm_call.cost_usd`` column populated at write-time and
-keep this module as the read-side fallback for historical rows.
+* fallback pricing for legacy rows that predate the persisted-cost column,
+* deterministic pricing tests,
+* and the canonical "MAX / BALANCED / CHEAP" Gemini model presets.
 
 Pricing is **standard / paid tier, text only**. Audio, image,
 batch / flex / priority tiers are out of scope; if a future ticket needs

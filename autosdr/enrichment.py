@@ -40,6 +40,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from autosdr import __version__
 from autosdr.enrichment_extract import extract_signals_from_soup
+from autosdr.enrichment_vocab import SOCIAL_HOSTS
 from autosdr.models import Lead
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,60 @@ def normalise_website_url(raw: str | None) -> str | None:
     if not _HOSTNAME_RE.match(parsed.netloc):
         return None
     return candidate
+
+
+# ---------------------------------------------------------------------------
+# Social-profile-as-website detection (ticket 0014)
+# ---------------------------------------------------------------------------
+
+# Vocab lives in :mod:`autosdr.enrichment_vocab` so the extractor regex
+# in :mod:`autosdr.enrichment_extract` and this predicate share one
+# source of truth without a circular import. ``SOCIAL_HOSTS`` is
+# re-exported from this module for backward-compat on existing call
+# sites that did ``from autosdr.enrichment import SOCIAL_HOSTS``.
+
+
+def is_social_website(url: str | None) -> str | None:
+    """Return the platform token if ``url``'s hostname is a social profile.
+
+    Examples (truth table covered in
+    ``tests/test_enrichment_social_website.py``):
+
+    * ``https://facebook.com/foo``         → ``"facebook"``
+    * ``https://www.linkedin.com/in/x``    → ``"linkedin"``
+    * ``http://tiktok.com/@bar``           → ``"tiktok"``
+    * ``https://acme.com/facebook-ads``    → ``None`` (host-only match)
+    * ``None`` / ``""`` / garbage          → ``None``
+
+    Hostname-only match — a corporate website that mentions a social
+    platform in the path must not light up the predicate.
+    """
+
+    if not url:
+        return None
+    candidate = url.strip()
+    if not candidate:
+        return None
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    # Hostname suffix match: ``facebook.com`` or ``m.facebook.com``
+    # both qualify; ``acme.com`` does not. Single-label
+    # social-platform tokens (``x``) are matched exactly to avoid
+    # accidental collisions with country-code TLDs (e.g. ``some.x``).
+    for platform in SOCIAL_HOSTS:
+        suffix = f"{platform}.com"
+        if host == suffix or host.endswith(f".{suffix}"):
+            return platform
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -363,9 +418,11 @@ __all__ = [
     "IMPIT_TIMEOUT_FLOOR_S",
     "EnrichmentResult",
     "EnrichmentStatus",
+    "SOCIAL_HOSTS",
     "USER_AGENT",
     "enrich_lead",
     "enrich_urls",
+    "is_social_website",
     "normalise_website_url",
     "persist_enrichment",
 ]

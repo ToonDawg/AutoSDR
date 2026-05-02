@@ -131,6 +131,204 @@ def test_campaign_out_exposes_every_status_bucket(fresh_db, workspace_factory):
     )
 
 
+def test_campaign_out_exposes_queued_priority_count(fresh_db, workspace_factory):
+    """``queued_priority_count`` mirrors queued AND ``enrichment_status='not_found'``.
+
+    Three queued leads (one ``not_found``, one ``ok``, one
+    ``timeout``) plus one ``contacted`` lead with ``not_found``.
+    Only the queued+not_found row counts — the contacted one is not
+    queued, the ok/timeout rows are queued but not priority. Pins
+    ticket 0013 SC: ``queued_priority_count == 1``.
+    """
+
+    ws_id = workspace_factory()
+    with fresh_db() as session:
+        ws = session.get(Workspace, ws_id)
+        campaign = Campaign(
+            workspace_id=ws.id,
+            name="Priority bucket",
+            goal="Book calls",
+            outreach_per_day=10,
+            connector_type="file",
+            status=CampaignStatus.ACTIVE,
+        )
+        session.add(campaign)
+        session.flush()
+
+        fixtures = [
+            ("queued", "not_found"),
+            ("queued", "ok"),
+            ("queued", "timeout"),
+            ("contacted", "not_found"),  # NOT counted — not queued
+        ]
+        for idx, (cl_status, enrich) in enumerate(fixtures, start=1):
+            lead_status = (
+                LeadStatus.CONTACTED
+                if cl_status == "contacted"
+                else LeadStatus.NEW
+            )
+            lead = Lead(
+                workspace_id=ws.id,
+                name=f"Lead {idx}",
+                contact_uri=f"+6140000{idx:04d}",
+                contact_type="mobile",
+                category="Retail",
+                address="x",
+                raw_data={},
+                import_order=idx,
+                source_file="seed",
+                status=lead_status,
+            )
+            lead.enrichment_status = enrich
+            session.add(lead)
+            session.flush()
+            session.add(
+                CampaignLead(
+                    campaign_id=campaign.id,
+                    lead_id=lead.id,
+                    queue_position=idx,
+                    status=cl_status,
+                )
+            )
+        session.flush()
+        campaign_id = campaign.id
+
+    out = get_campaign(campaign_id)
+    assert out.queued_count == 3
+    assert out.queued_priority_count == 1
+    assert out.queued_priority_count <= out.queued_count
+
+
+def test_campaign_out_queued_priority_count_zero_when_no_priority(
+    fresh_db, workspace_factory,
+):
+    """Zero ``not_found`` leads → ``queued_priority_count == 0``.
+
+    Two queued leads, both ``ok``. Pins the no-priority path.
+    """
+
+    ws_id = workspace_factory()
+    with fresh_db() as session:
+        ws = session.get(Workspace, ws_id)
+        campaign = Campaign(
+            workspace_id=ws.id,
+            name="No priority",
+            goal="Book calls",
+            outreach_per_day=10,
+            connector_type="file",
+            status=CampaignStatus.ACTIVE,
+        )
+        session.add(campaign)
+        session.flush()
+
+        for idx in (1, 2):
+            lead = Lead(
+                workspace_id=ws.id,
+                name=f"Lead {idx}",
+                contact_uri=f"+6140002{idx:04d}",
+                contact_type="mobile",
+                category="Retail",
+                address="x",
+                raw_data={},
+                import_order=idx,
+                source_file="seed",
+                status=LeadStatus.NEW,
+            )
+            lead.enrichment_status = "ok"
+            session.add(lead)
+            session.flush()
+            session.add(
+                CampaignLead(
+                    campaign_id=campaign.id,
+                    lead_id=lead.id,
+                    queue_position=idx,
+                    status=CampaignLeadStatus.QUEUED,
+                )
+            )
+        session.flush()
+        campaign_id = campaign.id
+
+    out = get_campaign(campaign_id)
+    assert out.queued_count == 2
+    assert out.queued_priority_count == 0
+
+
+def test_queued_priority_count_includes_social_websites(
+    fresh_db, workspace_factory,
+):
+    """``queued_priority_count`` covers social-as-website too (ticket 0014).
+
+    Mix:
+
+    * 1× queued ``not_found`` (Australia phone) — counts via the
+      0013 branch.
+    * 2× queued ``ok`` with Facebook + LinkedIn URLs — counts via
+      the 0014 branch.
+    * 1× queued ``ok`` with a real corporate website — does NOT count.
+    * 1× queued ``ok`` with a path-only mention of a platform
+      (``acme.com/about-our-facebook``) — does NOT count (host-only
+      match).
+
+    Pins the OR semantics in :func:`_campaign_queued_priority_bulk`.
+    """
+
+    ws_id = workspace_factory()
+    with fresh_db() as session:
+        ws = session.get(Workspace, ws_id)
+        campaign = Campaign(
+            workspace_id=ws.id,
+            name="Mixed priority",
+            goal="Book calls",
+            outreach_per_day=10,
+            connector_type="file",
+            status=CampaignStatus.ACTIVE,
+        )
+        session.add(campaign)
+        session.flush()
+
+        fixtures = [
+            # (enrichment_status, website, counts_as_priority?)
+            ("not_found", None, True),
+            ("ok", "https://facebook.com/Acme", True),
+            ("ok", "https://www.linkedin.com/company/acme", True),
+            ("ok", "https://acme.com.au", False),
+            ("ok", "https://acme.com/about-our-facebook", False),
+        ]
+        for idx, (enrich, website, _) in enumerate(fixtures, start=1):
+            lead = Lead(
+                workspace_id=ws.id,
+                name=f"Lead {idx}",
+                contact_uri=f"+6140003{idx:04d}",
+                contact_type="mobile",
+                category="Retail",
+                address="x",
+                website=website,
+                raw_data={},
+                import_order=idx,
+                source_file="seed",
+                status=LeadStatus.NEW,
+            )
+            lead.enrichment_status = enrich
+            session.add(lead)
+            session.flush()
+            session.add(
+                CampaignLead(
+                    campaign_id=campaign.id,
+                    lead_id=lead.id,
+                    queue_position=idx,
+                    status=CampaignLeadStatus.QUEUED,
+                )
+            )
+        session.flush()
+        campaign_id = campaign.id
+
+    out = get_campaign(campaign_id)
+    expected_priority = sum(1 for *_ , counts in fixtures if counts)
+    assert out.queued_count == len(fixtures)
+    assert out.queued_priority_count == expected_priority
+    assert out.queued_priority_count <= out.queued_count
+
+
 def test_reset_send_count_starts_fresh_quota_window(fresh_db, workspace_factory):
     ws_id = workspace_factory()
     with fresh_db() as session:
@@ -184,7 +382,7 @@ def test_reset_send_count_starts_fresh_quota_window(fresh_db, workspace_factory)
 
     result = reset_send_count(campaign_id)
 
-    assert result.sent_24h == 0
+    assert result.sent_today == 0
     assert result.quota_reset_at is not None
 
 

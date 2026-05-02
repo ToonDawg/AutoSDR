@@ -110,7 +110,7 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch, responses: dict[str, Any]) -> No
     from autosdr.llm.client import CompletionResult
 
     async def _fake_complete_text(
-        *, system, user, model, prompt_version, temperature, context=None
+        *, system, user, model, prompt_version, temperature, context=None, **_kwargs
     ):
         payload = responses.get(prompt_version)
         if isinstance(payload, list):
@@ -121,7 +121,7 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch, responses: dict[str, Any]) -> No
         )
 
     async def _fake_complete_json(
-        *, system, user, model, prompt_version, temperature=0.0, context=None
+        *, system, user, model, prompt_version, temperature=0.0, context=None, **_kwargs
     ):
         payload = responses.get(prompt_version)
         if isinstance(payload, list):
@@ -148,7 +148,7 @@ async def test_negative_intent_closes_lost_and_propagates(active_thread, fresh_d
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "negative",
                 "confidence": 0.95,
                 "reason": "Lead said STOP.",
@@ -180,7 +180,7 @@ async def test_goal_achieved_closes_won(active_thread, fresh_db, monkeypatch):
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "goal_achieved",
                 "confidence": 0.95,
                 "reason": "Lead agreed to book.",
@@ -210,7 +210,7 @@ async def test_bot_check_escalates(active_thread, fresh_db, monkeypatch):
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "bot_check",
                 "confidence": 0.9,
                 "reason": "Lead asked if this is a robot.",
@@ -239,7 +239,7 @@ async def test_low_confidence_escalates(active_thread, fresh_db, monkeypatch):
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "question",
                 "confidence": 0.55,
                 "reason": "Not sure what they mean.",
@@ -265,13 +265,13 @@ async def test_positive_triggers_auto_reply(active_thread, fresh_db, monkeypatch
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "positive",
                 "confidence": 0.92,
                 "reason": "Lead wants to know more.",
             },
-            "generation-v7": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
-            "evaluation-v4.3": {
+            "generation-v8": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
+            "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.92,
                     "personalisation": 0.9,
@@ -444,7 +444,7 @@ async def test_multi_campaign_routes_to_most_recent_outbound(
     _patch_llm(
         monkeypatch,
         {
-            "classification-v1": {
+            "classification-v1.1": {
                 "intent": "negative",
                 "confidence": 0.95,
                 "reason": "Stop.",
@@ -461,3 +461,79 @@ async def test_multi_campaign_routes_to_most_recent_outbound(
     )
     assert result.action == "closed_lost"
     assert result.thread_id == newer_thread_id
+
+
+@pytest.mark.parametrize(
+    "configured_value, expected_kwarg",
+    [
+        (None, "disable"),     # default — no override in settings
+        ("low", "low"),
+        ("disable", "disable"),
+        ("medium", "medium"),
+    ],
+)
+async def test_classification_forwards_reasoning_effort(
+    active_thread,
+    fresh_db,
+    monkeypatch,
+    configured_value,
+    expected_kwarg,
+):
+    """``reasoning_classification`` setting reaches ``complete_json``.
+
+    Phase 4 #13 of the prompt audit caps the thinking-budget for
+    classification. Default is ``"disable"`` because a 5-thread live
+    replay (see ``scripts/replay_classifier_smoke.py``) showed
+    Flash-Lite was already not reasoning by default — and that
+    setting ``"low"`` actually *enabled* reasoning, tripling tokens
+    and doubling latency without improving accuracy. Pinning
+    ``"disable"`` matches today's behaviour and prevents a future
+    provider change from silently re-enabling it. This test pins
+    the wiring end-to-end so a future refactor can't silently drop
+    the kwarg.
+    """
+
+    if configured_value is not None:
+        with fresh_db() as session:
+            ws = session.get(Workspace, active_thread["workspace_id"])
+            settings = dict(ws.settings)
+            llm = dict(settings.get("llm") or {})
+            llm["reasoning_classification"] = configured_value
+            settings["llm"] = llm
+            ws.settings = settings
+
+    captured: dict[str, Any] = {}
+
+    from autosdr.llm.client import CompletionResult
+
+    async def _spy_complete_json(**kwargs):
+        captured.update(kwargs)
+        return (
+            {
+                "intent": "negative",
+                "confidence": 0.95,
+                "reason": "Stop.",
+            },
+            CompletionResult(
+                text="ok",
+                model=kwargs["model"],
+                prompt_version=kwargs["prompt_version"],
+                tokens_in=5,
+                tokens_out=5,
+                attempts=1,
+                latency_ms=1,
+            ),
+        )
+
+    monkeypatch.setattr("autosdr.pipeline.reply.complete_json", _spy_complete_json)
+
+    connector = FileConnector(outbox_path=active_thread["outbox_path"])
+    incoming = IncomingMessage(contact_uri="+61400000001", content="not interested")
+    await process_incoming_message(
+        connector=connector,
+        workspace_id=active_thread["workspace_id"],
+        incoming=incoming,
+    )
+
+    assert captured.get("reasoning_effort") == expected_kwarg
+    assert captured.get("prompt_version") == "classification-v1.1"

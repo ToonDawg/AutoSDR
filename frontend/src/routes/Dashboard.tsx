@@ -17,7 +17,7 @@ import { useHitlCount, useHitlThreads } from '@/lib/useHitlThreads';
  *   1. Status strip     — paused?, active connector, LLM usage today
  *   2. HITL queue       — threads awaiting a human reply
  *   3. Sends sparkline  — AI-message volume over the last 14 days
- *   4. Campaign quotas  — 24h progress bars per active campaign
+ *   4. Campaign quotas  — today's progress bars per active campaign (resets at midnight)
  *
  * The previous "editorial" layout (Fraunces hero, § markers, date strip)
  * has been removed. We still keep the warm paper palette because it's
@@ -49,8 +49,8 @@ export function Dashboard() {
     () => campaigns?.filter((c) => c.status === CampaignStatus.ACTIVE) ?? [],
     [campaigns],
   );
-  const totalSent24h = useMemo(
-    () => activeCampaigns.reduce((a, c) => a + c.sent_24h, 0),
+  const totalSentToday = useMemo(
+    () => activeCampaigns.reduce((a, c) => a + c.sent_today, 0),
     [activeCampaigns],
   );
 
@@ -62,7 +62,9 @@ export function Dashboard() {
           <p className="text-sm text-ink-muted mt-1">
             {status?.paused
               ? 'Scheduler is paused. Nothing is going out.'
-              : `Running. ${totalSent24h} messages in the last 24 hours.`}
+              : `Running. ${totalSentToday} ${
+                  totalSentToday === 1 ? 'message' : 'messages'
+                } sent today.`}
           </p>
         </div>
         <Link
@@ -184,10 +186,10 @@ export function Dashboard() {
                       {c.name}
                     </span>
                     <span className="font-mono text-[11px] text-ink-muted shrink-0 tabular-nums">
-                      {c.sent_24h} / {c.outreach_per_day}
+                      {c.sent_today} / {c.outreach_per_day}
                     </span>
                   </Link>
-                  <QuotaMeter sent={c.sent_24h} quota={c.outreach_per_day} label="SENT" />
+                  <QuotaMeter sent={c.sent_today} quota={c.outreach_per_day} label="SENT" />
                 </div>
               ))}
             </div>

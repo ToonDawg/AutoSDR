@@ -256,6 +256,11 @@ async def generate_and_evaluate(
             model=settings_llm["model_eval"],
             prompt_version=evaluation.PROMPT_VERSION,
             temperature=float(settings_llm.get("temperature_eval", 0.0)),
+            # Constrain the response shape via json_schema for providers
+            # that support it (Gemini 2+, OpenAI gpt-4o, LM Studio, ...).
+            # Falls back to json_object on older providers. Phase 4
+            # #11+12 of ``docs/prompt-audit-2026-05-02.md``.
+            json_schema=evaluation.EVALUATION_RESPONSE_SCHEMA,
             context=eval_ctx,
         )
         normalised = evaluation.evaluate_result(

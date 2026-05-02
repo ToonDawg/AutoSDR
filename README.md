@@ -26,7 +26,7 @@ file-backed connector for dev.
    goal-reached conversations close automatically. Everything else pauses the
    thread, generates two or three AI-drafted candidate replies, and waits for
    you to pick one, edit one, or type your own.
-5. Enforces a per-campaign rolling-24h send cap.
+5. Enforces a per-campaign daily send cap that resets at server-local midnight.
 6. Persists every LLM call — prompts, response, tokens, latency, error — to
    the `llm_call` table and `data/logs/llm-YYYYMMDD.jsonl`, so you can audit
    and iterate on prompts after the fact.
@@ -158,7 +158,7 @@ autosdr/
     outreach.py     # analyse → generate → evaluate → send
     reply.py        # classify → close / park / (if auto-reply on) respond
     suggestions.py  # generate_reply_variants(n=2-3) for the HITL card
-  scheduler.py      # outreach tick + inbound poller; rolling-24h quota
+  scheduler.py      # outreach tick + inbound poller; calendar-day quota (midnight reset)
   webhook.py        # FastAPI app: mounts routers + serves frontend/dist + logging
 
 frontend/           # React 19 + Vite 8 + Tailwind v4 operator console

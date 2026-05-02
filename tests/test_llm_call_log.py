@@ -18,20 +18,21 @@ def llm_stub(monkeypatch):
     """Capture calls to _do_completion and serve canned responses."""
 
     calls: list[dict] = []
-    canned: list[tuple[str, int, int]] = []
+    canned: list[tuple[str, int, int, float]] = []
 
-    async def _fake(*, model, messages, temperature, response_format):
+    async def _fake(*, model, messages, temperature, response_format, **_kwargs):
         calls.append(
             {
                 "model": model,
                 "messages": messages,
                 "temperature": temperature,
                 "response_format": response_format,
+                **_kwargs,
             }
         )
         if canned:
             return canned.pop(0)
-        return ("ok", 5, 7)
+        return ("ok", 5, 7, 0.0012)
 
     monkeypatch.setattr(llm_client, "_do_completion", _fake)
     return {"calls": calls, "canned": canned}
@@ -83,12 +84,13 @@ async def test_complete_text_writes_row_and_jsonl(fresh_db, llm_stub):
     assert len(records) == 1
     assert records[0]["purpose"] == LlmCallPurpose.ANALYSIS
     assert records[0]["thread_id"] == "thread-1"
+    assert records[0]["cost_usd"] == 0.0012
     assert records[0]["error"] is None
 
 
 async def test_complete_json_parses_and_backfills_parsed(fresh_db, llm_stub):
     fresh_db()
-    llm_stub["canned"].append(('{"angle": "rating is 3", "confidence": 0.6}', 10, 20))
+    llm_stub["canned"].append(('{"angle": "rating is 3", "confidence": 0.6}', 10, 20, 0.0008))
 
     ctx = LlmCallContext(
         purpose=LlmCallPurpose.ANALYSIS,
@@ -118,8 +120,8 @@ async def test_complete_json_parses_and_backfills_parsed(fresh_db, llm_stub):
 
 async def test_complete_json_self_heal_logs_both_attempts(fresh_db, llm_stub):
     fresh_db()
-    llm_stub["canned"].append(("not json at all", 3, 4))
-    llm_stub["canned"].append(('{"ok": true}', 6, 8))
+    llm_stub["canned"].append(("not json at all", 3, 4, 0.0))
+    llm_stub["canned"].append(('{"ok": true}', 6, 8, 0.0003))
 
     parsed, result = await complete_json(
         system="s",
@@ -176,7 +178,7 @@ async def test_disabled_logging_skips_db_and_jsonl(
 async def test_provider_error_persists_failed_row(fresh_db, llm_stub, monkeypatch):
     fresh_db()
 
-    async def _boom(*, model, messages, temperature, response_format):
+    async def _boom(*, model, messages, temperature, response_format, **_kwargs):
         raise RuntimeError("provider on fire")
 
     monkeypatch.setattr(llm_client, "_do_completion", _boom)
@@ -200,3 +202,161 @@ async def test_provider_error_persists_failed_row(fresh_db, llm_stub, monkeypatc
         assert row.error is not None
         assert "provider on fire" in row.error
         assert row.response_text is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 #11+12 — json_schema response_format routing.
+# ---------------------------------------------------------------------------
+
+
+_TINY_SCHEMA: dict = {
+    "type": "object",
+    "properties": {"ok": {"type": "boolean"}},
+    "required": ["ok"],
+    "additionalProperties": False,
+}
+
+
+async def test_complete_json_with_schema_uses_json_schema_for_supported_provider(
+    fresh_db, llm_stub, monkeypatch
+):
+    """Gemini supports response_schema → wrapper sent verbatim."""
+
+    fresh_db()
+    monkeypatch.setattr(
+        llm_client, "_supports_json_schema_response_format", lambda _m: True
+    )
+    llm_stub["canned"].append(('{"ok": true}', 1, 1, 0.0))
+
+    parsed, result = await complete_json(
+        system="s",
+        user="u",
+        model="gemini/gemini-3-flash-preview",
+        prompt_version="evaluation-v4.7",
+        json_schema=_TINY_SCHEMA,
+        context=LlmCallContext(purpose=LlmCallPurpose.EVALUATION),
+    )
+
+    assert parsed == {"ok": True}
+    assert llm_stub["calls"][0]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "response",
+            "strict": True,
+            "schema": _TINY_SCHEMA,
+        },
+    }
+    # Logged form is the short tag, not the wrapper.
+    with fresh_db() as session:
+        row = session.get(LlmCall, result.llm_call_id)
+        assert row is not None and row.response_format == "json_schema"
+
+
+async def test_complete_json_with_schema_falls_back_to_json_object_when_unsupported(
+    fresh_db, llm_stub, monkeypatch
+):
+    """Provider doesn't support json_schema → degrade to json_object, not crash."""
+
+    fresh_db()
+    monkeypatch.setattr(
+        llm_client, "_supports_json_schema_response_format", lambda _m: False
+    )
+    monkeypatch.setattr(
+        llm_client, "_supports_json_object_response_format", lambda _m: True
+    )
+    llm_stub["canned"].append(('{"ok": true}', 1, 1, 0.0))
+
+    parsed, _ = await complete_json(
+        system="s",
+        user="u",
+        model="some/legacy-model",
+        prompt_version="evaluation-v4.7",
+        json_schema=_TINY_SCHEMA,
+        context=LlmCallContext(purpose=LlmCallPurpose.EVALUATION),
+    )
+
+    assert parsed == {"ok": True}
+    assert llm_stub["calls"][0]["response_format"] == {"type": "json_object"}
+
+
+async def test_complete_json_with_schema_falls_back_to_text_for_lm_studio(
+    fresh_db, llm_stub, monkeypatch
+):
+    """Hypothetical: provider supports neither → text mode + injected JSON
+    instruction. Pinned so LM Studio (or any minimal provider) keeps
+    working without crashing on the unrecognised response_format."""
+
+    fresh_db()
+    monkeypatch.setattr(
+        llm_client, "_supports_json_schema_response_format", lambda _m: False
+    )
+    monkeypatch.setattr(
+        llm_client, "_supports_json_object_response_format", lambda _m: False
+    )
+    llm_stub["canned"].append(('{"ok": true}', 1, 1, 0.0))
+
+    parsed, _ = await complete_json(
+        system="s",
+        user="u",
+        model="lm_studio/google/gemma-4-31b",
+        prompt_version="evaluation-v4.7",
+        json_schema=_TINY_SCHEMA,
+        context=LlmCallContext(purpose=LlmCallPurpose.EVALUATION),
+    )
+
+    assert parsed == {"ok": True}
+    assert llm_stub["calls"][0]["response_format"] is None
+    user_msg = llm_stub["calls"][0]["messages"][-1]["content"]
+    assert "valid JSON object" in user_msg
+
+
+async def test_complete_json_without_schema_keeps_existing_json_object_path(
+    fresh_db, llm_stub, monkeypatch
+):
+    """``json_schema=None`` (the default) preserves today's json_object call.
+
+    This pins the no-regression contract for callers that haven't opted in
+    yet (analysis, classification, follow-up suggestion).
+    """
+
+    fresh_db()
+    monkeypatch.setattr(
+        llm_client, "_supports_json_schema_response_format", lambda _m: True
+    )
+    monkeypatch.setattr(
+        llm_client, "_supports_json_object_response_format", lambda _m: True
+    )
+    llm_stub["canned"].append(('{"ok": true}', 1, 1, 0.0))
+
+    parsed, _ = await complete_json(
+        system="s",
+        user="u",
+        model="gemini/gemini-3-flash-preview",
+        prompt_version="analysis-v3.6",
+        context=LlmCallContext(purpose=LlmCallPurpose.ANALYSIS),
+    )
+
+    assert parsed == {"ok": True}
+    assert llm_stub["calls"][0]["response_format"] == {"type": "json_object"}
+
+
+def test_evaluation_response_schema_matches_normalised_keys():
+    """The schema's ``scores`` keys must be exactly ``SCORING_WEIGHTS``.
+
+    A drift here means ``compute_overall`` will silently zero a missing
+    score it should weight, or score a key the model produced but
+    ``evaluate_result`` ignores. Bumping ``PROMPT_VERSION`` for any
+    ``SCORING_WEIGHTS`` change forces this test to be re-checked.
+    """
+
+    from autosdr.prompts import evaluation
+
+    schema_score_keys = set(
+        evaluation.EVALUATION_RESPONSE_SCHEMA["properties"]["scores"]["properties"]
+    )
+    weight_keys = set(evaluation.SCORING_WEIGHTS)
+    assert schema_score_keys == weight_keys
+
+    # Top-level keys mirror the canonical evaluator output.
+    top_level = set(evaluation.EVALUATION_RESPONSE_SCHEMA["properties"])
+    assert top_level == {"scores", "overall", "pass", "feedback"}

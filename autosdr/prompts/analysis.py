@@ -1,13 +1,40 @@
-"""Lead analysis prompt — extracts the personalisation angle from raw_data."""
+"""Lead analysis prompt — extracts the personalisation angle from raw_data.
+
+The system prompt is composed from named blocks so future ablation
+experiments and rule cross-references stay surgical (Phase 3 #9 of
+``docs/prompt-audit-2026-05-02.md``):
+
+* :data:`_RULES_INTRO` — framing and the 7-item angle menu.
+* :data:`_RULES_ANGLE_VOICE` — the lead-side-only scoping rule (the
+  angle field is about the LEAD, never the sender).
+* :data:`_RULES_TRUTHFULNESS` — don't claim problems about assets you
+  can't see; honest fallback is fine.
+* :data:`_RULES_ENRICHMENT` — how to read the website-signal block.
+* :data:`_RULES_STALE_INFO` — strict signal gating for the stale_info
+  angle.
+* :data:`_RULES_OWNER_FIRST_NAME` — the owner-name extraction
+  contract. Mirrored deterministically by
+  :func:`validate_owner_first_name`; the ``_OWNERSHIP_KEYWORDS`` and
+  ``_FRANCHISE_BRAND_PREFIXES`` constants below are the DATA the
+  validator uses (kept in code only, not duplicated into the prompt;
+  see audit Phase 3 #10).
+* :data:`_RULES_SHORT_NAME` — the trading-name extraction rule.
+* :data:`_OUTPUT_SCHEMA` — the JSON shape the model must return.
+
+Composing them in :data:`SYSTEM_PROMPT` keeps the rendered prompt
+byte-for-byte identical to the previous monolith — pinned by a SHA
+snapshot in ``tests/test_prompts.py``.
+"""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-PROMPT_VERSION = "analysis-v3.5"
+PROMPT_VERSION = "analysis-v3.6"
 
-SYSTEM_PROMPT = """\
+
+_RULES_INTRO = """\
 You are analysing a business lead to find the single strongest personalisation
 angle for a cold outreach message.
 
@@ -41,8 +68,10 @@ Hard rules:
   "they have good ratings"; a named service beats "they're in aged care".
 - The angle must be something the recipient would recognise about their own
   business within 2 seconds of reading it.
-- Do NOT invent facts not present in the data. Only cite what's there.
+- Do NOT invent facts not present in the data. Only cite what's there."""
 
+
+_RULES_ANGLE_VOICE = """\
 Angle text is LEAD-SIDE ONLY — strict scoping rule:
 - The `angle` field describes a fact about the LEAD's situation, full stop.
   It is NOT the place for the sender's mission, philosophy, plan, or
@@ -65,8 +94,10 @@ Angle text is LEAD-SIDE ONLY — strict scoping rule:
     * BAD:  "Hanley Browne Plumbing has 142 reviews. My focus is making
       sure plumbers with that reputation have a site that matches it."
   If you find yourself writing about the sender, stop and rewrite to
-  describe only what's true of the lead.
+  describe only what's true of the lead."""
 
+
+_RULES_TRUTHFULNESS = """\
 Truthfulness — do NOT claim problems about assets you cannot see:
 - raw_data is what you have. If a field is empty, missing, or contains
   only a URL with no scraped content, you have NO evidence about that
@@ -87,8 +118,10 @@ Truthfulness — do NOT claim problems about assets you cannot see:
   content), the honest move is `angle_type: "fallback"` with a short
   factual angle. The downstream generator handles thin signal fine;
   it produces a worse outcome with an invented hook than with an
-  honest fallback.
+  honest fallback."""
 
+
+_RULES_ENRICHMENT = """\
 Website signal block (`raw_data.enrichment`) — when present:
 
 The lead's `raw_data` may carry an `enrichment` block produced by an
@@ -161,8 +194,10 @@ Hard rules for reading this block:
     '24/7 Plumbing in Brisbane'"
 - The website signal NEVER overrides the truthfulness rule above.
   If `enrichment.signals.title` is missing or empty, treat the
-  title slot as absent — do not paraphrase it from the lead name.
+  title slot as absent — do not paraphrase it from the lead name."""
 
+
+_RULES_STALE_INFO = """\
 Stale-info angle — STRICT signal rules:
 - This angle only works when the business still has the stale label on
   something THEY control right now. The message is essentially "hey,
@@ -190,8 +225,16 @@ Stale-info angle — STRICT signal rules:
 - In the `signal` field for stale_info, always quote WHERE the stale
   label is currently showing (e.g. "listing title still reads
   'Sunnymeade'", "owner reply signed 'Sunnymeade Team' in 2026").
-  This makes the downstream message honest about the hook.
+  This makes the downstream message honest about the hook."""
 
+
+# This block is the canonical contract that ``validate_owner_first_name``
+# enforces in code. The deterministic ownership-keyword and franchise-
+# prefix lists used by the validator live in ``_OWNERSHIP_KEYWORDS`` and
+# ``_FRANCHISE_BRAND_PREFIXES`` below — they are deliberately NOT
+# duplicated into the prompt (see audit Phase 3 #10). The prompt teaches
+# the SHAPE of the rule; the code enforces the exact list.
+_RULES_OWNER_FIRST_NAME = """\
 Owner first name — bonus signal (be STRICT here; err empty):
 
 The casual greeting that uses this field ("hey matt,") only works if
@@ -215,34 +258,26 @@ A valid `owner_evidence` quote MUST do one of:
       "Cheers, Sarah - Owner", "Kind regards, Dave (Director)".
       A name just mentioned inside a review ("Danny went the extra
       mile") is NOT a signature and does NOT count.
-  (C) Use explicit ownership language in a review or reply:
-      "the owner Dave was great", "Dave runs the place", "Sarah,
-      who owns the cafe", "founder Emma replied", "Mike (director)".
-      The quote MUST contain one of these role words: "owner",
-      "operator", "founder", "director", "runs the place",
-      "owns the", "owner-operator", "proprietor", "principal".
+  (C) Use explicit ownership language in a review or reply
+      ("the owner Dave was great", "Dave runs the place", "founder
+      Emma replied"). The quote must contain a clear ownership
+      word. Staff words ("manager", "agent", "team member") do NOT
+      count.
 
-Examples that FAIL the test and must leave the field empty:
-  - "Danny is a great agent" — "agent" is an employee, not owner.
-  - "Ellen the site manager" — "manager" is staff at a franchise.
-  - "Thanks to Jodie for helping us" — no ownership language.
-  - A RE/MAX, Ray White, Bupa, BlueCare, Anglicare, Chemist
-    Warehouse, Bunnings, Harcourts, LJ Hooker, Stockland, Ingenia,
-    Bolton Clarke, TriCare, Regis, Arcare, Mercy Place, Infinite
-    Aged Care, BreakFree, Meriton, Quest, Oaks, Mantra listing —
-    these are franchises or multi-site brands; individual names in
-    reviews are almost always employees. Default to empty unless
-    the evidence literally contains an ownership word above.
-  - A reviewer's name, a customer's name, a resident's first name.
-  - Any name you had to guess at from context.
-
-When in doubt, leave the field empty. Empty is always safe.
+Anything that does NOT fit (A), (B), or (C) — names from review
+text without ownership wording, names on a franchise / multi-site
+brand listing (real estate networks, aged care groups, hotel
+chains, big-box retail), reviewer / customer / resident first
+names, names you had to guess at — leave the field empty. Empty
+is always safe.
 
 The `angle` text may reference the owner's name if (and only if) you
 also populated `owner_first_name`. It must NEVER name staff, agents,
 reviewers, residents, or other individuals — even when they are
-mentioned in the raw data.
+mentioned in the raw data."""
 
+
+_RULES_SHORT_NAME = """\
 Short trading name — extract from the business name and potentially review comments:
 
 The `lead_short_name` is the natural name a local would use to refer to
@@ -253,8 +288,10 @@ suffix and return the recognisable trading name. If the name already
 reads naturally without a suffix (e.g. "Jacaranda Cafe"), return it
 as-is. The result should be short enough to sit naturally in a sentence
 opener ("saw Skybound's reviews mention...") but specific enough to
-identify the business.
+identify the business."""
 
+
+_OUTPUT_SCHEMA = """\
 Return a single JSON object. Nothing else.
 
 Schema:
@@ -266,8 +303,19 @@ Schema:
   "owner_evidence":   "verbatim quote from the data that proves ownership (see rules). Empty string if owner_first_name is empty.",
   "confidence":       0.0-1.0,  // how strong the angle signal is
   "lead_short_name":  "the natural trading name of the business, with any Google-appended category descriptor suffix removed"
-}
-"""
+}"""
+
+
+SYSTEM_PROMPT = (
+    f"{_RULES_INTRO}\n\n"
+    f"{_RULES_ANGLE_VOICE}\n\n"
+    f"{_RULES_TRUTHFULNESS}\n\n"
+    f"{_RULES_ENRICHMENT}\n\n"
+    f"{_RULES_STALE_INFO}\n\n"
+    f"{_RULES_OWNER_FIRST_NAME}\n\n"
+    f"{_RULES_SHORT_NAME}\n\n"
+    f"{_OUTPUT_SCHEMA}\n"
+)
 
 
 _OWNERSHIP_KEYWORDS: tuple[str, ...] = (
@@ -332,14 +380,24 @@ def validate_owner_first_name(
 ) -> tuple[str, str]:
     """Enforce the owner_first_name rules at code level, not just prompt level.
 
-    The analysis prompt asks for BOTH `owner_first_name` and `owner_evidence`
-    (a verbatim quote proving ownership). The LLM frequently ignores the
-    prompt rules — even on the nth iteration — so we run a mechanical check
-    before letting the greeting leak into downstream generation.
+    Mirrors :data:`_RULES_OWNER_FIRST_NAME` (the prompt block above).
+    The prompt asks for both ``owner_first_name`` and a verbatim
+    ``owner_evidence`` quote proving ownership; the LLM frequently
+    ignores the prompt rules — even on the nth iteration — so we run a
+    mechanical check before letting the greeting leak into downstream
+    generation. Specifically:
 
-    The returned tuple is ``(owner_first_name, owner_evidence)`` where either
-    may be the empty string. Callers should treat both as empty if the
-    function judges the evidence insufficient.
+    - Evidence rule (A) — possessive in brand — is enforced via
+      ``possessive_in_brand`` below.
+    - Evidence rule (C) — explicit ownership language — is enforced
+      via :data:`_OWNERSHIP_KEYWORDS`.
+    - The franchise / multi-site brand carve-out is enforced via
+      :data:`_FRANCHISE_BRAND_PREFIXES`; on franchise leads the prompt
+      allows ONLY rule (C) (explicit ownership word).
+
+    Returns ``(owner_first_name, owner_evidence)`` where either may be
+    empty. Callers treat both as empty if the function rejects the
+    evidence.
     """
 
     name = (owner_first_name or "").strip()

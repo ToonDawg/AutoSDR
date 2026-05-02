@@ -104,7 +104,7 @@ A roadmap item that moves one of these metrics is high-leverage. One that doesn'
 | Prompts | `autosdr/prompts/` | Versioned per purpose. Bump version on any meaningful change. |
 | Connectors | `autosdr/connectors/` | `BaseConnector` ABC: `send`, `parse_webhook`, `poll_incoming`. |
 | Pipelines | `autosdr/pipeline/` | `outreach.py`, `reply.py`, `_shared.py` (generate-and-evaluate). |
-| Scheduler | `autosdr/scheduler.py` | Two asyncio tasks: outreach tick + inbound poll. Rolling-24h quota. |
+| Scheduler | `autosdr/scheduler.py` | Two asyncio tasks: outreach tick + inbound poll. Calendar-day quota (server-local midnight reset). |
 | Killswitch | `autosdr/killswitch.py` | Three layers: signals + flag file + CLI. Hot-path guards. |
 | CLI | `autosdr/cli.py` | Typer. `init` / `import` / `campaign` / `run` / `logs` / `pause` / `resume` / `status` / `sim`. |
 | Frontend | `frontend/src/routes/*` | React 19 + Vite. Routes: Dashboard, Inbox, Threads, Leads, Campaigns, Logs, Settings. |

@@ -147,7 +147,7 @@ class LlmUsage(BaseModel):
 class CampaignQuota(BaseModel):
     id: str
     name: str
-    sent_24h: int
+    sent_today: int
     quota: int
 
 
@@ -287,6 +287,12 @@ class CampaignOut(BaseModel):
     created_at: datetime
     lead_count: int = 0
     queued_count: int = 0
+    # Subset of ``queued_count`` whose ``Lead.enrichment_status``
+    # makes them priority — today, leads that returned 404 on the
+    # scan worker. Surfaces the "X of Y queued are priority" hint
+    # next to the queued count on the Campaign Detail page. Always
+    # ``<= queued_count``. See ticket 0013.
+    queued_priority_count: int = 0
     sending_count: int = 0
     paused_for_hitl_count: int = 0
     contacted_count: int = 0
@@ -294,7 +300,11 @@ class CampaignOut(BaseModel):
     won_count: int = 0
     lost_count: int = 0
     skipped_count: int = 0
-    sent_24h: int = 0
+    # Outreach contacts opened *today* (calendar day, server-local
+    # midnight reset). One contact = one thread whose first AI message
+    # landed at-or-after today's midnight; follow-ups and auto-replies
+    # don't count. Resets again at server-local midnight.
+    sent_today: int = 0
 
 
 class CampaignKickoffRequest(BaseModel):
@@ -411,6 +421,27 @@ class LeadOut(BaseModel):
     do_not_contact_at: datetime | None = None
     do_not_contact_reason: str | None = None
     created_at: datetime
+    # Send-order priority surfacing for tickets 0013 + 0014.
+    # ``is_priority`` is the boolean used by
+    # ``frontend/src/components/domain/PriorityBadge`` to decide
+    # whether to render; ``priority_reason`` is the literal token
+    # (``"not_found"`` or ``"social_profile_website"``) used as a
+    # tooltip / a11y label. Both are computed server-side in
+    # :func:`autosdr.api.leads._lead_to_out` from
+    # :func:`autosdr.pipeline.priority.priority_reason`. Plain
+    # ``str`` is intentional — see the ticket's resolved
+    # ``priority-reason-type`` open question.
+    is_priority: bool = False
+    priority_reason: str | None = None
+    # Informational sibling of ``priority_reason``: the platform
+    # token (``"facebook"``, ``"instagram"``, ``"linkedin"``,
+    # ``"twitter"``, ``"x"``, ``"tiktok"``, ``"youtube"``) when
+    # ``Lead.website`` is itself a social-profile URL, else
+    # ``None``. Set independently of priority so a 404'd Facebook
+    # URL reads as ``priority_reason="not_found"`` (precedence) but
+    # still exposes ``is_social_website="facebook"`` to drive the
+    # ``SocialProfileTag`` chip.
+    is_social_website: str | None = None
 
 
 class LeadOptOutIn(BaseModel):
@@ -507,6 +538,12 @@ class ImportPreviewOut(BaseModel):
     would_skip: list[ImportPreviewSkipReason]
     sample: list[ImportPreviewRow]
     columns: list[ImportPreviewColumn] = Field(default_factory=list)
+    # Per-platform tally of rows whose mapped ``website`` is a
+    # social-profile URL (ticket 0014). Empty dict when no social
+    # URLs are detected in the upload — frontend renders nothing in
+    # that case. Sample shape: ``{"facebook": 12, "instagram": 3}``.
+    # Defaulted so the field is always present in the JSON response.
+    social_website_hosts: dict[str, int] = Field(default_factory=dict)
 
 
 # The four canonical core fields the operator can map a source column to.
@@ -661,10 +698,10 @@ class LlmCallsSummaryOut(BaseModel):
     any non-trivial workspace. This response is the source of truth for
     the "total spend" stat above the Logs table.
 
-    ``unpriced_calls`` is the count of rows whose model has no entry in
-    the pricing map — those rows contribute zero to ``total_cost_usd``,
-    so the UI can show "≥ $X" with a tooltip when this number is
-    non-zero rather than implying a precise figure.
+    ``unpriced_calls`` is the count of legacy rows with ``cost_usd``
+    missing (pre write-time-cost migration). Those rows contribute zero
+    to ``total_cost_usd`` so the UI can show "≥ $X" with a tooltip when
+    this number is non-zero rather than implying a precise figure.
     """
 
     total_calls: int = 0

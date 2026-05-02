@@ -1,4 +1,4 @@
-"""Scheduler — rolling 24h quota enforcement."""
+"""Scheduler — calendar-day quota enforcement (resets at server-local midnight)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from autosdr.models import (
     Thread,
     ThreadStatus,
 )
-from autosdr.quota import count_outreach_contacts_last_24h
+from autosdr.quota import count_outreach_contacts_today
 from autosdr.scheduler import _next_queued_leads, run_campaign_outreach_batch
 
 
@@ -54,7 +54,8 @@ def test_count_outreach_contacts_one_per_thread_not_per_ai_message(
     Quota counts new conversations opened, not raw outbound message volume —
     otherwise turning the follow-up beat on would silently halve the
     effective daily cap. Two separate threads each with their own first AI
-    message must count as two contacts.
+    message must count as two contacts. Both contacts land "now" so they're
+    inside today's window regardless of the test clock.
     """
 
     ws_id = workspace_factory()
@@ -93,17 +94,19 @@ def test_count_outreach_contacts_one_per_thread_not_per_ai_message(
         )
         session.flush()
 
-        assert count_outreach_contacts_last_24h(session, cid) == 2
+        assert count_outreach_contacts_today(session, cid) == 2
 
 
-def test_count_outreach_contacts_excludes_threads_first_contacted_outside_window(
+def test_count_outreach_contacts_excludes_threads_first_contacted_before_midnight(
     fresh_db, workspace_factory
 ):
-    """A thread whose first AI message is older than 24h doesn't count.
+    """A thread whose first AI message landed yesterday doesn't count today.
 
-    Even if a fresh follow-up or auto-reply landed inside the window —
-    the *contact* was made yesterday, the new send is a continuation of
-    that conversation, not a new opening.
+    Even if a fresh follow-up or auto-reply landed today — the *contact*
+    was made yesterday, the new send is a continuation of that
+    conversation, not a new opening. We push the first AI back ≥ 25h
+    so it's guaranteed to fall before today's local-midnight cutoff
+    regardless of when in the day the suite runs.
     """
 
     ws_id = workspace_factory()
@@ -125,7 +128,7 @@ def test_count_outreach_contacts_excludes_threads_first_contacted_outside_window
         old.created_at = now - timedelta(hours=25)
         session.flush()
 
-        assert count_outreach_contacts_last_24h(session, cid) == 0
+        assert count_outreach_contacts_today(session, cid) == 0
 
 
 def test_count_outreach_contacts_respects_campaign_reset(fresh_db, workspace_factory):
@@ -172,7 +175,50 @@ def test_count_outreach_contacts_respects_campaign_reset(fresh_db, workspace_fac
         )
         session.flush()
 
-        assert count_outreach_contacts_last_24h(session, cid) == 1
+        assert count_outreach_contacts_today(session, cid) == 1
+
+
+def test_count_outreach_contacts_today_resets_at_local_midnight(
+    fresh_db, workspace_factory
+):
+    """A thread contacted at 11pm yesterday doesn't count once today starts.
+
+    Drives the rollover deterministically by pushing the first AI message
+    to one minute before today's local midnight, then asserts the count
+    drops to zero. This is the single behaviour ticket-0015 turns on:
+    the daily counter visibly resets at midnight.
+    """
+
+    ws_id = workspace_factory()
+    with fresh_db() as session:
+        cid = _build_fixture(session, ws_id, 1)
+        cl = session.query(CampaignLead).first()
+        thread = Thread(
+            campaign_lead_id=cl.id, connector_type="android_sms",
+            status=ThreadStatus.ACTIVE, angle="x", tone_snapshot="x",
+        )
+        session.add(thread)
+        session.flush()
+
+        msg = Message(
+            thread_id=thread.id, role=MessageRole.AI, content="hi", metadata_={}
+        )
+        session.add(msg)
+        session.flush()
+
+        # In the new world, "today" is the local-midnight cutoff. Park
+        # the first AI message at 23:59 yesterday (UTC) so it lands
+        # strictly before today's UTC-converted midnight in any tz the
+        # test runner happens to be in.
+        local_today_midnight = (
+            datetime.now().astimezone()
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+        )
+        before_midnight = local_today_midnight - timedelta(minutes=1)
+        msg.created_at = before_midnight.astimezone(timezone.utc)
+        session.flush()
+
+        assert count_outreach_contacts_today(session, cid) == 0
 
 
 def test_next_queued_leads_orders_by_queue_position(fresh_db, workspace_factory):

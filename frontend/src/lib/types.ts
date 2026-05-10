@@ -716,6 +716,49 @@ export interface HitlContext {
   note?: string;
 }
 
+/**
+ * Response shape for ``GET /api/threads/hitl/count``. ``active`` +
+ * ``dismissed`` are the legacy fields the sidebar badge has always
+ * read. ``by_reason`` (ticket 0018) drives the Inbox filter chip row
+ * — keys are the literal ``hitl_reason`` tokens emitted by the
+ * pipelines (NULLs are bucketed under ``"unknown"``); values are the
+ * per-reason count of *active* (non-dismissed) threads.
+ * ``sum(by_reason.values()) == active``.
+ */
+export interface HitlCount {
+  active: number;
+  dismissed: number;
+  by_reason: Partial<Record<HitlReasonT, number>> & Record<string, number | undefined>;
+}
+
+export interface RequeueThreadsRequest {
+  thread_ids: string[];
+}
+
+export interface RequeueThreadsResponse {
+  requeued: number;
+  skipped: number;
+}
+
+/**
+ * Closed vocabulary mirroring ``ToneRegisterT`` in
+ * ``autosdr/prompts/generation.py``. The analysis LLM picks one of these
+ * (or ``"unknown"``) per lead; the chosen register lands on
+ * ``Thread.tone_register`` and is rendered as a chip in the inbox /
+ * thread detail. ``null`` on a thread means "no concrete register on
+ * file" (legacy thread, pre-analysis row, or analysis returned
+ * ``"unknown"``) — the chip render path collapses null + "unknown" to a
+ * single quiet "no register" state. Ticket 0017.
+ */
+export type ToneRegister =
+  | "tradie"
+  | "professional"
+  | "hospitality"
+  | "retail"
+  | "personal_services"
+  | "aged_care"
+  | "unknown";
+
 export interface Thread {
   id: UUID;
   campaign_id: UUID;
@@ -729,6 +772,7 @@ export interface Thread {
   status: ThreadStatusT;
   auto_reply_count: number;
   angle: string | null;
+  tone_register: ToneRegister | null;
   tone_snapshot: string | null;
   hitl_reason: HitlReasonT | string | null;
   hitl_context: HitlContext | null;
@@ -1010,9 +1054,17 @@ export interface SendsByDay {
  * One row of the angle-funnel aggregation. Mirrors
  * ``autosdr/api/schemas.py::AngleFunnelRow``.
  *
- * ``angle`` is the discrete bucket from ``Thread.angle_type`` — one of
- * the seven values the analysis prompt emits, plus ``"unknown"`` for
- * legacy threads written before that column existed.
+ * ``angle`` is always present. When the request asked for a
+ * register-aware ``dimension``, ``tone_register`` is also populated:
+ * - ``dimension="angle"`` (default) — ``angle`` set, ``tone_register``
+ *   ``null``. Buckets are the seven values the analysis prompt emits,
+ *   plus ``"unknown"`` for legacy threads written before that column
+ *   existed.
+ * - ``dimension="register"`` — ``tone_register`` set, ``angle`` echoes
+ *   the literal ``"all"`` so legacy renderers that key on ``angle``
+ *   still work.
+ * - ``dimension="angle_register"`` — both populated, one row per
+ *   cross-tab cell.
  *
  * ``replied`` counts threads with at least one ``role=lead`` message
  * (the more honest signal than ``CampaignLead.status``, which can lag).
@@ -1021,6 +1073,7 @@ export interface SendsByDay {
  */
 export interface AngleFunnelRow {
   angle: string;
+  tone_register?: string | null;
   threads: number;
   replied: number;
   won: number;
@@ -1037,6 +1090,15 @@ export interface AngleFunnelRow {
  */
 export type EnrichmentFilter = 'all' | 'enriched' | 'unenriched';
 
+/**
+ * Group-by dimension for ``GET /api/stats/angle-funnel?dimension=``.
+ * ``"angle"`` is the default and preserves the pre-0017 contract.
+ * ``"register"`` aggregates by ``Thread.tone_register``.
+ * ``"angle_register"`` returns the (angle, register) cross-tab — useful
+ * for the heatmap that answers "which opener works for which voice".
+ */
+export type AngleFunnelDimension = 'angle' | 'register' | 'angle_register';
+
 export interface AngleFunnel {
   /** ISO 8601 string. ``null`` when scope is a campaign and no override
    *  was supplied — implies "campaign lifetime". */
@@ -1045,6 +1107,8 @@ export interface AngleFunnel {
   campaign_id: UUID | null;
   /** Resolved value of the ``?enrichment=`` filter — defaults to ``"all"``. */
   enrichment: EnrichmentFilter;
+  /** Resolved value of the ``?dimension=`` filter — defaults to ``"angle"``. */
+  dimension?: AngleFunnelDimension;
   /** Per-bucket counts, server-sorted by ``threads`` descending. */
   rows: AngleFunnelRow[];
 }

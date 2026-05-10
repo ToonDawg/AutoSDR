@@ -5,6 +5,7 @@ import { AlertTriangle, ArrowLeft, RotateCcw, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { MessageBubble } from "@/components/domain/MessageBubble";
 import { AngleTag } from "@/components/domain/AngleTag";
+import { RegisterChip } from "@/components/domain/RegisterChip";
 import { ThreadStatusBadge } from "@/components/domain/ThreadStatusBadge";
 import { Badge } from "@/components/ui/Badge";
 import {
@@ -405,6 +406,12 @@ export function ThreadDetail() {
         <section className="px-4 md:px-6 py-5 border-b border-rule">
           <div className="label mb-2">Angle</div>
           <AngleTag angle={thread.angle} />
+          {thread.tone_register && thread.tone_register !== 'unknown' && (
+            <div className="mt-3">
+              <div className="label mb-1.5">Tone register</div>
+              <RegisterChip register={thread.tone_register} />
+            </div>
+          )}
           {campaign && (
             <div className="mt-4 pt-4 border-t border-rule">
               <div className="label mb-1.5">Campaign goal</div>

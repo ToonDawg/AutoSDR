@@ -5,32 +5,43 @@ import { ThreadStatus, type Thread } from '@/lib/types';
 const POLL_MS = 10_000;
 
 /**
- * Threads paused for HITL, optionally narrowed to active (undismissed) or
- * recently dismissed.
+ * Threads paused for HITL, optionally narrowed to active (undismissed),
+ * recently dismissed, or a specific ``hitl_reason`` (ticket 0018 — the
+ * Inbox filter chips).
  *
- * Three call sites share this hook:
+ * Four call sites share this hook:
  *   - Inbox tabs: each tab passes its own ``dismissed`` flag and a
  *     growing ``limit`` for client-driven pagination.
+ *   - Inbox filter chips: ``{ dismissed: false, reason: "connector_send_failed" }``
+ *     drives the per-reason slice; the chip's count comes from
+ *     ``useHitlCount().by_reason[reason]`` rather than ``.length`` so
+ *     we never paginate just to count.
  *   - Dashboard preview: ``{ dismissed: false, limit: 6 }`` for the
  *     "Waiting for you" panel.
  *   - (count-only callers use ``useHitlCount`` instead — fetching a list
  *     just to read ``.length`` was the original design's main scaling
  *     wart.)
  *
- * The ``dismissed`` flag is folded into the query key so each variant
- * gets its own cache slot. ``invalidateQueries(['threads', 'hitl'])``
- * still nukes them all in one go after a dismiss/restore mutation.
+ * The ``dismissed`` + ``reason`` flags are folded into the query key so
+ * each variant gets its own cache slot.
+ * ``invalidateQueries(['threads', 'hitl'])`` still nukes them all in
+ * one go after a dismiss/restore/retry mutation.
  */
 export function useHitlThreads(
-  opts: { dismissed?: boolean; limit?: number } = {},
+  opts: { dismissed?: boolean; reason?: string; limit?: number } = {},
 ) {
-  const { dismissed, limit = 50 } = opts;
+  const { dismissed, reason, limit = 50 } = opts;
   return useQuery<Thread[]>({
-    queryKey: ['threads', 'hitl', { dismissed: dismissed ?? null, limit }],
+    queryKey: [
+      'threads',
+      'hitl',
+      { dismissed: dismissed ?? null, reason: reason ?? null, limit },
+    ],
     queryFn: () =>
       api.listThreads({
         status: ThreadStatus.PAUSED_FOR_HITL,
         dismissed,
+        hitlReason: reason,
         limit,
       }),
     refetchInterval: POLL_MS,

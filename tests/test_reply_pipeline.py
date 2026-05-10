@@ -270,7 +270,7 @@ async def test_positive_triggers_auto_reply(active_thread, fresh_db, monkeypatch
                 "confidence": 0.92,
                 "reason": "Lead wants to know more.",
             },
-            "generation-v8": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
+            "generation-v9": "Happy to share more. Does Tuesday or Wednesday suit for 15 mins?",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.92,

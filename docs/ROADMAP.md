@@ -1,6 +1,6 @@
 # AutoSDR Roadmap
 
-**Last updated:** 2026-05-02 (ticket **0005 — PWA install + Web Push for HITL escalations** shipped: operator console is now an installable PWA (`vite-plugin-pwa` injectManifest with a bespoke service worker that handles `push` + `notificationclick`), VAPID keypair generated on first lifespan boot and persisted to `workspace.settings.push`, privacy-strict payload (`{title, body, thread_id, lead_first_name, hitl_reason, escalated_at, url}` — pinned by `tests/test_push_payload_privacy.py::EXPECTED_FIELDS`), `pywebpush` transport runs via `asyncio.to_thread` so a slow gateway never blocks the reply pipeline, HTTP 410 from the gateway hard-deletes dead subs, killswitch is honoured. New `/api/push/{vapid-public,subscribe,subscriptions,test}` endpoints, new `/api/status/networking` endpoint with a best-effort `tailscale status` probe and a startup warning when `HOST=127.0.0.1` *and* Tailscale is up. New Settings → Notifications + Networking cards. 39 new tests, 661 backend tests pass, `tsc -b --noEmit` clean, `vite build` clean. PATTERNS.md gains rows for `vite-plugin-pwa`, `pywebpush`, `cryptography`. **Operator-side mobile smoke (Tailscale + cellular) deferred to home PC** because Tailscale install is blocked on the work PC. Earlier today: tickets 0008 + 0009 + 0015 shipped, prompt-audit Phase 1/2/3#9/4 #11+#12+#13 landed, ticket 0016 filed for the in-app deploy-watch surface, ticket 0005 refined with a council-resolved Tailscale-default for remote access)
+**Last updated:** 2026-05-10 — **Shipped 0018 (bulk-retry + reason filter on Inbox)** alongside 0017 in the same operator session. New `POST /api/threads/retry` endpoint (≤ 50 ids per call, semaphore-bounded, killswitch-aware, **does not re-fire the follow-up beat** because the retry IS the first outbound); `GET /api/threads/hitl/count` now carries a `by_reason` breakdown; `GET /api/threads?hitl_reason=…` filters the list. Inbox grows a reason-chip row driven by the breakdown plus a `Retry all N` / `Retry N` bulk action when the `Connector failed` chip is active, and a post-sweep summary banner that groups failures by error token (operator sees "47 connector still down · 3 send already in flight" without opening individual rows). 690 backend tests pass; 14 new tests on this ticket. Live-decrementing progress chip in the header dropped in favour of the per-chunk summary banner — chunks settle one at a time on the client, so an extra poll loop adds work without new info; can ship as a follow-up if operator feedback warrants. Sequencing note: 0019 (upstream circuit-breaker) was the listed prerequisite but the user explicitly requested 0017 + 0018 first; the ticket still adds value as the resume affordance for the legacy 1000-thread pile-up regardless of 0019's order. **Earlier same day: shipped 0017 (occupation-aware tone register).** Mid-implementation re-council swapped the original code-driven seed-map design for the analysis LLM picking `tone_register` as a structured enum field. Net: ~700 LOC deleted, no Settings UI surface to build, `Thread.tone_register` populated by the analysis call, generation prompt swaps in the matching voice block. Re-read the ticket's "Re-council (2026-05-10)" section for the rationale. — Operator-driven planning round: filed four new tickets in response to a single-session ask. **0017** ([occupation-aware tone register](tickets/0017-occupation-aware-tone-register.md)) lifts the prose `CATEGORY CALIBRATION` block out of `prompts/generation.py` and replaces it with a deterministic `Lead.category → register` map (`tradie | professional | hospitality | retail | personal_services | aged_care | unknown`) — solves the operator's *"can't say 'hey mate' to a nail salon, lawyer, or clinic"* problem by promoting category from "freeform LLM context" to "structured input that drives the prompt". **0018** ([retry connector-failed from inbox](tickets/0018-retry-connector-failed-from-inbox.md)) is the resume-affordance for the operator's 1000-thread connector-failure pile-up: filter chip + bulk-retry button on the Inbox + new `POST /api/threads/retry` endpoint. **0019** ([auto-pause on connector circuit-break](tickets/0019-auto-pause-on-connector-circuit-break.md)) is the upstream fix for that same pile-up — promotes `BaseConnector.consecutive_failures` from a write-only counter into a real circuit breaker that gates the scheduler tick + surfaces a banner + fires a single Web Push event when the gateway phone goes offline. **0020** ([business-longevity signal](tickets/0020-business-longevity-signal.md)) is the operator-requested new scraper angle — extracts `founded_year`/`years_in_business` from "since YYYY" / "established YYYY" / "30+ years in business" patterns alongside the existing `copyright_year` / ABN / ACN regex set, opens a new `angle_type=longevity` for the positive-pivot path, no new dependencies (slots into the same `extract_signals_from_soup` the operator's working `scripts/enrich_leads_httpx.py` already runs). Sequence in *Next* is now **0019 → 0020 → 0016 → 0005-followups → 0007 → docs sync** (0017 + 0018 done 2026-05-10). Earlier (2026-05-02): tickets 0005 + 0008 + 0009 + 0015 shipped, prompt-audit Phase 1/2/3#9/4 #11+#12+#13 landed, ticket 0016 filed for the in-app deploy-watch surface.
 **Maintainer:** project-manager skill (see `.claude/skills/project-manager/SKILL.md`)
 
 This is the canonical roadmap. Tickets get fleshed out below or in dedicated
@@ -32,19 +32,23 @@ tracker — see `.claude/skills/project-manager/references/beads-integration.md`
 
 ## Next — committed for next quarter
 
-Sequenced by **dependency chain**: prod-push blockers (0008, 0009) shipped
-2026-05-02, the mobile/PWA pair (0015 → 0005) shipped 2026-05-02 — the
-remaining row at the top is the in-app LLM deploy-watch surface (0016)
-which unblocks the Phase 3 prompt-shrink line of work. After that, prod-
-push hardening (0007) and the long-overdue docs sweep. Within unblocked
-groups, ranked by RICE.
+Sequenced by **risk-first + dependency chain**: 0019 (connector circuit-
+breaker) is the upstream fix for the connector-failure pile-up that 0018
+(shipped 2026-05-10) currently cleans up. 0020 (longevity scraper signal)
+is the cheap operator-requested scraper-angle add-on, gated on Open
+Question 4 (measure incidence on the QLD dump first). Then the in-app
+LLM deploy-watch surface (0016) which unblocks Phase 3 prompt-shrink.
+After that, prod-push hardening (0007) and the long-overdue docs sweep.
+Within unblocked groups, ranked by RICE.
 
 | # | Title | Problem | RICE | Status | Link |
 | - | --- | --- | --- | --- | --- |
-| 1 | **[UI/API] In-app LLM "deploy watch" surface** (NEW 2026-05-02) | The 2026-05-02 prompt audit shipped `scripts/llm_call_metrics.py` + `scripts/replay_evaluator.py` as the regression harness this project lacked, but they're CLIs only — the operator who's about to be on a phone won't SSH in to read them. Surface per-`prompt_version` slice metrics + a "deploy health" callout + a one-click golden-replay button in the operator console. **Unblocks Phase 3 prompt-shrink work** (audit § 7 Phase 3 #7/#8/#10) which is gated on "the v4.4-v4.7 deploy is stable for 1-2 weeks". | 6.0 | ready | [`docs/tickets/0016-llm-deploy-watch-dashboard.md`](tickets/0016-llm-deploy-watch-dashboard.md) |
-| 2 | [Hardening] Override safety + connector E.164 guard + `autosdr e2e` rehearsal CLI | OverrideConnector's single-slot mapping can cross-talk under concurrent sends (real customer's thread receives the rehearsal reply); BaseConnector trusts `contact_uri` verbatim with no E.164 guard; pre-prod-push rehearsal is ~12 manual UI/curl steps. Identified during the 2026-04-27 prod-push rehearsal — see Addendum for findings 3–6 (SMSGate transport, DB bloat, simulator CLI). | — | ready | [`docs/tickets/0007-prod-hardening-override-and-e2e.md`](tickets/0007-prod-hardening-override-and-e2e.md) |
-| 3 | [Docs] Sync `ARCHITECTURE.md` with as-built | § 14 still says "Any frontend or PWA" is out of scope (frontend has shipped). § 3 component map omits `pipeline/followup.py`, `pipeline/suggestions.py`, `quota.py`, `workspace_settings.py`. The PM skill's forecasts assume this doc is accurate. **Prompt audit added `enrichment_vocab.py`, `enrichment_extract.py`, `pipeline/priority.py`, `prompts/_tone.py`, the `pricing.py` cost map, and the new `scripts/replay_*` + `scripts/llm_call_metrics.py` diagnostic CLIs — sweep all in one pass.** | 2.5 | ready | _(self-contained chore — inline)_ |
-| 4 | [Repo] Actually ignore `all_results_qld.json` | Last commit (`470345c`) message claims it added the file to `.gitignore`; it didn't (`/.gitignore` reviewed 2026-04-26). 323 MB of real lead data sitting untracked → one `git add .` from being committed. | — | ready | _(one-line fix; rolled into Docs sync)_ |
+| 1 | **[Connectors/Scheduler] Auto-pause campaigns when connector circuit-breaks** (NEW 2026-05-10) | Operator's gateway phone went offline; scheduler kept ticking; 1000 leads ended up in `connector_send_failed` HITL state before they noticed. `BaseConnector.consecutive_failures` already counts but nothing reads it. Promote it to a real circuit breaker on the ABC, gate the scheduler outreach tick on `should_attempt_send()`, fan-out a single trip-event Web Push, surface a banner + Settings → Connector health card, auto-resume on probe success. **Upstream fix for 0018's pain** — 0018 (shipped 2026-05-10) added the resume-affordance for legacy pile-ups; 0019 prevents new ones. | 8.0 | ready | [`docs/tickets/0019-auto-pause-on-connector-circuit-break.md`](tickets/0019-auto-pause-on-connector-circuit-break.md) |
+| 2 | **[AI/Data] Extract business-longevity signal as new positive angle** (NEW 2026-05-10) | Operator hint: *"Might be worth a new addition to the scraper to get a new angle idea?"* Today `extract_signals_from_soup` pulls `copyright_year` (weak proxy for site age) but doesn't extract business longevity — the *"Established 1995"* / *"trading since '95"* / *"30+ years in business"* / *"two decades of service"* patterns that AU SMB sites love to put on their homepage. Adds 4 fields to the envelope (`founded_year`, `years_in_business`, `longevity_evidence`, `longevity_source`), bumps `ENVELOPE_VERSION 3 → 4`, adds `longevity` to `angle_type` closed vocab, adds one worked example to `generation`. Pure regex — no new deps; inherits via the shared extractor in both the crawlee worker and the operator's working httpx script. **Open Question 4 measures incidence on QLD dump before commit.** | 1.25 | spike-first | [`docs/tickets/0020-business-longevity-signal.md`](tickets/0020-business-longevity-signal.md) |
+| 3 | [UI/API] In-app LLM "deploy watch" surface | The 2026-05-02 prompt audit shipped `scripts/llm_call_metrics.py` + `scripts/replay_evaluator.py` as the regression harness this project lacked, but they're CLIs only — the operator who's about to be on a phone won't SSH in to read them. Surface per-`prompt_version` slice metrics + a "deploy health" callout + a one-click golden-replay button in the operator console. **Unblocks Phase 3 prompt-shrink work** (audit § 7 Phase 3 #7/#8/#10) which is gated on "the v4.4-v4.7 deploy is stable for 1-2 weeks". | 6.0 | ready | [`docs/tickets/0016-llm-deploy-watch-dashboard.md`](tickets/0016-llm-deploy-watch-dashboard.md) |
+| 4 | [Hardening] Override safety + connector E.164 guard + `autosdr e2e` rehearsal CLI | OverrideConnector's single-slot mapping can cross-talk under concurrent sends (real customer's thread receives the rehearsal reply); BaseConnector trusts `contact_uri` verbatim with no E.164 guard; pre-prod-push rehearsal is ~12 manual UI/curl steps. Identified during the 2026-04-27 prod-push rehearsal — see Addendum for findings 3–6 (SMSGate transport, DB bloat, simulator CLI). | — | ready | [`docs/tickets/0007-prod-hardening-override-and-e2e.md`](tickets/0007-prod-hardening-override-and-e2e.md) |
+| 5 | [Docs] Sync `ARCHITECTURE.md` with as-built | § 14 still says "Any frontend or PWA" is out of scope (frontend has shipped). § 3 component map omits `pipeline/followup.py`, `pipeline/suggestions.py`, `quota.py`, `workspace_settings.py`. The PM skill's forecasts assume this doc is accurate. **Prompt audit added `enrichment_vocab.py`, `enrichment_extract.py`, `pipeline/priority.py`, `prompts/_tone.py`, the `pricing.py` cost map, and the new `scripts/replay_*` + `scripts/llm_call_metrics.py` diagnostic CLIs — sweep all in one pass.** | 2.5 | ready | _(self-contained chore — inline)_ |
+| 6 | [Repo] Actually ignore `all_results_qld.json` | Last commit (`470345c`) message claims it added the file to `.gitignore`; it didn't (`/.gitignore` reviewed 2026-04-26). 323 MB of real lead data sitting untracked → one `git add .` from being committed. | — | ready | _(one-line fix; rolled into Docs sync)_ |
 
 ---
 
@@ -92,6 +96,8 @@ Most-recent first.
 
 | Title | Date | Ref | Note |
 | --- | --- | --- | --- |
+| **0018 — Filter and bulk-retry connector-failed threads from the Inbox** | 2026-05-10 | [ticket](tickets/0018-retry-connector-failed-from-inbox.md) | New `POST /api/threads/retry` endpoint — accepts ≤ 50 thread ids, optional `reason_filter` (server-side guard so a typo doesn't retry an `awaiting_human_reply` row), optional `max_concurrent` (default 5, hard-cap 10, single-SIM bottleneck). Concurrency bounded by `asyncio.Semaphore`; each retry runs on its own short-lived `session_scope()`; killswitch checked per-row so a mid-batch flip stops new sends within ms. Critically, **`suppress_followup=True` is hard-coded** so a stale-draft retry never re-fires the +10 s follow-up beat — the retry IS the first outbound; the follow-up is owned by the *original* send path which already ran when the outreach pipeline first failed. Pinned by mocking `schedule_followup_send` and asserting `call_count == 0` across the success path. Per-thread failures append to `hitl_context.retry_attempts: list[{ts, error}]` so "still failing for an hour" is a one-glance read instead of a log scrape. `send_draft` body extracted into a reusable internal `_perform_thread_send(thread_id, *, suppress_followup, enforce_reason)` returning a structured `_SendOutcome`; the existing `POST /api/threads/{id}/send-draft` endpoint wraps it and maps to identical `HTTPException` codes — per-thread retry behaviour is byte-identical. The session-spanning-await pattern is preserved (it's allowlisted on the AST lint test for atomic message-with-state-flip semantics; restructuring is a separate larger ticket). `GET /api/threads/hitl/count` promoted to a typed `HitlCount` Pydantic model with a `by_reason: Record<HitlReasonT, number>` breakdown (single GROUP BY against active paused threads). `GET /api/threads` accepts `hitl_reason=…` as a where-clause additive on the existing list endpoint; indexable on the composite `idx_thread_status` index. Frontend: new `ReasonChipRow` on the Inbox reads counts from `count.by_reason` — promoted reasons (`connector_send_failed`, `eval_failed_after_max_attempts`, `awaiting_human_reply`) hit the server filter directly; `Other` is filtered client-side as "everything not in the promoted set" so the count matches the server's `Other` residual without enumerating every classifier flag. When the chip is `Connector failed` and ≥ 1 row is selected, the toolbar swaps in `Retry N` (primary); when nothing is selected, `Retry all N` (ghost) sweeps the visible page. The mutation chunks client-side at 50 to honour `MAX_RETRY_BATCH_SIZE`. After the sweep, a `RetryReportBanner` summarises succeeded/failed and groups failures by error token via a new `RETRY_ERROR_LABEL` map (operator sees, e.g. "47 connector still down · 3 send already in flight" without opening individual rows). `retrying…` chip in the toolbar surfaces in-flight state. **Deviation from the mini plan:** the live-decrementing progress chip in the Inbox header was dropped in favour of the per-chunk summary banner — chunks settle one at a time on the client (the mutation already has per-chunk results), so a separate poll loop adds work without new info, and the per-failure-token rollup is more actionable than a moving number ("47 still failing" + "47 connector still down" tells the operator the gateway is still off; "47 still failing" alone doesn't). Live chip can land as a follow-up if the banner doesn't carry its weight. 14 new tests (11 in `test_threads_bulk_retry.py`: happy path with no follow-up scheduled, partial failure, reason mismatch, no stashed draft, killswitch halts new sends, batch-size 51 → 400, concurrency 15 → clamped to 10, dedup, defensive guards for unknown / active threads; +3 in `test_hitl_dismiss.py`: filter + by-reason + null bucketing). 690 backend tests pass; `tsc -b --noEmit` clean; `vite build` clean (Inbox bundle 11.84 kB / 4.07 kB gzipped). No new deps, no schema migration, no manifest deltas. Pattern-unifier focused scan against the diff: ✓ no drift introduced (every change lands inside an existing PATTERNS row — FastAPI / SQLAlchemy 2.0 / Pydantic v2 / killswitch / pytest+asyncio / TanStack Query / React Router 7 / lucide-react / Tailwind v4 tokens / `lib/api.ts` / `lib/types.ts` mirror). Sequencing note: 0019 (upstream circuit-breaker) was the listed prerequisite but the user explicitly requested 0017 + 0018 first; 0018 still adds value as the resume affordance for the legacy 1000-thread pile-up regardless of 0019's order. Out-of-scope deferrals (per ticket): auto-retry on connector failure → ticket 0019; URL-param filter persistence (one-line follow-up if asked); re-drafting on retry; connector swap mid-retry. |
+| **0017 — Tone register adapts to lead occupation/category** | 2026-05-10 | [ticket](tickets/0017-occupation-aware-tone-register.md) | Re-councilled mid-implementation: the analysis LLM now picks `tone_register` as a structured enum field on its JSON output (one of `tradie | professional | hospitality | retail | personal_services | aged_care | unknown`), instead of a code-driven `Lead.category → register` substring map. ~700 LOC deleted (no `autosdr/tone_register.py`, no `tone_registers` workspace settings, no Settings UI override card, no kill switch); ~150 LOC added across `autosdr/prompts/analysis.py` (new `_RULES_TONE_REGISTER` block + `tone_register` schema field, bumped `analysis-v3.6 → v3.7`), `autosdr/prompts/generation.py` (inlined `_REGISTER_INSTRUCTIONS` + `ToneRegisterT`, bumped `generation-v8 → v9`, fixed three "DO use" → "Do NOT use" prose typos in the `professional` / `personal_services` / `aged_care` register blocks), `autosdr/pipeline/outreach.py` (closed-vocab guard at the persistence boundary collapses unknown / invalid LLM responses to NULL on `Thread.tone_register`), `autosdr/pipeline/_shared.py::generate_and_evaluate` (reads register off the thread, passes to `build_system_prompt(register=…)` so reply / regenerate flows reuse the original outreach decision). Schema: `Thread.tone_register VARCHAR(32) NULL` (additive migration via `_ADDITIVE_COLUMN_MIGRATIONS`). API: `ThreadOut.tone_register` round-trips on `GET /api/threads` + `GET /api/threads/{id}`; `/api/stats/angle-funnel` extended with `?dimension=register|angle_register` (existing `dimension=angle` default preserves the pre-0017 contract). Frontend: new `RegisterChip` component (mustard / forest / teal / rust / oxblood / neutral by register, single-source labels + tooltips inline, mirrors `PriorityBadge` pattern), new `ToneRegister` literal in `frontend/src/lib/types.ts`, chip rendered next to the angle on `ThreadDetail` right rail and inline on `LeadDetail`'s per-thread row. Tests: 6 new in `test_prompts.py` (analysis schema advertises field, generation injects / omits block per register, prose still under compose budget, defensive fallback on junk tokens, no `CATEGORY CALIBRATION` regression); 3 new in `test_outreach_pipeline.py` (analysis output persists, `unknown` collapses to NULL, invalid token collapses to NULL); 3 new in `test_hitl_dismiss.py` (parametrized `tone_register` round-trip on the API). 675 backend tests pass; `tsc -b --noEmit` clean. **Deferred / dropped from original ticket scope:** Settings UI "Tone register" card (no overrides if LLM picks); workspace `tone_registers` block + kill switch (no overrides means nothing to configure; revert is `analysis-v3.7 → v3.6`); `LeadsImport.tsx` per-register count preview (no deterministic mapper to preview); `AngleFunnelPanel` frontend dimension toggle (backend ready — frontend can add when there's data to read). Cohort opener-shape audit (≥ 90% per register) deferred to ticket 0016 deploy-watch. **Owner control trade-off**: no per-workspace operator-tunable register override; recourse for a wrong-register draft is the existing HITL take-over flow. Recoverable later if a per-workspace skew emerges. |
 | **0005 — PWA install + Web Push for HITL escalations** | 2026-05-02 | [ticket](tickets/0005-pwa-web-push.md) | The operator console is now an installable PWA. New `vite-plugin-pwa` (injectManifest) emits `dist/manifest.webmanifest` + a custom `dist/sw.js` (`frontend/src/sw/sw.ts`) with bespoke `push` + `notificationclick` handlers and a NetworkFirst cache for `/api/`. Service worker registration ships in `frontend/src/sw/register.ts` and is called from `main.tsx` (no-op in dev). Backend: new `autosdr/push.py` owns VAPID keypair lifecycle (`ensure_vapid_keys`, generated on first lifespan boot, persisted to `workspace.settings.push.vapid_*`), the privacy-strict payload builder (`build_hitl_payload` — only `{title, body, thread_id, lead_first_name, hitl_reason, escalated_at, url}` — and the dataclass shape itself is the contract), and the killswitch-aware fan-out (`fanout_hitl_push`, run via `asyncio.to_thread` so a slow gateway never blocks the reply pipeline; HTTP 410 hard-deletes dead subs). New `autosdr/api/push.py` exposes `GET /api/push/vapid-public`, `POST /api/push/subscribe` (upsert on `endpoint`), `DELETE /api/push/subscribe` (idempotent), `GET /api/push/subscriptions`, `POST /api/push/test`. New `autosdr/networking.py` shells out to `tailscale status` (best-effort; PATH/timeout/exception failures collapse to `not_detected` so we never blame the operator for the probe), surfaces a startup `WARNING` log when `HOST=127.0.0.1` *and* Tailscale is up (the *PC-bind-interface footgun* the Pragmatist flagged), and powers a new `GET /api/status/networking` endpoint. The HITL escalation seam (`autosdr.pipeline._shared.schedule_hitl_push`) wires up to four `pause_thread_for_hitl` call sites (outreach×2, reply×2) — fires the fanout *after* `session.flush()` succeeds, no-ops cleanly outside an event loop. New `push_subscription` table (`autosdr/models.py`) with unique-on-`endpoint` constraint + workspace+created_at index. Frontend: new Settings → Notifications card (subscribe / unsubscribe / list devices / test fire / HITL toggle / dashboard-origin override) and Settings → Networking card (HOST bind state + Tailscale probe + resolved deep-link origin + warning surface). 39 new tests across 6 files (`test_push_subscription_model`, `test_push_vapid_lifecycle`, `test_push_subscriptions_api`, `test_push_transport`, `test_push_payload_privacy`, `test_dashboard_origin_resolution`, `test_pause_thread_for_hitl_push`, `test_networking_probe`). 661 backend tests pass; `tsc -b --noEmit` clean; `vite build` clean (54-entry precache, dist/sw.js with all three SW handlers verified). PATTERNS.md gains 3 new rows (`vite-plugin-pwa`, `pywebpush`, `cryptography`) + 2 decisions-log entries. README has a new "Remote access (use AutoSDR from your phone)" subsection walking through the Tailscale + `HOST=0.0.0.0` flow + SMSGate Local-vs-Cloud trade-off. **Operator-side mobile smoke (Tailscale install on PC + phone, full end-to-end notification on cellular) deferred to home PC** — the work-PC constraint blocks Tailscale install; everything else is covered by the test suite. Follow-ups raised: vulnerability scanner noise from build-time-only deps (workbox-build chain, glob CLI), Vite-8 peer-dep mismatch with vite-plugin-pwa@1.2.0 (installed via --legacy-peer-deps; works in practice), VAPID rotation story (v0 ships keypair-forever), `push_event` telemetry table (deferred), send-failure / quota-exhausted push events (cheap follow-up — one new caller of `schedule_hitl_push` per event class). |
 | **0008 — Reply pipeline must not hold the SQLite write transaction across LLM API awaits** | 2026-05-02 | [ticket](tickets/0008-reply-pipeline-tx-across-await.md) | Three-part fix for the rehearsal-day "status endpoint times out for 30-60s during inbound processing" pathology. **Part A (phased pipeline)** — `process_incoming_message` was already split into Phase 1 *read+persist-inbound*, Phase 2 *async LLM work*, Phase 3 *write outcome*; the contract is now codified by a new AST lint test (`tests/test_no_await_in_session.py`) that walks every `.py` file under `autosdr/` and fails on `await` inside `with session_scope()` / `with db_session()`. Pre-existing violations in `scheduler.py`, `api/threads.py`, `pipeline/followup.py`, `api/campaigns.py`, `api/leads.py`, `api/scans.py` are explicitly allowlisted with explanatory notes pointing to follow-up tickets — `reply.py` is *not* on the allowlist. **Part B (audit log off the loop)** — `_log_call` is now `async`; the synchronous body (`_persist_audit_row_sync`) runs on `loop.run_in_executor(None, ...)` and we `await` the future. `_update_parsed_json` mirrors the same pattern. Awaiting (rather than blocking) frees the loop to service other coroutines while SQLite holds the writer lock; sync-context fallback persists inline for CLI scripts. **Part C (busy_timeout)** — `PRAGMA busy_timeout` dropped 120 000 ms → 5 000 ms now that no caller holds a session across an LLM await; a real 5 s wait now means a genuine writer-on-writer contention bug, not a pipeline patiently queuing. **Tests** — new `tests/test_reply_pipeline_concurrency.py` (2 cases): a competing `UnmatchedWebhook` INSERT during a 0.4 s simulated LLM await completes with median < 50 ms (was waiting full busy_timeout pre-fix); two concurrent inbounds finish in ~0.2 s vs ≥ 5 s pre-fix. **610 backend tests pass.** New `ARCHITECTURE.md § 12 "Database concurrency rules"` section explains the no-await-in-session invariant, the three-part fix, and the runtime test that asserts it. Follow-ups raised: porting the six allowlisted paths to the phased pattern; manual-rehearsal smoke for WAL ≤ 32 MB; a "claim/lease/complete" enum or 0009-style queue if a process crash mid-LLM ever strands an inbound in practice. |
 | **0009 — Killswitch must not silently drop inbound webhooks** | 2026-05-02 | [ticket](tickets/0009-killswitch-inbound-replay.md) | Pause is now a *processing* pause, not a *durability* pause. New `paused_inbound` table (`autosdr/models.py:PausedInbound`) with composite indexes on `(workspace_id, created_at)` and `(replayed_at, created_at)` — `Base.metadata.create_all` is idempotent so legacy DBs pick it up on next boot. Webhook handler (`autosdr/api/webhooks.py:_process_in_background`) replaced the silent drop with `_persist_paused_inbound` — log line is now `"killswitch on; queued inbound for replay: %s"` (truthful — was `"dropping inbound while paused: %s"`); both `/api/webhooks/sms` and `/api/webhooks/sim` honour the killswitch identically. New `autosdr/pipeline/replay.py:drain_paused_inbounds` walks unreplayed rows oldest-first, dispatches each through `process_incoming_message`, stamps `replayed_at` on success, leaves NULL on failure / connector-mismatch (operator can swap connector back or DELETE by hand). `POST /api/status/resume` is now async and fires the drain via `asyncio.create_task` (fire-and-forget — operator watches `pending_count` drop on `/api/status`). New `paused_inbound: { pending_count, oldest_pending_at }` block on `SystemStatusOut` (cheap aggregate via the new index). Frontend: `SystemStatus` type mirrors the schema; `KillSwitch.tsx` renders a mustard-soft `N inbound(s) waiting` chip next to the toggle when `pending_count > 0`, with a tooltip surfacing `oldest_pending_at` for stale-queue detection. **Six new tests in `tests/test_killswitch_inbound_durability.py`**: queue-not-drop on `/sim` and `/sms`, drain-on-resume reaches expected thread state, **STOP-during-pause flips `lead.do_not_contact_at` on resume** (closing the ticket-0001 deterministic-shortcut promise across pause windows), connector-mismatch is a skip-not-replay, status endpoint surfaces `pending_count`. 610 backend tests pass; `npx tsc -b --noEmit` clean. **Sequence requirement honoured**: 0009 ships *after* 0008 because the replay drain re-uses `process_incoming_message`; without the phased pipeline the drain would deadlock the dev server on the second inbound. Follow-ups raised: list-modal opened from the badge (needs `GET /api/paused-inbounds` — file when queue routinely > 10 entries); CLI `autosdr status` extension when the CLI lands. |
@@ -121,6 +127,153 @@ Most-recent first.
 
 Append-only. One bullet per material call.
 
+- **2026-05-10 (post-ship)** — **0018 shipped same session as 0017,
+  ahead of 0019.** The roadmap had 0019 (auto-pause on connector
+  circuit-break) sequenced first because it's the upstream fix for
+  the 1000-thread connector-failure pile-up that 0018 cleans up — but
+  the user explicitly asked for 0017 + 0018 in the same pass, so we
+  shipped against that order. 0018 still earns its place: the resume
+  affordance is the operator-facing UX for whatever pile-up is
+  already in the inbox (legacy or otherwise), and 0019's value is
+  *upstream prevention* of new pile-ups, not cleanup of the existing
+  one. The two compose cleanly; sequence inversion costs nothing.
+  All five Open Questions resolved at intake (architect-led, no
+  council mini-round needed): stateless server with client-
+  orchestrated batches of ≤ 50 ids; default `max_concurrent=5`,
+  hard-cap 10 (single-SIM bottleneck makes this factual); response
+  envelope carries `message_id` + `provider_message_id`; `Other`
+  filter chip ships in v0; killswitch chip stays a single-purpose
+  toggle (progress lives in the Inbox toolbar). One deviation from
+  the mini plan worth pinning: the **live-decrementing progress
+  chip in the Inbox header was dropped** in favour of a
+  per-chunk `RetryReportBanner` that groups failures by error
+  token. Rationale: chunks settle one at a time on the client (the
+  mutation already returns the per-chunk envelope), so a separate
+  2 s poll loop adds work without new info, and "47 connector still
+  down · 3 send already in flight" is more actionable than "47 still
+  failing". Promotable to a live chip later if operator feedback
+  warrants. Architecture call worth pinning: **`send_draft` body
+  was extracted into a reusable `_perform_thread_send` helper that
+  preserves the session-spanning-await pattern**, even though the
+  AST lint test from ticket 0008 forbids it in general. The
+  pattern is allowlisted for this endpoint specifically because the
+  message-with-state-flip atom is load-bearing (a crash mid-await
+  must leave the thread in a recoverable state — splitting the
+  session would create a window where the thread is `SENDING`
+  with no `Message` row); restructuring is a separate larger
+  ticket. The bulk retry endpoint reuses the helper but handles
+  follow-up scheduling separately (`suppress_followup=True`
+  hard-coded — the retry IS the first outbound, so the
+  `is_first_outbound` follow-up beat schedule was already fired by
+  the original send path). Pinned by mocking
+  `schedule_followup_send` and asserting `call_count == 0`. Net
+  diff: +526 LOC in `autosdr/api/threads.py` (helper extract +
+  endpoint + by-reason count + filter), +135 LOC in
+  `autosdr/api/schemas.py` (4 new Pydantic models), +421 LOC in
+  `frontend/src/routes/Inbox.tsx` (chip row + retry mutation +
+  banner), 14 new tests, 0 deps added, 0 schema migrations. 690
+  backend tests pass.
+- **2026-05-10 (post-ship)** — **0017 ship pivot, mid-implementation.**
+  Original plan had a code-driven `Lead.category → register` substring
+  map (`autosdr/tone_register.py`, 504 LOC) + per-workspace overrides
+  + Settings UI override card + kill switch. Operator pushed back
+  mid-build: "the tone registry is over the top. We have an angle
+  LLM right? We can in that agent choose a tone right?" Re-councilled
+  the seed-map-location question with that fresh framing. The
+  original council had anchored on "the **generation** model is bad
+  at picking register from prose mid-write" — which is true but
+  misframed the problem. The **analysis** model already does enum-
+  typed JSON output (it picks `angle_type` from a closed 7-token
+  vocabulary every call); adding `tone_register` as an 8th enum
+  field is qualitatively the same problem the analysis model already
+  solves well, with the bonus that it sees website + reviews +
+  signals — not just the freeform `Lead.category` string the
+  substring map would have been keyed on. Decision: drop the seed
+  map, the workspace overrides, the Settings card, and the kill
+  switch. Net: ~700 LOC deleted, ~150 LOC added. Strongest dissent:
+  no operator-tunable per-workspace override; recourse for a wrong-
+  register draft is HITL take-over (existing flow). Confidence:
+  high. Revert path: bump `analysis-v3.7 → v3.6` (drops the schema
+  field) — same cost as any prompt-version revert. Lesson logged
+  here: when the council's argument structure depends on **which
+  LLM call** is doing the work, double-check that the planner
+  framed the right LLM call as the chooser.
+- **2026-05-10** — Operator-driven planning round, single session.
+  Three asks landed: (a) tone-by-occupation, (b) retry the 1000
+  connector-failed threads from the notifications, (c) "create one
+  to three new features you think would be helpful, consider QoL
+  and the general outreach mindset." Resolved as **four tickets,
+  not three**, because (b) had a clear upstream cause that should
+  be fixed before its symptom: filed **0019 (auto-pause on
+  connector circuit-break)** as the upstream fix and **0018 (bulk
+  retry from inbox)** as the legacy-pile-up clean-up + future
+  resume-affordance. **0017 (occupation-aware tone register)** is
+  the highest-RICE ticket in the queue (12.0) — every send, every
+  campaign — and addresses exactly the *"can't send 'hey mate' to
+  a nail salon, lawyer, or clinic"* problem the operator described
+  by replacing prose-driven LLM-judgement category calibration
+  with a deterministic register map. **0020 (business-longevity
+  signal)** picks up the operator's explicit hint about adding a
+  new scraper angle; pure regex extraction in the shared
+  `extract_signals_from_soup` so it inherits into both the
+  production crawlee worker and the operator's working httpx
+  script (the script the operator named as their working tool).
+  Sequenced **0019 → 0018 → 0017 → 0020** in *Next* on risk-first
+  + RICE: 0019 prevents the symptom that 0018 cleans up (so 0018's
+  reach drops once 0019 ships, but its value as the resume-
+  affordance for the legacy pile-up justifies it standing in
+  Next); 0017 is RICE 12.0 and unblocked; 0020 is RICE 1.25 and
+  spike-first (Open Question 4 asks for an incidence-rate spike on
+  the QLD dump before committing — if < 4% of leads carry a
+  longevity signal, it goes back to *Considered, not committed*).
+  Three architectural calls worth pinning: (1) **Tone register is
+  generation-only, not evaluator-aware** in v0 (Open Question 2 in
+  0017); the evaluator scores against the always-rules so
+  register-block can soften the rules invisibly without inflating
+  the eval prompt-version bumps. Risk: a clean professional-
+  register draft scoring lower for "too formal"; mitigation is a
+  golden-replay smoke against
+  `scripts/replay_evaluator.py` and a register-stratified
+  pass-rate panel in 0016's deploy-watch UI. Council if pass-flips
+  > 2/8. (2) **Circuit breaker lives on `BaseConnector`, not as a
+  scheduler-side counter**, so SMSGate, TextBee, Override, File
+  all wear it identically (Override and File pin
+  `failure_threshold = inf`); the existing
+  `consecutive_failures` counter on SMSGate gets migrated, and
+  TextBee gets a counter for the first time (gap closure).
+  Probe loop runs in the FastAPI lifespan only while tripped,
+  zero-cost when healthy. Per-thread `send-draft` honours
+  `allow_manual_send()` — the operator can always override the
+  breaker. (3) **Longevity is a peer angle of `signature_detail`/
+  `review_theme`/`brand_voice`, not a sub-case of either** (Open
+  Question 5 in 0020); the `angle_type` vocab grows by one
+  closed token, the analysis prompt teaches the precedence ladder
+  (`not_found > stale_info > signature_detail > review_theme >
+  longevity > differentiator > weak_presence > brand_voice >
+  fallback`), generation gains exactly one new worked example
+  (Example 7). Bumps `analysis-v3.5 → v3.6` and `generation-v8 →
+  v9` (+ `→ v10` if 0017 ships first). Open Question 1 in 0020
+  flags an existing drift the operator named in this session: the
+  production scan worker
+  (`autosdr/pipeline/scans.py:35`) imports the **crawlee**
+  fetcher, but the operator runs `scripts/enrich_leads_httpx.py`
+  manually because crawlee is failing on AU SMB sites. **This
+  ticket does NOT migrate the worker** — flagged as a separate
+  follow-up — but means 0020's production reach is gated on the
+  worker actually fetching pages. Council if the user wants the
+  migration in scope. None of the four tickets ran a full council
+  mini-round at intake — every Open Question that needed council
+  is embedded in the ticket for the implementer to resolve at
+  pickup time per the [ticket-implementer skill's pre-flight](
+  ../.claude/skills/ticket-implementer/SKILL.md). Confidence:
+  high on 0017 + 0019 (operator pain is direct + measurable);
+  medium on 0018 (exact concurrency cap and `Retry all`-vs-
+  per-batch shape are open); medium-low on 0020 (incidence-rate
+  spike is gating). Strongest preserved dissent: the Critic-style
+  worry that **0017's register block lengthens the gen prompt by
+  ~ 5%** and stacks under an already-bumped tone-cap budget — if
+  the Phase 3 #8 tone-block-cap work in *Later* lands, re-measure
+  the composed prompt size before merging 0017.
 - **2026-05-02** — Shipped tickets 0008 + 0009 back-to-back, in
   that order. 0008 (reply pipeline TX-across-await) was the harder
   problem and the strict prerequisite for 0009 (killswitch inbound

@@ -115,7 +115,7 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch, responses: dict[str, Any]) -> No
     # ``generation-v7``. Alias one to the other so existing test
     # fixtures keep working without per-test edits.
     _PROMPT_ALIASES = {
-        "followup-reply-v1": "generation-v8",
+        "followup-reply-v1": "generation-v9",
     }
 
     async def _fake_complete_text(
@@ -184,7 +184,7 @@ async def test_positive_reply_goes_to_hitl_with_suggestions(
                 "confidence": 0.92,
                 "reason": "Lead wants to know more.",
             },
-            "generation-v8": list(drafts),
+            "generation-v9": list(drafts),
             "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
@@ -269,7 +269,7 @@ async def test_negative_intent_still_parks_for_hitl(
                 "confidence": 0.95,
                 "reason": "lead is not interested",
             },
-            "generation-v8": list(drafts),
+            "generation-v9": list(drafts),
             "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
@@ -326,7 +326,7 @@ async def test_goal_achieved_intent_still_parks_for_hitl(
                 "confidence": 0.95,
                 "reason": "booked",
             },
-            "generation-v8": list(drafts),
+            "generation-v9": list(drafts),
             "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
@@ -457,7 +457,7 @@ async def test_third_party_stop_does_not_trigger_shortcut(
                 "confidence": 0.5,
                 "reason": "ambiguous",
             },
-            "generation-v8": ["draft"],
+            "generation-v9": ["draft"],
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.8,
@@ -600,7 +600,7 @@ async def test_two_inbounds_same_thread_no_double_park(
                 "confidence": 0.9,
                 "reason": "interested",
             },
-            "generation-v8": list(drafts),
+            "generation-v9": list(drafts),
             "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )
@@ -842,7 +842,7 @@ async def test_inbound_message_uses_received_at_for_created_at(
                 "confidence": 0.95,
                 "reason": "not interested",
             },
-            "generation-v8": ["d1", "d2", "d3"],
+            "generation-v9": ["d1", "d2", "d3"],
             "evaluation-v4.7": [eval_payload, eval_payload, eval_payload],
         },
     )

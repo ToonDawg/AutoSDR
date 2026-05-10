@@ -332,7 +332,7 @@ async def test_complete_json_without_schema_keeps_existing_json_object_path(
         system="s",
         user="u",
         model="gemini/gemini-3-flash-preview",
-        prompt_version="analysis-v3.6",
+        prompt_version="analysis-v3.7",
         context=LlmCallContext(purpose=LlmCallPurpose.ANALYSIS),
     )
 

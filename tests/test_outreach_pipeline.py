@@ -185,13 +185,13 @@ async def test_outreach_happy_path(prepared_campaign, fresh_db, monkeypatch):
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "Rating of 3 from 10 reviews suggests room to improve service perception.",
                 "angle_type": "review_theme",
                 "signal": "rating=3, reviews=10",
                 "confidence": 0.7,
             },
-            "generation-v8": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
+            "generation-v9": "Hey — saw your rating is sitting around 3. Open to a quick chat on lifting it?",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -245,6 +245,11 @@ async def test_outreach_happy_path(prepared_campaign, fresh_db, monkeypatch):
         assert thread.status == ThreadStatus.ACTIVE
         assert thread.angle  # analysis wrote it
         assert thread.angle_type == "review_theme"  # discrete bucket persisted in lockstep with angle
+        # ``tone_register`` round-trip is exercised by
+        # ``test_outreach_persists_tone_register_from_analysis_output``;
+        # this happy-path mock omits the field so the column stays NULL
+        # (the legacy / unknown shape).
+        assert thread.tone_register is None
         assert thread.tone_snapshot  # snapshot at creation
         assert message.role == MessageRole.AI
         assert "saw your rating" in message.content.lower()
@@ -265,12 +270,12 @@ async def test_outreach_retries_then_passes(prepared_campaign, fresh_db, monkeyp
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "Rating 3 — opportunity to stand out",
                 "signal": "rating",
                 "confidence": 0.6,
             },
-            "generation-v8": [
+            "generation-v9": [
                 "Hello valued customer! Let's discuss synergies.",  # bad
                 "Hey — noticed your ratings slipped recently. Quick chat about it?",  # good
             ],
@@ -333,13 +338,13 @@ async def test_outreach_persists_fallback_angle_type_when_llm_omits_it(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "Rating 3 — opportunity",
                 # angle_type intentionally omitted to exercise the fallback.
                 "signal": "rating",
                 "confidence": 0.6,
             },
-            "generation-v8": "Hey — quick chat about your reviews?",
+            "generation-v9": "Hey — quick chat about your reviews?",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -379,8 +384,8 @@ async def test_outreach_escalates_after_max_attempts(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {"angle": "x", "signal": "y", "confidence": 0.5},
-            "generation-v8": "Hi hi hi hi hi hi hi hi.",
+            "analysis-v3.7": {"angle": "x", "signal": "y", "confidence": 0.5},
+            "generation-v9": "Hi hi hi hi hi hi hi hi.",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.3,
@@ -433,8 +438,8 @@ async def test_outreach_rejects_message_over_max_length(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {"angle": "y", "signal": "z", "confidence": 0.6},
-            "generation-v8": long_draft,
+            "analysis-v3.7": {"angle": "y", "signal": "z", "confidence": 0.6},
+            "generation-v9": long_draft,
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 1.0,
@@ -644,8 +649,8 @@ async def test_outreach_pauses_campaign_lead_when_connector_send_fails(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {"angle": "x", "signal": "y", "confidence": 0.7},
-            "generation-v8": "hey, quick chat?",
+            "analysis-v3.7": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v9": "hey, quick chat?",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -695,8 +700,8 @@ async def test_outreach_skips_if_contact_uri_changes_before_send(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {"angle": "x", "signal": "y", "confidence": 0.7},
-            "generation-v8": "unused",
+            "analysis-v3.7": {"angle": "x", "signal": "y", "confidence": 0.7},
+            "generation-v9": "unused",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -811,12 +816,12 @@ async def test_outreach_aborts_when_lead_opts_out_during_pipeline(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "Rating 3 — opportunity",
                 "signal": "rating",
                 "confidence": 0.7,
             },
-            "generation-v8": "hey, quick one?",
+            "generation-v9": "hey, quick one?",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -968,13 +973,13 @@ async def test_outreach_reads_cached_enrichment(
     captured_calls = _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "WordPress site, 24/7 callouts hook.",
                 "angle_type": "signature_detail",
                 "signal": "wordpress generator + h1",
                 "confidence": 0.7,
             },
-            "generation-v8": "Hey — quick chat?",
+            "generation-v9": "Hey — quick chat?",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -1078,13 +1083,13 @@ async def test_outreach_surfaces_cached_failure_status(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "Fallback, site did not respond in time.",
                 "angle_type": "fallback",
                 "signal": "no website signal",
                 "confidence": 0.4,
             },
-            "generation-v8": "Hey there, quick question.",
+            "generation-v9": "Hey there, quick question.",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -1142,13 +1147,13 @@ async def test_outreach_with_no_enrichment_blob_records_missing_status(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "Fallback while we wait for the scan worker.",
                 "angle_type": "fallback",
                 "signal": "no enrichment yet",
                 "confidence": 0.5,
             },
-            "generation-v8": "Hey, quick chat?",
+            "generation-v9": "Hey, quick chat?",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -1217,13 +1222,13 @@ async def test_enrichment_disabled_short_circuits(
     _install_mock_llm(
         monkeypatch,
         responses={
-            "analysis-v3.6": {
+            "analysis-v3.7": {
                 "angle": "Disabled — fallback hook.",
                 "angle_type": "fallback",
                 "signal": "no enrichment",
                 "confidence": 0.4,
             },
-            "generation-v8": "Hey, brief intro.",
+            "generation-v9": "Hey, brief intro.",
             "evaluation-v4.7": {
                 "scores": {
                     "tone_match": 0.9,
@@ -1267,4 +1272,157 @@ async def test_enrichment_disabled_short_circuits(
         # the feature does not silently rewrite previously-clean data.
         lead = session.get(Lead, prepared_campaign["lead_id"])
         assert "enrichment" not in (lead.raw_data or {})
+
+
+# ---------------------------------------------------------------------------
+# Tone register persistence (ticket 0017)
+#
+# Register is picked by the analysis LLM (``analysis-v3.7``) as a
+# structured enum field on its JSON output. The pipeline trusts the
+# closed vocab — anything outside the seven tokens (or an explicit
+# ``"unknown"``) collapses to NULL on the column.
+# ---------------------------------------------------------------------------
+
+
+async def test_outreach_persists_tone_register_from_analysis_output(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """Happy path: analysis LLM picks ``"retail"`` -> ``Thread.tone_register``
+    reflects it on the persisted row."""
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.7": {
+                "angle": "Saw your reviews are strong.",
+                "angle_type": "review_theme",
+                "signal": "rating=3, reviews=10",
+                "confidence": 0.7,
+                "tone_register": "retail",
+            },
+            "generation-v9": "hey, quick chat?",
+            "evaluation-v4.7": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+    with fresh_db() as session:
+        thread = session.query(Thread).one()
+        assert thread.tone_register == "retail"
+
+
+async def test_outreach_collapses_unknown_register_to_null(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """``"unknown"`` from the analysis LLM persists as NULL — same column
+    shape as legacy threads. Generation prompt skips the register block,
+    matching the no-register v8 shape per-lead."""
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.7": {
+                "angle": "Saw the listing.",
+                "angle_type": "fallback",
+                "signal": "category",
+                "confidence": 0.4,
+                "tone_register": "unknown",
+            },
+            "generation-v9": "hey, quick chat?",
+            "evaluation-v4.7": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+    with fresh_db() as session:
+        thread = session.query(Thread).one()
+        assert thread.tone_register is None
+
+
+async def test_outreach_collapses_invalid_register_token_to_null(
+    prepared_campaign, fresh_db, monkeypatch
+):
+    """Defensive: a bad LLM response (typo, dropped vocab, hallucinated
+    new token) collapses to NULL rather than persisting junk that the
+    funnel + chip surfaces would have to defend against."""
+
+    _install_mock_llm(
+        monkeypatch,
+        responses={
+            "analysis-v3.7": {
+                "angle": "Saw the listing.",
+                "angle_type": "fallback",
+                "signal": "category",
+                "confidence": 0.4,
+                "tone_register": "tradies",  # typo — plural, not in vocab
+            },
+            "generation-v9": "hey, quick chat?",
+            "evaluation-v4.7": {
+                "scores": {
+                    "tone_match": 0.9,
+                    "personalisation": 0.9,
+                    "goal_alignment": 0.9,
+                    "length_valid": 1.0,
+                    "naturalness": 0.9,
+                },
+                "pass": True,
+                "feedback": "",
+            },
+        },
+    )
+    connector = FileConnector(outbox_path=prepared_campaign["outbox_path"])
+    with fresh_db() as session:
+        await run_outreach_for_campaign_lead(
+            session=session,
+            connector=connector,
+            workspace=session.get(Workspace, prepared_campaign["workspace_id"]),
+            campaign=session.get(Campaign, prepared_campaign["campaign_id"]),
+            campaign_lead=session.get(
+                CampaignLead, prepared_campaign["campaign_lead_id"]
+            ),
+            lead=session.get(Lead, prepared_campaign["lead_id"]),
+        )
+    with fresh_db() as session:
+        thread = session.query(Thread).one()
+        assert thread.tone_register is None
 

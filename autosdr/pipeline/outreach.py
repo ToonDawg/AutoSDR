@@ -46,8 +46,20 @@ from autosdr.pipeline._shared import (
 )
 from autosdr.pipeline.followup import schedule_followup_send
 from autosdr.prompts import analysis
+from autosdr.prompts.generation import ToneRegisterT
 
 logger = logging.getLogger(__name__)
+
+# Closed-vocab guard for the analysis LLM's ``tone_register`` enum
+# field (ticket 0017). Anything outside this set is treated as
+# ``"unknown"`` and persisted as NULL so the funnel + chip surfaces
+# don't have to defend against arbitrary strings drifting in via a
+# bad LLM response. ``"unknown"`` itself is *also* persisted as NULL
+# — the column reads "no concrete register on file" the same way for
+# legacy rows, the kill-switch path, and the explicit unknown tag.
+_VALID_TONE_REGISTERS: frozenset[str] = frozenset(
+    t for t in ToneRegisterT.__args__ if t != "unknown"  # type: ignore[attr-defined]
+)
 
 
 def _read_cached_enrichment_status(lead: Lead, workspace: Workspace) -> str:
@@ -347,9 +359,31 @@ async def run_outreach_for_campaign_lead(
         campaign.id,
     )
 
-    message_history = thread_history(session, thread)
-    analysis_meta: dict[str, Any] = {}
-    if created or not thread.angle:
+    # Re-queued connector-failed threads carry a stashed draft in
+    # ``hitl_context.last_drafts``. Reuse it instead of calling the
+    # LLM again — the draft was already generated and evaluated, and
+    # the lead data hasn't changed.
+    _stashed = (thread.hitl_context or {}).get("last_drafts")
+    if isinstance(_stashed, list) and _stashed:
+        _draft = str(_stashed[-1])
+        _angle = thread.angle or f"{lead.category or 'business'} in {lead.address or 'the area'}"
+        loop_result: dict[str, Any] = {
+            "status": "pass",
+            "draft": _draft,
+            "attempts": 0,
+            "overall": None,
+            "scores": [],
+            "drafts": [],
+        }
+        draft: str = _draft
+        angle = _angle
+        lead_short_name = None
+        analysis_meta: dict[str, Any] = {}
+    else:
+        loop_result = None  # set by the generate block below
+        message_history = thread_history(session, thread)
+        analysis_meta = {}
+    if loop_result is None and (created or not thread.angle):
         # Enrichment is owned by the background scan worker — read the
         # latest cached status off ``raw_data.enrichment`` so the audit
         # trail stays honest, but never block the outreach loop on a
@@ -389,6 +423,16 @@ async def run_outreach_for_campaign_lead(
         thread.angle_type = (
             str(analysis_result.get("angle_type") or "").strip() or "fallback"
         )
+        # Tone register picked by the analysis LLM (ticket 0017).
+        # Closed vocab — anything outside the seven tokens collapses to
+        # NULL (treated as ``"unknown"`` by the funnel and skipped by
+        # the generation prompt's register block) rather than being
+        # written through. The downstream generation prompt reads this
+        # column off ``thread.tone_register`` via ``_shared.py``.
+        register_raw = str(analysis_result.get("tone_register") or "").strip().lower()
+        thread.tone_register = (
+            register_raw if register_raw in _VALID_TONE_REGISTERS else None
+        )
         analysis_meta = {
             "model": analysis_result["_meta"]["model"],
             "tokens_in": analysis_result["_meta"]["tokens_in"],
@@ -417,54 +461,55 @@ async def run_outreach_for_campaign_lead(
             (analysis_result.get("signal") or "")[:120],
             truncated,
         )
-    else:
+    elif loop_result is None:
         angle = thread.angle
         lead_short_name = None
 
-    try:
-        loop_result = await generate_and_evaluate(
-            settings_llm=settings_llm,
-            eval_threshold=eval_threshold,
-            eval_max_attempts=eval_max_attempts,
-            workspace=workspace,
-            campaign=campaign,
-            lead=lead,
-            thread=thread,
-            angle=angle,
-            lead_short_name=lead_short_name,
-            message_history=message_history if not created else None,
-        )
-    except Exception:
-        _requeue_claim_after_failure(session, campaign_lead.id)
-        raise
+    if loop_result is None:
+        try:
+            loop_result = await generate_and_evaluate(
+                settings_llm=settings_llm,
+                eval_threshold=eval_threshold,
+                eval_max_attempts=eval_max_attempts,
+                workspace=workspace,
+                campaign=campaign,
+                lead=lead,
+                thread=thread,
+                angle=angle,
+                lead_short_name=lead_short_name,
+                message_history=message_history if not created else None,
+            )
+        except Exception:
+            _requeue_claim_after_failure(session, campaign_lead.id)
+            raise
 
-    if loop_result["status"] != "pass":
-        pause_thread_for_hitl(
-            thread,
-            reason="eval_failed_after_max_attempts",
-            context=hitl_context_from_loop_failure(loop_result),
-        )
-        campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
-        session.flush()
-        schedule_hitl_push(
-            thread_id=thread.id,
-            lead_name=lead.name,
-            hitl_reason="eval_failed_after_max_attempts",
-        )
-        logger.warning(
-            "outreach escalated lead=%s thread=%s reason=eval_failed attempts=%d last_overall=%.3f",
-            lead.id,
-            thread.id,
-            loop_result["attempts"],
-            loop_result["overall"],
-        )
-        return OutreachResult(
-            sent=False,
-            reason="eval_failed",
-            thread_id=thread.id,
-            attempts=loop_result["attempts"],
-            overall_score=loop_result["overall"],
-        )
+        if loop_result["status"] != "pass":
+            pause_thread_for_hitl(
+                thread,
+                reason="eval_failed_after_max_attempts",
+                context=hitl_context_from_loop_failure(loop_result),
+            )
+            campaign_lead.status = CampaignLeadStatus.PAUSED_FOR_HITL
+            session.flush()
+            schedule_hitl_push(
+                thread_id=thread.id,
+                lead_name=lead.name,
+                hitl_reason="eval_failed_after_max_attempts",
+            )
+            logger.warning(
+                "outreach escalated lead=%s thread=%s reason=eval_failed attempts=%d last_overall=%.3f",
+                lead.id,
+                thread.id,
+                loop_result["attempts"],
+                loop_result["overall"],
+            )
+            return OutreachResult(
+                sent=False,
+                reason="eval_failed",
+                thread_id=thread.id,
+                attempts=loop_result["attempts"],
+                overall_score=loop_result["overall"],
+            )
 
     draft: str = loop_result["draft"]
     session.refresh(campaign_lead)

@@ -19,6 +19,10 @@ experiments and rule cross-references stay surgical (Phase 3 #9 of
   validator uses (kept in code only, not duplicated into the prompt;
   see audit Phase 3 #10).
 * :data:`_RULES_SHORT_NAME` — the trading-name extraction rule.
+* :data:`_RULES_TONE_REGISTER` — the tone-register picker (ticket
+  0017). Returns one of seven tokens which the generation prompt
+  uses to swap in a per-register voice block. Code-side mirror is
+  the ``ToneRegisterT`` literal in :mod:`autosdr.prompts.generation`.
 * :data:`_OUTPUT_SCHEMA` — the JSON shape the model must return.
 
 Composing them in :data:`SYSTEM_PROMPT` keeps the rendered prompt
@@ -31,7 +35,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "analysis-v3.6"
+PROMPT_VERSION = "analysis-v3.7"
 
 
 _RULES_INTRO = """\
@@ -291,6 +295,46 @@ opener ("saw Skybound's reviews mention...") but specific enough to
 identify the business."""
 
 
+_RULES_TONE_REGISTER = """\
+Tone register — pick the voice that fits this recipient.
+
+Output one of seven tokens in `tone_register`. The downstream
+generation prompt uses the value to swap in a per-register voice
+block (lowercase tradie openers vs. cleaner professional ones,
+empathy clauses for aged-care, and so on). Pick from category +
+website + reviews + any signal in the data — not category alone.
+
+Menu:
+- `tradie` — hands-on trades. Plumber, sparky, mechanic, builder,
+  carpenter, painter, landscaper, cleaner, removalist, locksmith,
+  arborist, fencer, tow truck, pest control. Texts the way one
+  tradie texts another.
+- `professional` — legal, accounting, financial advisory,
+  consulting, real estate, conveyancing, insurance, mortgage,
+  veterinary, dental, optometry, audiology, architecture,
+  engineering, surveying. Casual peer-to-peer, but cleanly
+  punctuated.
+- `hospitality` — cafes, restaurants, pubs, bars, bakeries, food
+  trucks, catering, breweries, takeaways. Loose and warm.
+- `retail` — shops, boutiques, florists, pharmacies, butchers,
+  hardware stores, newsagents, liquor stores. Loose and casual,
+  feels like a local customer.
+- `personal_services` — salons, barbers, spas, gyms, yoga,
+  pilates, beauty therapy, photographers, celebrants, tattoo,
+  martial arts, dance studios. Warm and approachable, between
+  tradie and professional.
+- `aged_care` — aged care, nursing homes, retirement villages,
+  disability services (NDIS), home care, GP / medical centres,
+  allied health (physio, psych, podiatry, OT, speech),
+  childcare, schools, tutoring. Casual but precise — the
+  "vulnerable people" register where empathy lands well.
+- `unknown` — pick this if the category genuinely doesn't fit
+  any of the above (e.g. wholesale manufacturing, niche B2B with
+  no clear voice). Do NOT default to `tradie` to fill the slot
+  — `unknown` is honest and the generation prompt will fall back
+  to a neutral register."""
+
+
 _OUTPUT_SCHEMA = """\
 Return a single JSON object. Nothing else.
 
@@ -302,7 +346,8 @@ Schema:
   "owner_first_name": "the owner's first name if unambiguously proven by owner_evidence, else empty string",
   "owner_evidence":   "verbatim quote from the data that proves ownership (see rules). Empty string if owner_first_name is empty.",
   "confidence":       0.0-1.0,  // how strong the angle signal is
-  "lead_short_name":  "the natural trading name of the business, with any Google-appended category descriptor suffix removed"
+  "lead_short_name":  "the natural trading name of the business, with any Google-appended category descriptor suffix removed",
+  "tone_register":    "one of: tradie | professional | hospitality | retail | personal_services | aged_care | unknown"
 }"""
 
 
@@ -314,6 +359,7 @@ SYSTEM_PROMPT = (
     f"{_RULES_STALE_INFO}\n\n"
     f"{_RULES_OWNER_FIRST_NAME}\n\n"
     f"{_RULES_SHORT_NAME}\n\n"
+    f"{_RULES_TONE_REGISTER}\n\n"
     f"{_OUTPUT_SCHEMA}\n"
 )
 

@@ -8,6 +8,7 @@ import { BackLink } from '@/components/ui/BackLink';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { PriorityBadge } from '@/components/domain/PriorityBadge';
+import { RegisterChip } from '@/components/domain/RegisterChip';
 import { SocialProfileTag } from '@/components/domain/SocialProfileTag';
 import {
   CONTACT_TYPE_LABEL,
@@ -255,6 +256,7 @@ export function LeadDetail() {
                     >
                       {thread.campaign_name || 'Conversation'}
                     </Link>
+                    <RegisterChip register={thread.tone_register} />
                   </div>
                   <div className="mt-1 text-xs text-ink-muted truncate">
                     {thread.angle ?? thread.hitl_reason ?? 'No angle recorded yet'}

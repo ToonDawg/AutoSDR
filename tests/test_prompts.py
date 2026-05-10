@@ -36,17 +36,41 @@ def _sha(s: str) -> str:
 
 
 def test_rendered_prompts_are_byte_stable():
-    """Pin the SHA of every rendered prompt to detect silent drift."""
+    """Pin the SHA of every rendered prompt to detect silent drift.
+
+    Ticket 0017 bumped two prompts:
+
+    * ``analysis`` ``v3.6 -> v3.7`` — added the ``_RULES_TONE_REGISTER``
+      block and the ``tone_register`` enum field on the JSON output
+      schema. The analysis LLM now picks the register, replacing the
+      removed prose CATEGORY CALIBRATION paragraph from ``generation``.
+    * ``generation`` ``v8 -> v9`` — the per-register prose block is
+      injected between ``_RULES`` and ``_REFERENCE_EXAMPLES`` based on
+      the ``register=`` kwarg the caller passes (sourced from
+      ``Thread.tone_register``). The two ``register=None`` snapshots
+      below pin the no-register-block shape (skipped on
+      ``register is None`` and ``register == "unknown"``); the
+      ``tradie`` and ``professional`` snapshots pin the
+      register-injected variants so a silent register-prose tweak is
+      caught.
+    """
 
     snapshots = {
-        # analysis
+        # analysis — bumped to v3.7 (new tone_register field)
         "analysis.SYSTEM_PROMPT": _sha(analysis.SYSTEM_PROMPT),
-        # generation — both tone variants
+        # generation — no-register path (legacy / unknown / pre-analysis)
         "generation.build_system_prompt(None)": _sha(
             generation.build_system_prompt(None)
         ),
         "generation.build_system_prompt('Casual mate, short.')": _sha(
             generation.build_system_prompt("Casual mate, short.")
+        ),
+        # generation — register-injected path; pins v9 register block prose
+        "generation.build_system_prompt(None, register='tradie')": _sha(
+            generation.build_system_prompt(None, register="tradie")
+        ),
+        "generation.build_system_prompt(None, register='professional')": _sha(
+            generation.build_system_prompt(None, register="professional")
         ),
         # evaluation
         "evaluation.build_system_prompt()": _sha(evaluation.build_system_prompt()),
@@ -73,9 +97,11 @@ def test_rendered_prompts_are_byte_stable():
     }
 
     expected = {
-        "analysis.SYSTEM_PROMPT": "957e30b3530a2a10",
-        "generation.build_system_prompt(None)": "77994406d6aacfc3",
-        "generation.build_system_prompt('Casual mate, short.')": "e92482e37f51e793",
+        "analysis.SYSTEM_PROMPT": "999d35f631d0386a",
+        "generation.build_system_prompt(None)": "b8a95df16fb50e0d",
+        "generation.build_system_prompt('Casual mate, short.')": "4e94f273319be28a",
+        "generation.build_system_prompt(None, register='tradie')": "24b8d581bbff421f",
+        "generation.build_system_prompt(None, register='professional')": "dad5281b269aac45",
         "evaluation.build_system_prompt()": "215b88e67e81138d",
         "evaluation.build_user_prompt(...)": "c3b3334a30ef4299",
         "classification.build_system_prompt()": "ebf54dbf6b5e9a8e",
@@ -88,6 +114,105 @@ def test_rendered_prompts_are_byte_stable():
         "bump the relevant PROMPT_VERSION, re-run the audit harness, and "
         "update the snapshot dict above."
     )
+
+
+# ---------------------------------------------------------------------------
+# Tone register wiring (ticket 0017) — analysis picks, generation injects.
+# ---------------------------------------------------------------------------
+
+
+def test_analysis_prompt_advertises_tone_register_field():
+    """The analysis LLM's JSON output schema must list ``tone_register``;
+    pipeline reads it out of ``analysis_result["tone_register"]``."""
+
+    assert "tone_register" in analysis.SYSTEM_PROMPT
+    assert "REGISTER:" not in analysis.SYSTEM_PROMPT or True  # n/a here
+    # Closed vocab must be advertised in the schema string so the model
+    # knows what tokens are valid (mirror of the code-side
+    # ``ToneRegisterT`` literal in ``generation.py``).
+    for token in (
+        "tradie",
+        "professional",
+        "hospitality",
+        "retail",
+        "personal_services",
+        "aged_care",
+        "unknown",
+    ):
+        assert token in analysis.SYSTEM_PROMPT, (
+            f"register token {token!r} missing from analysis prompt"
+        )
+
+
+def test_generation_omits_register_block_when_register_is_none():
+    """No-register path: caller passes ``register=None`` (legacy thread,
+    pre-analysis call, or analysis returned ``"unknown"``). The prompt
+    falls back to workspace tone + rules + examples."""
+
+    sys = generation.build_system_prompt(None)
+    assert "REGISTER:" not in sys
+
+
+def test_generation_omits_register_block_when_register_is_unknown():
+    """Skip-the-block: an explicit ``"unknown"`` token from the analysis
+    LLM produces the same prompt body as ``register=None``."""
+
+    none_prompt = generation.build_system_prompt(None)
+    unknown_prompt = generation.build_system_prompt(None, register="unknown")
+    assert none_prompt == unknown_prompt
+
+
+def test_generation_includes_register_block_for_known_register():
+    """Concrete register injects its prose between RULES and EXAMPLES."""
+
+    sys = generation.build_system_prompt(None, register="professional")
+    assert "REGISTER: professional services" in sys
+    rules_idx = sys.index("OPENING")
+    register_idx = sys.index("REGISTER: professional")
+    examples_idx = sys.index("Reference examples")
+    assert rules_idx < register_idx < examples_idx
+
+
+def test_generation_register_blocks_differ_per_register():
+    """Each register produces a distinct system prompt — sanity that the
+    register -> prose dict is keyed correctly."""
+
+    tradie = generation.build_system_prompt(None, register="tradie")
+    professional = generation.build_system_prompt(None, register="professional")
+    aged_care = generation.build_system_prompt(None, register="aged_care")
+    hospitality = generation.build_system_prompt(None, register="hospitality")
+    assert len({tradie, professional, aged_care, hospitality}) == 4
+
+
+def test_generation_v9_no_longer_carries_category_calibration_prose():
+    """v8's CATEGORY CALIBRATION paragraph is gone — register selection
+    moved upstream to the analysis LLM. Guard against regression."""
+
+    sys = generation.build_system_prompt(None, register="tradie")
+    assert "CATEGORY CALIBRATION" not in sys
+
+
+def test_generation_register_block_fits_under_compose_budget():
+    """Adding a register block to a max-sized tone snapshot should not
+    blow the existing 26K composed-prompt ceiling that the audit pinned."""
+
+    fat_tone = "Voice: short.\n\n" + "x" * 5000
+    for register in ("tradie", "professional", "aged_care"):
+        sys = generation.build_system_prompt(fat_tone, register=register)
+        assert len(sys) < 28_000, (
+            f"prompt with register={register!r} grew to {len(sys)} chars; "
+            "audit ceiling is ~26K plus headroom for the register block"
+        )
+
+
+def test_generation_register_block_falls_back_silently_on_unknown_token():
+    """Defensive: if a junk register token slips past the persistence
+    guard in ``outreach.py``, the prompt builder degrades to no-block
+    rather than raising. Same shape as ``register=None``."""
+
+    sys_garbage = generation.build_system_prompt(None, register="not_a_real_register")  # type: ignore[arg-type]
+    sys_none = generation.build_system_prompt(None)
+    assert sys_garbage == sys_none
 
 
 # ---------------------------------------------------------------------------

@@ -134,6 +134,7 @@ _ADDITIVE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("campaign", "outreach_window", "JSON"),
     ("thread", "hitl_dismissed_at", "DATETIME"),
     ("thread", "angle_type", "VARCHAR(32)"),
+    ("thread", "tone_register", "VARCHAR(32)"),
     ("lead", "do_not_contact_at", "DATETIME"),
     ("lead", "do_not_contact_reason", "TEXT"),
     ("lead", "enrichment_status", "VARCHAR(32)"),

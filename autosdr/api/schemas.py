@@ -628,6 +628,13 @@ class ThreadOut(BaseModel):
     status: str
     auto_reply_count: int
     angle: str | None
+    # Resolved tone register for the prompt at first-contact analysis
+    # (one of ``tradie | professional | hospitality | retail |
+    # personal_services | aged_care | unknown``). ``None`` when the
+    # workspace kill switch (``settings.tone_registers.disabled = true``)
+    # was on or the thread predates ticket 0017. Drives the
+    # ``RegisterChip`` next to the lead name in Inbox/ThreadDetail.
+    tone_register: str | None = None
     tone_snapshot: str | None
     hitl_reason: str | None
     hitl_context: dict[str, Any] | None
@@ -673,6 +680,43 @@ class TakeOverRequest(BaseModel):
 class CloseThreadRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     outcome: Literal["won", "lost"]
+
+
+# ---------------------------------------------------------------------------
+# HITL counts (sidebar / Inbox filter chips)
+# ---------------------------------------------------------------------------
+
+
+class HitlCount(BaseModel):
+    """Response shape for ``GET /api/threads/hitl/count``.
+
+    ``active`` + ``dismissed`` are the legacy fields the sidebar badge
+    has always read. ``by_reason`` (ticket 0018) drives the Inbox
+    filter chip row — keys are the literal ``hitl_reason`` tokens
+    emitted by the pipelines (NULLs are bucketed under ``"unknown"``);
+    values are the per-reason count of *active* (non-dismissed)
+    threads. ``sum(by_reason.values()) == active``.
+    """
+
+    active: int
+    dismissed: int
+    by_reason: dict[str, int] = {}
+
+
+# ---------------------------------------------------------------------------
+# Re-queue of connector-failed threads back into the scheduler (ticket 0018).
+# ---------------------------------------------------------------------------
+
+
+class RequeueThreadsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    thread_ids: list[str]
+
+
+class RequeueThreadsResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    requeued: int
+    skipped: int
 
 
 # ---------------------------------------------------------------------------
@@ -743,16 +787,30 @@ class Sends14dOut(BaseModel):
 
 
 class AngleFunnelRow(BaseModel):
-    """Per-angle funnel counts for one bucket of `Thread.angle_type`.
+    """One bucket of the angle-funnel response.
 
-    Buckets are the seven values the analysis prompt emits, plus
-    ``"unknown"`` for legacy threads that pre-date the column. The four
-    counters always satisfy ``replied <= threads`` and
+    The ``angle`` field is always present (legacy contract). When the
+    request asked for a register-aware ``dimension``, ``tone_register``
+    is also populated (matches the ``Thread.tone_register`` column
+    name and dodges Pydantic's ``BaseModel.register`` shadow warning):
+
+    - ``dimension=angle`` (default) — ``angle`` set, ``tone_register``
+      ``None``. Buckets are the seven values the analysis prompt emits,
+      plus ``"unknown"`` for legacy threads that pre-date the column.
+    - ``dimension=register`` — ``tone_register`` set, ``angle`` echoes
+      ``"all"`` so existing UI code paths that key on ``angle`` still
+      render. Buckets are the seven tone registers (six concrete +
+      ``"unknown"``).
+    - ``dimension=angle_register`` — both populated, one row per
+      cross-tab cell.
+
+    The four counters always satisfy ``replied <= threads`` and
     ``won + lost <= threads`` (a thread can be both replied and
     won/lost; these are independent slices of the funnel, not stages).
     """
 
     angle: str
+    tone_register: str | None = None
     threads: int
     replied: int
     won: int
@@ -760,6 +818,7 @@ class AngleFunnelRow(BaseModel):
 
 
 EnrichmentFilter = Literal["all", "enriched", "unenriched"]
+AngleFunnelDimension = Literal["angle", "register", "angle_register"]
 
 
 class AngleFunnelOut(BaseModel):
@@ -770,16 +829,22 @@ class AngleFunnelOut(BaseModel):
     rendering). ``campaign_id`` is echoed when scoped to a campaign;
     when scoped to a workspace and a campaign filter wasn't supplied,
     it is ``None``. ``rows`` is the per-bucket aggregation, ordered by
-    ``threads`` descending so the dominant angle renders first.
+    ``threads`` descending so the dominant bucket renders first.
 
     ``enrichment`` is the resolved value of the ``?enrichment=`` filter
     (default ``"all"``); the API echoes it back so the frontend can
     render the segmented control without re-parsing the query string.
+
+    ``dimension`` is the resolved value of the ``?dimension=`` filter
+    (default ``"angle"`` — preserves the pre-0017 contract). The
+    frontend uses this to pick the right row-renderer (angle-only,
+    register-only, or cross-tab heatmap).
     """
 
     since: datetime | None
     campaign_id: str | None
     enrichment: EnrichmentFilter = "all"
+    dimension: AngleFunnelDimension = "angle"
     rows: list[AngleFunnelRow]
 
 
@@ -1022,6 +1087,7 @@ class NetworkingStatusOut(_ApiModel):
 
 
 __all__ = [
+    "AngleFunnelDimension",
     "AngleFunnelOut",
     "AngleFunnelRow",
     "EnrichmentFilter",

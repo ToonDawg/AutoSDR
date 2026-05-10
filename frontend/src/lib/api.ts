@@ -22,6 +22,9 @@ import type {
   ConnectorTestResult,
   EnrichmentFilter,
   FollowupConfig,
+  HitlCount,
+  RequeueThreadsRequest,
+  RequeueThreadsResponse,
   ImportCommit,
   ImportPreview,
   MappingConfig,
@@ -396,6 +399,7 @@ export const api = {
     campaignId?: string;
     leadId?: string;
     dismissed?: boolean;
+    hitlReason?: string;
     limit?: number;
     offset?: number;
   }): Promise<Thread[]> {
@@ -405,14 +409,22 @@ export const api = {
         campaign_id: opts?.campaignId,
         lead_id: opts?.leadId,
         dismissed: opts?.dismissed,
+        hitl_reason: opts?.hitlReason,
         limit: opts?.limit,
         offset: opts?.offset,
       },
     });
   },
 
-  async getHitlCount(): Promise<{ active: number; dismissed: number }> {
-    return req<{ active: number; dismissed: number }>('/threads/hitl/count');
+  async getHitlCount(): Promise<HitlCount> {
+    return req<HitlCount>('/threads/hitl/count');
+  },
+
+  async requeueThreads(payload: RequeueThreadsRequest): Promise<RequeueThreadsResponse> {
+    return req<RequeueThreadsResponse>('/threads/requeue', {
+      method: 'POST',
+      body: payload,
+    });
   },
 
   async getThread(id: string): Promise<Thread> {

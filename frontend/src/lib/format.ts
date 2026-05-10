@@ -97,6 +97,28 @@ export const HITL_LABEL: Partial<Record<HitlReasonT, string>> & Record<string, s
   taken_over_by_human: 'Taken over — awaiting your send',
 };
 
+/**
+ * Short label per HITL reason for the Inbox filter chip row (ticket
+ * 0018). Tighter than ``HITL_LABEL`` because the chip has limited
+ * horizontal space — the full label remains in ``HITL_LABEL`` for the
+ * per-thread badge.
+ */
+export const HITL_REASON_CHIP_LABEL: Partial<Record<HitlReasonT, string>> & Record<string, string | undefined> = {
+  awaiting_human_reply: 'Lead replied',
+  connector_send_failed: 'Connector failed',
+  eval_failed_after_max_attempts: 'Eval failed',
+  reply_eval_failed: 'Reply eval failed',
+  taken_over_by_human: 'Taken over',
+  bot_check: 'Bot check',
+  human_requested: 'Human requested',
+  low_confidence: 'Low confidence',
+  unclear: 'Unclear',
+  max_auto_replies_reached: 'Auto-reply cap',
+  escalated: 'Escalated',
+  unknown: 'Other',
+};
+
+
 export const THREAD_STATUS_LABEL: Record<ThreadStatusT, string> = {
   active: 'Active',
   paused: 'Paused',

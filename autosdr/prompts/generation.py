@@ -10,22 +10,148 @@ experiments stay surgical (Phase 3 #9 of
   truthfulness, product language, GBP-vs-website, turnaround, empathy,
   credential, CTA, format, punctuation. The bulk of the prompt and the
   contract the evaluator scores against.
+* Tone register block — slotted between :data:`_RULES` and
+  :data:`_REFERENCE_EXAMPLES` when the caller has a concrete
+  :data:`ToneRegisterT` for the lead. Replaces the prose
+  ``CATEGORY CALIBRATION`` paragraph that used to live inside ``_RULES``
+  (ticket 0017). The register itself is picked **upstream** by the
+  analysis LLM as a structured enum field on its JSON output — the
+  generation prompt does not infer it. Skipped when ``register is
+  None`` or ``"unknown"`` (the analysis model said "I'm not sure"); the
+  model then relies on workspace tone + rules + worked examples, which
+  is the v8-shaped baseline.
 * :data:`_REFERENCE_EXAMPLES` — six worked SMS examples in the target
   voice. Cheap to ablate / replace independently of the rules.
 
 Composing them in :func:`build_system_prompt` keeps the rendered prompt
-byte-for-byte identical to the previous monolith — pinned by a SHA
-snapshot in ``tests/test_prompts.py``.
+byte-stable per ``PROMPT_VERSION`` — pinned by a SHA snapshot in
+``tests/test_prompts.py``.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from autosdr.prompts._tone import cap_tone_snapshot
 
-PROMPT_VERSION = "generation-v8"
+# v9 (ticket 0017) — drops the prose CATEGORY CALIBRATION paragraph in
+# favour of the per-register block injected between ``_RULES`` and
+# ``_REFERENCE_EXAMPLES``. v8 was the byte-stable baseline post Phase 1
+# bug fix; v9 is the first prompt-bump since the audit shipped.
+PROMPT_VERSION = "generation-v9"
+
+
+# Closed register vocabulary. Mirrors the ``tone_register`` enum on the
+# analysis prompt's JSON output (``analysis-v3.7``); the analysis model
+# is the chooser, the generation prompt is the consumer. Adding a
+# seventh register means: one literal token here + one
+# ``_REGISTER_INSTRUCTIONS`` entry below + one paragraph in the
+# analysis prompt's ``_RULES_TONE_REGISTER`` block.
+ToneRegisterT = Literal[
+    "tradie",
+    "professional",
+    "hospitality",
+    "retail",
+    "personal_services",
+    "aged_care",
+    "unknown",
+]
+
+
+# ---------------------------------------------------------------------------
+# Per-register instructional blocks injected into the generation prompt.
+#
+# Budget: each block aims to stay under 1000 chars so the composed
+# prompt (workspace tone + _RULES + register block + examples + closing)
+# fits the token envelope of ``generation-v8``. Pinned by
+# ``tests/test_prompts.py::test_register_block_fits_under_compose_budget``.
+#
+# ``"unknown"`` deliberately has no entry — when the analysis model
+# returns ``"unknown"`` we skip the block, mirroring the v8 prompt
+# shape (rules + workspace tone + worked examples only).
+# ---------------------------------------------------------------------------
+_REGISTER_INSTRUCTIONS: dict[ToneRegisterT, str] = {
+    "tradie": (
+        "REGISTER: tradie / hands-on trade.\n"
+        "Write the way one tradie texts another. Lowercase opener is the "
+        "default ('hey,', 'hey mate,', 'g'day,'). Contractions welcome "
+        "('you've', 'i'm', 'wanna'). Drop the final full stop. Sentence "
+        "fragments are fine. Don't capitalise the first word of the message "
+        "unless it's a proper noun. Do NOT sound like a sales rep — sound "
+        "like the bloke down the street who happened to look at their "
+        "Google listing. Hype words are out. One exclamation max, only on "
+        "the greeting if you use one."
+    ),
+    "professional": (
+        "REGISTER: professional services (legal, financial, consulting, "
+        "B2B advisory).\n"
+        "Stay casual but keep it tidy. Capital-case opener is fine ('Hi "
+        "there,', 'Hello,'). Do NOT use 'hey mate,' or 'g'day,' — they "
+        "read as flippant for this category. Capitalise the first word of "
+        "sentences and proper nouns. Punctuation should parse cleanly — "
+        "drop the trailing full stop only if the message ends on a "
+        "question. Contractions are fine. Aim for the voice of a peer "
+        "professional sending a quick text, not a brochure or a press "
+        "release. No hype words."
+    ),
+    "hospitality": (
+        "REGISTER: hospitality (cafes, restaurants, pubs, food trucks, "
+        "catering).\n"
+        "Loose and warm — very close to the tradie register. Lowercase "
+        "openers ('hey,', 'hey there,'), contractions, dropped final "
+        "punctuation. Reference the food / drink / atmosphere when the "
+        "signal supports it. Sound like a regular who happened to notice "
+        "something, not a marketer. One exclamation max."
+    ),
+    "retail": (
+        "REGISTER: retail (shops, boutiques, services-as-storefront).\n"
+        "Loose and casual. Lowercase openers, contractions, dropped final "
+        "punctuation are all fine. Reference the storefront or product "
+        "category when the signal supports it. Sound like a local "
+        "customer who noticed something, not a vendor."
+    ),
+    "personal_services": (
+        "REGISTER: personal services (salons, spas, fitness studios, "
+        "yoga, pilates, beauty therapists).\n"
+        "Warm and approachable — between tradie and professional. "
+        "Lowercase openers OK ('hey,', 'hi there,'), but do NOT use "
+        "'hey mate,' or 'g'day,' — those don't fit the register. "
+        "Contractions welcome. Punctuation can be loose but proper nouns "
+        "(business names, suburbs) stay capitalised. Aim for the voice of "
+        "a friendly regular client, not a sales pitch."
+    ),
+    "aged_care": (
+        "REGISTER: aged care, healthcare, allied health, education.\n"
+        "Casual but clean. Do NOT use 'hey mate,' or 'g'day,' — they read "
+        "as flippant for sectors that care for vulnerable people. "
+        "Lowercase openers like 'hi there,', 'hello,' are fine. "
+        "Capitalise proper nouns and the first word of sentences. Keep "
+        "punctuation tidy. The tone is helpful neighbour, not slick "
+        "sales — but precision matters more here than vibe. "
+        "Empathy clauses ('must be confusing for families') land "
+        "particularly well in this register."
+    ),
+}
+
+
+def render_register_block(register: ToneRegisterT | str | None) -> str | None:
+    """Return the prompt prose for ``register``, or ``None`` to skip the block.
+
+    The caller (:func:`build_system_prompt`) inserts the returned string
+    between ``_RULES`` and ``_REFERENCE_EXAMPLES`` separated by a blank
+    line. ``None`` skips the section entirely — this fires on
+    ``register is None`` (legacy thread or pre-analysis call),
+    ``register == "unknown"`` (analysis model said it doesn't know), and
+    any unexpected token (defensive — the analysis prompt's enum guard
+    plus the persistence guard in ``outreach.py`` should keep us in
+    the closed vocab, but if junk slips through we degrade silently to
+    the v8-shaped prompt rather than 500ing).
+    """
+
+    if register is None or register == "unknown":
+        return None
+    return _REGISTER_INSTRUCTIONS.get(register)  # type: ignore[arg-type]
 
 
 _DEFAULT_TONE = (
@@ -388,19 +514,6 @@ punctuation, not the words.
     * Perfectly balanced parallel clauses with matching punctuation on
       each side.
     * "Oxford comma + three-item list" in a casual text.
-- CATEGORY CALIBRATION — lean on the recipient's category:
-    * Tradies, hospitality, retail, tourism, personal services, local
-      trades → fully loose. Lowercase openers, contractions, minimal
-      punctuation. This is how they'd text a mate.
-    * Healthcare, aged care, allied health, legal, financial, education
-      → stay casual but keep punctuation clean and capitalise proper
-      nouns (names, suburbs, brand names). Do not sacrifice clarity or
-      professionalism for vibe. A lowercase opener is still fine here
-      if it reads natural, but the rest of the message should parse
-      cleanly.
-  When the category is ambiguous, default to the tradie register. It's
-  easier to be too friendly than too stiff.
-
 SHAPE — the target beat pattern for a first-contact message is:
 
   [greeting] — [observation] — [optional empathy] — [credential +
@@ -481,23 +594,35 @@ _OUTPUT_INSTRUCTION = (
 )
 
 
-def build_system_prompt(tone_snapshot: str | None) -> str:
-    """Compose the system prompt: tone block + RULES + EXAMPLES + closing.
+def build_system_prompt(
+    tone_snapshot: str | None,
+    *,
+    register: ToneRegisterT | None = None,
+) -> str:
+    """Compose the system prompt: tone + RULES + (register?) + EXAMPLES + closing.
 
     The tone block is bounded via :func:`cap_tone_snapshot` because the same
     snapshot is also injected into ``evaluation.build_user_prompt`` — an
     unbounded tone block doubles its cost per round-trip. See
     ``autosdr/prompts/_tone.py``.
+
+    ``register`` is the resolved tone register for the recipient (ticket
+    0017). When set to a concrete value (``"tradie"``, ``"professional"``,
+    etc.), the corresponding prose block is injected between ``_RULES``
+    and ``_REFERENCE_EXAMPLES``. When ``None`` (kill-switch path) or
+    ``"unknown"``, the block is omitted and the model relies on the
+    rules + worked examples — byte-stable for the kill-switch revert
+    story.
     """
 
     tone_block = cap_tone_snapshot(tone_snapshot) if tone_snapshot else None
     tone_block = tone_block or _DEFAULT_TONE
-    return (
-        f"{tone_block}\n\n"
-        f"{_RULES}\n\n"
-        f"{_REFERENCE_EXAMPLES}\n\n"
-        f"{_OUTPUT_INSTRUCTION}\n"
-    )
+    register_block = render_register_block(register)
+    parts: list[str] = [tone_block, _RULES]
+    if register_block is not None:
+        parts.append(register_block)
+    parts.append(_REFERENCE_EXAMPLES)
+    return "\n\n".join(parts) + f"\n\n{_OUTPUT_INSTRUCTION}\n"
 
 
 def build_user_prompt(

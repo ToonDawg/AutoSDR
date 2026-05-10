@@ -318,6 +318,15 @@ class Thread(Base):
     # legacy rows that pre-date this column; the funnel buckets NULL as
     # ``"unknown"``.
     angle_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Tone register picked by the analysis LLM (``analysis-v3.7+``) as a
+    # structured enum field on its JSON output, then echoed into the
+    # generation prompt as a per-register voice block via
+    # ``autosdr.prompts.generation.render_register_block``. One of
+    # ``tradie | professional | hospitality | retail | personal_services |
+    # aged_care | unknown``, or NULL on legacy threads / pre-analysis
+    # rows. The angle-funnel stratifies by this column; NULL buckets as
+    # ``"unknown"``. Ticket 0017.
+    tone_register: Mapped[str | None] = mapped_column(String(32), nullable=True)
     tone_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     hitl_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     hitl_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)

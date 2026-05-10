@@ -241,7 +241,18 @@ async def generate_and_evaluate(
     can persist it to ``thread.hitl_context`` on failure.
     """
 
-    system_gen = generation.build_system_prompt(thread.tone_snapshot)
+    # Tone register comes off the thread row, written by the analysis
+    # step in ``outreach.py`` from the analysis LLM's structured output
+    # (ticket 0017). On reply / regenerate flows the analysis doesn't
+    # re-run, so the existing column wins — same voice for the same
+    # thread end-to-end. NULL means "no concrete register on file"
+    # (legacy thread, or analysis returned ``"unknown"``); the prompt
+    # builder skips the register block in that case.
+    register = thread.tone_register or None
+
+    system_gen = generation.build_system_prompt(
+        thread.tone_snapshot, register=register
+    )
     system_eval = evaluation.build_system_prompt()
 
     gen_ctx = LlmCallContext(

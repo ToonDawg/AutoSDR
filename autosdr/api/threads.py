@@ -14,9 +14,11 @@ on the wire:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -25,7 +27,10 @@ from autosdr import killswitch
 from autosdr.api.deps import db_session, require_workspace
 from autosdr.api.schemas import (
     CloseThreadRequest,
+    HitlCount,
     MessageOut,
+    RequeueThreadsRequest,
+    RequeueThreadsResponse,
     SendDraftRequest,
     TakeOverRequest,
     ThreadOut,
@@ -48,6 +53,8 @@ from autosdr.pipeline._shared import thread_history
 from autosdr.pipeline.followup import schedule_followup_send
 from autosdr.pipeline.reply import HITL_AWAITING_HUMAN_REPLY
 from autosdr.pipeline.suggestions import generate_reply_variants
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/threads", tags=["threads"])
 
@@ -78,6 +85,7 @@ def _build_thread_out(
         status=thread.status,
         auto_reply_count=thread.auto_reply_count,
         angle=thread.angle,
+        tone_register=thread.tone_register,
         tone_snapshot=thread.tone_snapshot,
         hitl_reason=thread.hitl_reason,
         hitl_context=thread.hitl_context,
@@ -104,6 +112,18 @@ def list_threads(
     campaign_id: str | None = None,
     lead_id: str | None = None,
     dismissed: bool | None = None,
+    hitl_reason: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Filter to threads whose ``hitl_reason`` matches exactly. "
+                "Drives the Inbox filter chips (ticket 0018) — combined "
+                "with ``status_filter=paused_for_hitl`` + "
+                "``dismissed=false`` it returns the operator's actionable "
+                "slice of one HITL bucket (e.g. ``connector_send_failed``)."
+            ),
+        ),
+    ] = None,
     limit: int = 200,
     offset: int = 0,
 ) -> list[ThreadOut]:
@@ -114,6 +134,8 @@ def list_threads(
         stmt = select(Thread)
         if status_filter:
             stmt = stmt.where(Thread.status == status_filter)
+        if hitl_reason:
+            stmt = stmt.where(Thread.hitl_reason == hitl_reason)
         if dismissed is True:
             stmt = stmt.where(Thread.hitl_dismissed_at.is_not(None))
         elif dismissed is False:
@@ -185,13 +207,20 @@ def list_threads(
         return out
 
 
-@router.get("/hitl/count")
-def hitl_count() -> dict[str, int]:
-    """Cheap counter for the sidebar/dashboard badges.
+@router.get("/hitl/count", response_model=HitlCount)
+def hitl_count() -> HitlCount:
+    """Cheap counter for the sidebar/dashboard badges + Inbox filter chips.
 
     Replaces the older pattern of pulling the full HITL list just to read
     ``len(...)``: at scale that fan-outs into a JSON payload of every paused
     thread on every refresh tick, which we don't want.
+
+    ``by_reason`` (ticket 0018) drives the Inbox filter chip row — one
+    chip per ``hitl_reason`` token, with the count rendered alongside
+    so the operator sees "connector_send_failed · 1000" before they
+    bulk-retry. NULL reasons (legacy threads from before the column
+    existed) are bucketed under ``"unknown"`` so the sum of
+    ``by_reason.values()`` equals ``active``.
     """
 
     with db_session() as session:
@@ -206,7 +235,24 @@ def hitl_count() -> dict[str, int]:
             .where(Thread.status == ThreadStatus.PAUSED_FOR_HITL)
             .where(Thread.hitl_dismissed_at.is_not(None))
         ).scalar_one()
-        return {"active": int(active), "dismissed": int(dismissed)}
+        # Per-reason breakdown is a single GROUP BY on the same index
+        # the active/dismissed counts already hit (``idx_thread_status``).
+        # Cheap aggregate; runs once per Inbox refresh tick.
+        breakdown_rows = session.execute(
+            select(
+                func.coalesce(Thread.hitl_reason, "unknown").label("reason"),
+                func.count(Thread.id).label("n"),
+            )
+            .where(Thread.status == ThreadStatus.PAUSED_FOR_HITL)
+            .where(Thread.hitl_dismissed_at.is_(None))
+            .group_by("reason")
+        ).all()
+        by_reason = {str(row.reason): int(row.n) for row in breakdown_rows}
+        return HitlCount(
+            active=int(active),
+            dismissed=int(dismissed),
+            by_reason=by_reason,
+        )
 
 
 def _load_thread(session: Session, thread_id: str) -> Thread:
@@ -381,12 +427,6 @@ async def send_draft(thread_id: str, payload: SendDraftRequest) -> MessageOut:
 
         # Hold the DB session open across the send so the message row is
         # atomically persisted with the thread/state change.
-        #
-        # ``send-draft`` is the HITL approve-and-send path — an explicit human
-        # action. The pause flag is meant to stop the *autopilot*, not block
-        # the pilot, so we open a ``allow_manual_send`` context that lets the
-        # connector bypass the pause guard. Hard-stop (SIGTERM / lifespan
-        # shutdown) still aborts; that surfaces as a clear 409.
         try:
             with killswitch.allow_manual_send():
                 send_result = await connector.send(
@@ -436,14 +476,14 @@ async def send_draft(thread_id: str, payload: SendDraftRequest) -> MessageOut:
         )
         session.add(message)
 
-        # Clear any stashed suggestions — they're stale the instant we
-        # actually hit send. Leave thread ACTIVE so the lead's next reply
-        # re-enters the pipeline.
+        # Clear stashed suggestions and drafts — stale the instant we send.
+        # Leave thread ACTIVE so the lead's next reply re-enters the pipeline.
         thread.status = ThreadStatus.ACTIVE
         thread.hitl_reason = None
         if thread.hitl_context:
             cleared = dict(thread.hitl_context)
             cleared.pop("suggestions", None)
+            cleared.pop("last_drafts", None)
             thread.hitl_context = cleared
             flag_modified(thread, "hitl_context")
         thread.auto_reply_count += 1
@@ -466,10 +506,7 @@ async def send_draft(thread_id: str, payload: SendDraftRequest) -> MessageOut:
         contact_uri = lead.contact_uri
         lead_name = lead.name
 
-    # Outside the session — the DB write is committed by ``db_session``.
-    # Only schedule a follow-up on the *first* outbound of the thread:
-    # manual replies after the lead has already responded shouldn't get
-    # the "one more thing" beat piled on top.
+    # Outside the session — only schedule a follow-up on the first outbound.
     if is_first_outbound:
         schedule_followup_send(
             campaign_followup=campaign_followup,
@@ -481,6 +518,44 @@ async def send_draft(thread_id: str, payload: SendDraftRequest) -> MessageOut:
         )
 
     return message_out
+
+
+@router.post("/requeue", response_model=RequeueThreadsResponse)
+def requeue_threads(payload: RequeueThreadsRequest) -> RequeueThreadsResponse:
+    """Re-queue connector-failed threads back into the normal scheduler flow.
+
+    Flips ``Thread.status`` to ACTIVE and ``CampaignLead.status`` to QUEUED
+    so the scheduler picks them up within the campaign's ``outreach_per_day``
+    daily limit. The draft is regenerated by the outreach pipeline — this is
+    intentional; the context may have changed since the original failure.
+    """
+
+    thread_ids = list(dict.fromkeys(payload.thread_ids))
+    requeued = 0
+    skipped = 0
+    with db_session() as session:
+        require_workspace(session)
+        for thread_id in thread_ids:
+            thread = session.get(Thread, thread_id)
+            if thread is None or thread.status != ThreadStatus.PAUSED_FOR_HITL:
+                skipped += 1
+                continue
+            campaign_lead = session.get(CampaignLead, thread.campaign_lead_id)
+            if campaign_lead is None:
+                skipped += 1
+                continue
+            thread.status = ThreadStatus.ACTIVE
+            thread.hitl_reason = None
+            # Keep last_drafts so the outreach pipeline can send the
+            # already-generated message without calling the LLM again.
+            ctx = dict(thread.hitl_context or {})
+            ctx.pop("connector_error", None)
+            thread.hitl_context = ctx or None
+            thread.hitl_dismissed_at = None
+            campaign_lead.status = CampaignLeadStatus.QUEUED
+            requeued += 1
+        session.flush()
+    return RequeueThreadsResponse(requeued=requeued, skipped=skipped)
 
 
 @router.post("/{thread_id}/take-over", response_model=ThreadOut)

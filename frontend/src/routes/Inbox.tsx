@@ -1,12 +1,18 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, RotateCcw, Trash2 } from "lucide-react";
+import { ArrowRight, RotateCcw, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { FilterTabs, type FilterOption } from "@/components/ui/FilterTabs";
-import { HITL_LABEL, INTENT_LABEL, evalScoreTone, relTime } from "@/lib/format";
+import {
+  HITL_LABEL,
+  HITL_REASON_CHIP_LABEL,
+  INTENT_LABEL,
+  evalScoreTone,
+  relTime,
+} from "@/lib/format";
 import { type Thread } from "@/lib/types";
 import { useHitlCount, useHitlThreads } from "@/lib/useHitlThreads";
 
@@ -37,35 +43,89 @@ const PAGE_SIZE = 50;
 const HISTORY_RETENTION_DAYS = 30;
 const HISTORY_CUTOFF_MS = HISTORY_RETENTION_DAYS * 24 * 3600 * 1000;
 
+/**
+ * Reason filter chip type. ``"all"`` means "no filter"; a specific
+ * reason maps 1-1 to a ``hitl_reason`` value the server understands;
+ * ``"other"`` is a client-side bucket that catches everything not in
+ * the explicitly-listed reasons (mostly classifier flags) and asks the
+ * server for ``hitl_reason=unknown`` while also showing whatever the
+ * user picked in the dropdown — kept simple in v0 by just filtering
+ * client-side. See ticket 0018.
+ */
+type ReasonFilter =
+  | "all"
+  | "awaiting_human_reply"
+  | "connector_send_failed"
+  | "eval_failed_after_max_attempts"
+  | "other";
+
+/**
+ * Reasons promoted to top-level chips in the filter row. Anything else
+ * (bot_check, low_confidence, …) folds into the "Other" chip whose
+ * count is computed from ``count.by_reason`` minus the promoted ones.
+ */
+const PROMOTED_REASONS: ReadonlyArray<
+  Exclude<ReasonFilter, "all" | "other">
+> = [
+  "connector_send_failed",
+  "eval_failed_after_max_attempts",
+  "awaiting_human_reply",
+];
+
 export function Inbox() {
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("active");
+  const [reason, setReason] = useState<ReasonFilter>("all");
   const [activePages, setActivePages] = useState(1);
   const [historyPages, setHistoryPages] = useState(1);
   const [selected, setSelected] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const [requeueCount, setRequeueCount] = useState<number | null>(null);
 
   const pages = tab === "active" ? activePages : historyPages;
   const setPages = tab === "active" ? setActivePages : setHistoryPages;
 
+  // Server-side ``hitl_reason`` only fires when a specific promoted
+  // chip is active. ``"other"`` is filtered client-side because it's
+  // an open-ended union that the server doesn't know about as a
+  // single token, so we ask the server for everything-not-promoted is
+  // simply the unfiltered set minus the promoted reasons.
+  const serverReasonFilter = useMemo(() => {
+    if (tab !== "active") return undefined;
+    if (reason === "all" || reason === "other") return undefined;
+    return reason;
+  }, [tab, reason]);
+
   const { data: threads, isLoading } = useHitlThreads({
     dismissed: tab === "dismissed",
     limit: PAGE_SIZE * pages,
+    reason: serverReasonFilter,
   });
   const { data: count } = useHitlCount();
 
   // History tab hides anything older than 30 days client-side. Active
-  // tab takes the server response as-is.
+  // tab + "Other" chip applies a client-side filter that catches every
+  // ``hitl_reason`` not in ``PROMOTED_REASONS`` (matches the server
+  // ``by_reason`` "Other" bucket).
   const visibleThreads = useMemo(() => {
     if (!threads) return [];
-    if (tab !== "dismissed") return threads;
-    const cutoff = new Date().getTime() - HISTORY_CUTOFF_MS;
-    return threads.filter((t) => {
-      const at = t.hitl_dismissed_at ? Date.parse(t.hitl_dismissed_at) : 0;
-      return at >= cutoff;
-    });
-  }, [threads, tab]);
+    if (tab === "dismissed") {
+      const cutoff = new Date().getTime() - HISTORY_CUTOFF_MS;
+      return threads.filter((t) => {
+        const at = t.hitl_dismissed_at ? Date.parse(t.hitl_dismissed_at) : 0;
+        return at >= cutoff;
+      });
+    }
+    if (reason === "other") {
+      return threads.filter(
+        (t) =>
+          !t.hitl_reason ||
+          !PROMOTED_REASONS.includes(t.hitl_reason as never),
+      );
+    }
+    return threads;
+  }, [threads, tab, reason]);
 
   // Server returned a full page → assume more exist. The client-side
   // 30-day filter on the history tab is intentionally ignored here so a
@@ -95,9 +155,27 @@ export function Inbox() {
     },
   });
 
+  const requeueBulk = useMutation({
+    mutationFn: (ids: readonly string[]) =>
+      api.requeueThreads({ thread_ids: Array.from(ids) }),
+    onSuccess: (resp) => {
+      setSelected(new Set());
+      setRequeueCount(resp.requeued);
+      invalidateHitl();
+    },
+  });
+
   const onTabChange = (next: Tab) => {
     setTab(next);
+    setReason("all");
     setSelected(new Set());
+    setRequeueCount(null);
+  };
+
+  const onReasonChange = (next: ReasonFilter) => {
+    setReason(next);
+    setSelected(new Set());
+    setRequeueCount(null);
   };
 
   const toggleSelect = (id: string) => {
@@ -133,7 +211,49 @@ export function Inbox() {
   const allVisibleSelected =
     visibleThreads.length > 0 && selected.size === visibleThreads.length;
   const actionPending =
-    dismiss.isPending || restore.isPending || dismissBulk.isPending;
+    dismiss.isPending ||
+    restore.isPending ||
+    dismissBulk.isPending ||
+    requeueBulk.isPending;
+
+  // Reason-chip counts. ``count.by_reason`` is the server snapshot for
+  // *all* active paused threads; promoted reasons sum into "Other"'s
+  // residual.
+  const byReason = count?.by_reason ?? {};
+  const reasonCounts: Record<ReasonFilter, number> = useMemo(() => {
+    const promoted = PROMOTED_REASONS.reduce(
+      (sum, r) => sum + (byReason[r] ?? 0),
+      0,
+    );
+    const total = count?.active ?? 0;
+    return {
+      all: total,
+      awaiting_human_reply: byReason.awaiting_human_reply ?? 0,
+      connector_send_failed: byReason.connector_send_failed ?? 0,
+      eval_failed_after_max_attempts:
+        byReason.eval_failed_after_max_attempts ?? 0,
+      other: Math.max(0, total - promoted),
+    };
+  }, [byReason, count?.active]);
+
+  // Connector-failed sweep candidates — when the user is on the
+  // connector chip we can offer a "Retry all N" button that pulls the
+  // visible-page worth of IDs (capped at the server batch size by the
+  // mutation's chunking).
+  const connectorFailedIds = useMemo(() => {
+    if (reason !== "connector_send_failed") return [];
+    return visibleThreads
+      .filter((t) => t.hitl_reason === "connector_send_failed")
+      .map((t) => t.id);
+  }, [reason, visibleThreads]);
+
+  const selectedConnectorFailedCount = useMemo(() => {
+    if (selected.size === 0) return 0;
+    return visibleThreads.filter(
+      (t) =>
+        selected.has(t.id) && t.hitl_reason === "connector_send_failed",
+    ).length;
+  }, [selected, visibleThreads]);
 
   return (
     <div className="page-narrow gap-6">
@@ -151,6 +271,29 @@ export function Inbox() {
         counts={tabCounts}
       />
 
+      {tab === "active" && (
+        <ReasonChipRow
+          active={reason}
+          counts={reasonCounts}
+          onChange={onReasonChange}
+        />
+      )}
+
+      {requeueCount !== null && (
+        <div className="paper-card border-l-4 border-l-[color:var(--color-forest)] bg-forest-soft px-4 py-3 flex items-center justify-between">
+          <span className="text-sm">
+            {requeueCount} thread{requeueCount === 1 ? "" : "s"} re-queued — the scheduler will send them within the daily limit.
+          </span>
+          <button
+            type="button"
+            onClick={() => setRequeueCount(null)}
+            className="text-xs text-ink-muted hover:text-ink cursor-pointer ml-4"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {tab === "active" && visibleThreads.length > 0 && (
         <div className="paper-card flex items-center justify-between px-4 py-2">
           <div className="flex items-center gap-3 text-xs text-ink-muted">
@@ -166,16 +309,55 @@ export function Inbox() {
             {selected.size > 0 && (
               <span className="font-mono">{selected.size} selected</span>
             )}
+            {requeueBulk.isPending && (
+              <span className="font-mono text-ink-faint">re-queuing…</span>
+            )}
           </div>
-          <Button
-            variant="primary"
-            size="sm"
-            iconLeft={<Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />}
-            disabled={selected.size === 0 || actionPending}
-            onClick={() => dismissBulk.mutate(Array.from(selected))}
-          >
-            Dismiss {selected.size || ""}
-          </Button>
+          <div className="flex items-center gap-2">
+            {reason === "connector_send_failed" &&
+              selectedConnectorFailedCount > 0 && (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  iconLeft={<RefreshCw className="h-3.5 w-3.5" strokeWidth={1.5} />}
+                  disabled={actionPending}
+                  onClick={() => {
+                    const ids = visibleThreads
+                      .filter(
+                        (t) =>
+                          selected.has(t.id) &&
+                          t.hitl_reason === "connector_send_failed",
+                      )
+                      .map((t) => t.id);
+                    requeueBulk.mutate(ids);
+                  }}
+                >
+                  Re-queue {selectedConnectorFailedCount}
+                </Button>
+              )}
+            {reason === "connector_send_failed" &&
+              selected.size === 0 &&
+              connectorFailedIds.length > 0 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  iconLeft={<RefreshCw className="h-3.5 w-3.5" strokeWidth={1.5} />}
+                  disabled={actionPending}
+                  onClick={() => requeueBulk.mutate(connectorFailedIds)}
+                >
+                  Re-queue all {connectorFailedIds.length}
+                </Button>
+              )}
+            <Button
+              variant={reason === "connector_send_failed" ? "ghost" : "primary"}
+              size="sm"
+              iconLeft={<Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />}
+              disabled={selected.size === 0 || actionPending}
+              onClick={() => dismissBulk.mutate(Array.from(selected))}
+            >
+              Dismiss {selected.size || ""}
+            </Button>
+          </div>
         </div>
       )}
 
@@ -402,3 +584,76 @@ function HitlRow({
     </div>
   );
 }
+
+interface ReasonChipRowProps {
+  active: ReasonFilter;
+  counts: Record<ReasonFilter, number>;
+  onChange: (next: ReasonFilter) => void;
+}
+
+/**
+ * Lightweight chip row that filters the active Inbox by ``hitl_reason``
+ * (ticket 0018). Counts come straight off ``GET /api/threads/hitl/count``
+ * — the "Other" bucket is computed in the parent as
+ * ``active - sum(promoted)`` so it stays consistent with whatever the
+ * server reports without requiring the client to enumerate every
+ * possible reason token.
+ *
+ * The "Awaiting reply" chip is included even though the bulk-retry
+ * button only shows for ``connector_send_failed`` because operators
+ * want a way to focus on one bucket at a time regardless.
+ */
+function ReasonChipRow({ active, counts, onChange }: ReasonChipRowProps) {
+  const chips: ReadonlyArray<{ id: ReasonFilter; label: string }> = [
+    { id: "all", label: "All" },
+    {
+      id: "connector_send_failed",
+      label: HITL_REASON_CHIP_LABEL.connector_send_failed!,
+    },
+    {
+      id: "eval_failed_after_max_attempts",
+      label: HITL_REASON_CHIP_LABEL.eval_failed_after_max_attempts!,
+    },
+    {
+      id: "awaiting_human_reply",
+      label: HITL_REASON_CHIP_LABEL.awaiting_human_reply!,
+    },
+    { id: "other", label: "Other" },
+  ];
+  return (
+    <div
+      role="tablist"
+      aria-label="Filter by reason"
+      className="flex flex-wrap items-center gap-1.5"
+    >
+      {chips.map((chip) => {
+        const n = counts[chip.id] ?? 0;
+        const isActive = chip.id === active;
+        return (
+          <button
+            key={chip.id}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            onClick={() => onChange(chip.id)}
+            className={`text-xs px-2.5 py-1 rounded-full border cursor-pointer transition-colors ${
+              isActive
+                ? "border-ink bg-ink text-paper"
+                : "border-rule text-ink-muted hover:text-ink hover:border-ink-muted"
+            }`}
+          >
+            {chip.label}
+            <span
+              className={`font-mono ml-1.5 ${
+                isActive ? "text-paper-deep" : "text-ink-faint"
+              }`}
+            >
+              {n}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+

@@ -11,6 +11,7 @@ from sqlalchemy import case, exists, func, select
 
 from autosdr.api.deps import db_session, require_workspace
 from autosdr.api.schemas import (
+    AngleFunnelDimension,
     AngleFunnelOut,
     AngleFunnelRow,
     EnrichmentFilter,
@@ -96,8 +97,21 @@ def angle_funnel(
             ),
         ),
     ] = "all",
+    dimension: Annotated[
+        AngleFunnelDimension,
+        Query(
+            description=(
+                "Group-by dimension. ``angle`` (default — preserves the pre-0017 "
+                "contract) buckets by ``Thread.angle_type``. ``register`` buckets "
+                "by ``Thread.tone_register`` (the resolved tone register from "
+                "ticket 0017). ``angle_register`` returns one row per "
+                "(angle, register) cross-tab cell — the heatmap shape that "
+                "answers 'which opener works for which voice'."
+            ),
+        ),
+    ] = "angle",
 ) -> AngleFunnelOut:
-    """Per-angle funnel: ``threads`` / ``replied`` / ``won`` / ``lost``.
+    """Per-bucket funnel: ``threads`` / ``replied`` / ``won`` / ``lost``.
 
     Replies are detected by ``Message.role = 'lead'`` existence on the
     thread — the more honest signal than ``CampaignLead.status``, which
@@ -105,9 +119,10 @@ def angle_funnel(
     terminal :class:`Thread.status` set by the operator (or auto-reply
     pipeline) when a thread closes.
 
-    NULL ``angle_type`` (legacy threads written before this column
-    existed) is bucketed as ``"unknown"`` so the operator sees them
-    rather than silently dropping them.
+    NULL ``angle_type`` / ``tone_register`` (legacy threads written
+    before those columns existed, or kill-switch path on tone_register)
+    are bucketed as ``"unknown"`` so the operator sees them rather than
+    silently dropping them.
 
     The aggregation is a single query — no N+1 — and uses portable
     SQL: ``SUM(CASE WHEN …)`` instead of dialect-specific
@@ -146,7 +161,15 @@ def angle_funnel(
             .correlate(Thread)
         )
 
-        bucket = func.coalesce(Thread.angle_type, _UNKNOWN_BUCKET).label("bucket")
+        # Group-by columns vary by dimension — each one always appears in
+        # the SELECT in a stable column order (angle, register) so the
+        # downstream row builder can read positional indices safely.
+        angle_bucket = func.coalesce(Thread.angle_type, _UNKNOWN_BUCKET).label(
+            "angle_bucket"
+        )
+        register_bucket = func.coalesce(
+            Thread.tone_register, _UNKNOWN_BUCKET
+        ).label("register_bucket")
         threads_count = func.count(Thread.id).label("threads_count")
         replied_count = func.sum(
             case((replied_exists, 1), else_=0)
@@ -158,13 +181,20 @@ def angle_funnel(
             case((Thread.status == ThreadStatus.LOST, 1), else_=0)
         ).label("lost_count")
 
+        if dimension == "angle":
+            group_cols = (angle_bucket,)
+        elif dimension == "register":
+            group_cols = (register_bucket,)
+        else:  # angle_register
+            group_cols = (angle_bucket, register_bucket)
+
         stmt = select(
-            bucket,
+            *group_cols,
             threads_count,
             replied_count,
             won_count,
             lost_count,
-        ).group_by(bucket)
+        ).group_by(*group_cols)
 
         if campaign_id is not None:
             # Thread → CampaignLead → Campaign. We only need
@@ -205,20 +235,40 @@ def angle_funnel(
         rows = session.execute(stmt).all()
 
     rows_sorted = sorted(rows, key=lambda r: r.threads_count, reverse=True)
+
+    def _build_row(row) -> AngleFunnelRow:
+        # Positional reads — the SELECT order is locked by ``group_cols``
+        # above. Keeping the column-order contract local to this function
+        # means a future grouping change can't silently mis-attribute
+        # buckets to the wrong field.
+        if dimension == "angle":
+            angle_value = str(row[0])
+            register_value: str | None = None
+        elif dimension == "register":
+            # ``angle`` is required on the response shape; legacy callers
+            # render ``angle`` so we feed them the literal "all" sentinel
+            # rather than the (here-meaningless) angle bucket. The real
+            # bucket lives in ``tone_register``.
+            angle_value = "all"
+            register_value = str(row[0])
+        else:  # angle_register
+            angle_value = str(row[0])
+            register_value = str(row[1])
+        return AngleFunnelRow(
+            angle=angle_value,
+            tone_register=register_value,
+            threads=int(row.threads_count or 0),
+            replied=int(row.replied_count or 0),
+            won=int(row.won_count or 0),
+            lost=int(row.lost_count or 0),
+        )
+
     return AngleFunnelOut(
         since=since_dt,
         campaign_id=campaign_id,
         enrichment=enrichment,
-        rows=[
-            AngleFunnelRow(
-                angle=row.bucket,
-                threads=int(row.threads_count or 0),
-                replied=int(row.replied_count or 0),
-                won=int(row.won_count or 0),
-                lost=int(row.lost_count or 0),
-            )
-            for row in rows_sorted
-        ],
+        dimension=dimension,
+        rows=[_build_row(row) for row in rows_sorted],
     )
 
 
